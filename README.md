@@ -24,6 +24,8 @@ need attention or are fine, the affected repositories with their main reason, th
 new version is available. The number next to the icon is the decisions waiting for you. Clicking a
 repository or job opens it in the window; **Status aktualisieren** reads all repositories again. The icon
 only shows what the app already knows and reads nothing by itself.
+Closing the window does not quit the app: it stays in the menu bar (without a Dock icon) and running jobs
+go on. It quits with **OpenReleasePilot beenden** in that menu or ⌘Q.
 
 ## Getting started
 

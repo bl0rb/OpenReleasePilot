@@ -11,7 +11,7 @@ use tauri::menu::{IsMenuItem, Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Wry};
 
-const ID: &str = "main";
+pub const ID: &str = "main";
 /// How many repositories or jobs the menu names; the rest are counted.
 const LISTED: usize = 6;
 /// Longer reasons are cut so the menu stays narrow.

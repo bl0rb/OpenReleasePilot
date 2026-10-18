@@ -248,6 +248,8 @@ pub fn changed(app: &AppHandle) {
 
 /// Brings the main window to the front, also from the menu bar.
 pub fn show_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
@@ -1727,7 +1729,10 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(Shared(Mutex::new(Model::load())))
         .setup(|app| {
-            tray::init(app.handle())?;
+            // Without a menu bar icon (a Linux desktop without one) the app works as before.
+            if let Err(e) = tray::init(app.handle()) {
+                eprintln!("no menu bar icon: {e}");
+            }
             // Like ClaudeKeyZapper: look for a new version once at start, quietly.
             let handle = app.handle().clone();
             if !cfg!(debug_assertions) && !with_model(&handle, |m| m.config.no_update_check) {
@@ -1784,8 +1789,29 @@ fn main() {
             inspect_repo,
             cancel
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running OpenReleasePilot");
+        // Closing the window keeps the app in the menu bar, with running jobs going on; it ends
+        // with "Beenden" there or Cmd+Q.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let app = window.app_handle();
+                if window.label() == "main" && app.tray_by_id(tray::ID).is_some() {
+                    api.prevent_close();
+                    let _ = window.hide();
+                    // Without a window, no Dock icon either.
+                    #[cfg(target_os = "macos")]
+                    let _ = app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+                }
+            }
+        })
+        .build(tauri::generate_context!())
+        .expect("error while running OpenReleasePilot")
+        .run(|_app, _event| {
+            // A click on the Dock icon or opening the app again brings the window back.
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen { .. } = _event {
+                show_window(_app);
+            }
+        });
 }
 
 #[cfg(test)]

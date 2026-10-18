@@ -24,6 +24,8 @@ sind, Aufmerksamkeit brauchen oder in Ordnung sind, die betroffenen Repositories
 offenen Aufträge und ob eine neue Version da ist. Die Zahl neben dem Symbol sind die Entscheidungen, die auf
 dich warten. Ein Klick auf ein Repository oder einen Auftrag öffnet ihn im Fenster; **Status aktualisieren**
 liest alle Repositories neu. Das Symbol zeigt nur, was die App schon weiß, und liest selbst nichts nach.
+Das Fenster zu schließen beendet die App nicht: Sie bleibt in der Menüleiste (ohne Dock-Symbol), laufende
+Aufträge gehen weiter. Beendet wird sie über **OpenReleasePilot beenden** im Menü oder ⌘Q.
 
 ## Erste Schritte
 
