@@ -191,10 +191,10 @@ pub fn install(_package: &std::path::Path, _version: &str) -> Result<Installed> 
 }
 
 fn download(url: &str, limit: u64) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).build();
-    let response = agent.get(url).set("User-Agent", "OpenReleasePilot").call()?;
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(300))).build().into();
+    let response = agent.get(url).header("User-Agent", "OpenReleasePilot").call()?;
     let mut data = Vec::new();
-    response.into_reader().take(limit).read_to_end(&mut data)?;
+    response.into_body().into_reader().take(limit).read_to_end(&mut data)?;
     Ok(data)
 }
 

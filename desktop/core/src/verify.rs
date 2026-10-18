@@ -35,11 +35,11 @@ fn url_for(base: &str, path: &str) -> String {
 
 fn check(agent: &ureq::Agent, base: &str, path: &str, expected: &str) -> Result<(), String> {
     let response = agent.get(&url_for(base, path)).call().map_err(|e| match e {
-        ureq::Error::Status(code, _) => format!("HTTP {code}"),
+        ureq::Error::StatusCode(code) => format!("HTTP {code}"),
         other => other.to_string(),
     })?;
     let mut body = Vec::new();
-    response.into_reader().take(256 * 1024 * 1024).read_to_end(&mut body).map_err(|e| e.to_string())?;
+    response.into_body().into_reader().take(256 * 1024 * 1024).read_to_end(&mut body).map_err(|e| e.to_string())?;
     if hex::encode(Sha256::digest(&body)) == expected {
         Ok(())
     } else {
@@ -55,10 +55,11 @@ pub fn compare(base: &str, manifest: &Manifest, on_progress: impl Fn(usize, usiz
         .filter(|(path, _)| !path.split('/').any(|s| s.starts_with('.')))
         .map(|(path, entry)| (path, &entry.sha256))
         .collect();
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(30))
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(30)))
         .user_agent("OpenReleasePilot verify")
-        .build();
+        .build()
+        .into();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let problems = Mutex::new(Vec::new());
