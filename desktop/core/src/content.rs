@@ -800,6 +800,13 @@ pub fn publish_docs(repo: &str, dir: &Path, proposal: &Proposal, title: &str, bo
     if let Some(why) = docs_conflict(repo, proposal)? {
         return Err(Conflict(format!("{why}; neu vorbereiten")).into());
     }
+    deliver(repo, dir, proposal, title, body)
+}
+
+/// Commit with exactly the proposal's files on top of its base commit, its branch and a pull
+/// request into its base branch, through the API; picks up what an interrupted attempt created.
+/// Checks nothing about the base branch (`publish_docs` does that for documentation).
+pub fn deliver(repo: &str, dir: &Path, proposal: &Proposal, title: &str, body: &str) -> Result<PullRequestRef> {
     let files = approved_files(dir, proposal)?;
     if let Some(p) = crate::gitlab::project(repo) {
         let docs: Vec<crate::gitlab::DocsFile> = files

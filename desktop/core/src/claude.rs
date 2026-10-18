@@ -358,7 +358,7 @@ pub const GITLAB_REVIEW_DISALLOWED: &[&str] = &[
 ];
 
 /// One entry per pull request; see `repocare::Review`.
-pub const REVIEW_SCHEMA: &str = r#"{"type":"object","properties":{"prs":{"type":"array","items":{"type":"object","properties":{"number":{"type":"integer"},"action":{"type":"string","enum":["merge","keep","close"]},"risk":{"type":"string","enum":["green","yellow","red"]},"bump":{"type":"string"},"reason":{"type":"string"},"proof":{"type":"string"},"supersededBy":{"type":"integer"}},"required":["number","action","risk","reason"]}}},"required":["prs"]}"#;
+pub const REVIEW_SCHEMA: &str = r#"{"type":"object","properties":{"prs":{"type":"array","items":{"type":"object","properties":{"number":{"type":"integer"},"action":{"type":"string","enum":["merge","keep","close"]},"risk":{"type":"string","enum":["green","yellow","red"]},"bump":{"type":"string"},"reason":{"type":"string"},"proof":{"type":"string"},"repair":{"type":"string"},"supersededBy":{"type":"integer"}},"required":["number","action","risk","reason"]}}},"required":["prs"]}"#;
 
 /// The rules of the dependabot-pr skill, so the review does not depend on it being installed.
 const REVIEW_RULES: &str = "\
@@ -398,6 +398,14 @@ Datei:Zeile in die Begründung schreiben; trotzdem keep.
 - PRs von Menschen oder anderen Bots (z. B. Copilot): den Diff vollständig lesen (gh pr diff). merge nur, wenn \
 die Änderung abgeschlossen, nachvollziehbar, von der CI abgedeckt und klein genug ist, um sie ganz zu prüfen; \
 risk dann höchstens yellow. Große, unfertige oder unklare Änderungen: keep.
+Reparatur (repair): Lässt du einen Dependabot-PR offen, weil der Code an die neue Version angepasst werden muss \
+(entfernte oder geänderte API, der Build bricht), und ist die Anpassung überschaubar und rein im Code, beschreib sie \
+in repair in einem Satz mit den betroffenen Dateien (z. B. „ureq-2-API auf ureq 3 umstellen in github.rs, gitlab.rs, \
+verify.rs, update.rs“). Die App bietet dann an, die Anpassung in einem eigenen Lauf schreiben zu lassen und als neuen \
+PR einzureichen. Sonst repair weglassen, auch bei allem, was nur Release-Notes-Unklarheit ist.
+PRs vom Branch openreleasepilot/fix-<n> sind Reparaturen der App für PR #n: Diff vollständig lesen wie bei PRs von \
+Menschen, risk höchstens yellow, merge nur, wenn die Anpassung vollständig und schlüssig ist. Den reparierten PR #n \
+nicht schließen; der Bot schließt ihn nach dem Merge selbst.
 Wenn ein Skill dependabot-pr verfügbar ist, gelten zusätzlich seine Bewertungsregeln und Repo-Besonderheiten; \
 seine Schritte zum Mergen und Kommentieren führst du nicht aus.
 Befehle einzeln ausführen, ohne cd, && oder Schleifen; zusammengesetzte Befehle werden ohne Rückfrage abgelehnt \
@@ -442,6 +450,13 @@ Datei:Zeile in die Begründung schreiben; trotzdem keep.
 - MRs von Menschen oder anderen Bots: den Diff vollständig lesen (glab mr diff <iid> -R <url>). merge nur, wenn \
 die Änderung abgeschlossen, nachvollziehbar, von der Pipeline abgedeckt und klein genug ist, um sie ganz zu \
 prüfen; risk dann höchstens yellow. Große, unfertige oder unklare Änderungen: keep.
+Reparatur (repair): Lässt du einen Renovate-MR offen, weil der Code an die neue Version angepasst werden muss \
+(entfernte oder geänderte API, der Build bricht), und ist die Anpassung überschaubar und rein im Code, beschreib sie \
+in repair in einem Satz mit den betroffenen Dateien. Die App bietet dann an, die Anpassung in einem eigenen Lauf \
+schreiben zu lassen und als neuen MR einzureichen. Sonst repair weglassen.
+MRs vom Branch openreleasepilot/fix-<n> sind Reparaturen der App für MR !n: Diff vollständig lesen wie bei MRs von \
+Menschen, risk höchstens yellow, merge nur, wenn die Anpassung vollständig und schlüssig ist. Den reparierten MR !n \
+nicht schließen; Renovate schließt ihn nach dem Merge selbst.
 Befehle einzeln ausführen, ohne cd, && oder Schleifen; zusammengesetzte Befehle werden ohne Rückfrage abgelehnt \
 (Pipes zu jq oder head gehen).
 
@@ -472,10 +487,11 @@ pub fn review_prompt(plan: &crate::repocare::Plan, proofs: Option<&crate::proof:
         let more = pr.files.len().saturating_sub(15);
         let files = pr.files.iter().take(15).cloned().collect::<Vec<_>>().join(", ");
         text.push_str(&format!(
-            "- #{} „{}“ von {}; {}; GitHub: {}; Dateien: {}{}\n",
+            "- #{} „{}“ von {}{}; {}; GitHub: {}; Dateien: {}{}\n",
             pr.number,
             pr.title,
             pr.author,
+            pr.fix_of.map(|n| format!(" (Reparatur der App für #{n})")).unwrap_or_default(),
             pr.size,
             gate,
             files,
@@ -510,10 +526,11 @@ fn gitlab_review_prompt(plan: &crate::repocare::Plan, project: &crate::gitlab::P
         let more = pr.files.len().saturating_sub(15);
         let files = pr.files.iter().take(15).cloned().collect::<Vec<_>>().join(", ");
         text.push_str(&format!(
-            "- !{} „{}“ von {}; {}; GitLab: {}; Dateien: {}{}\n",
+            "- !{} „{}“ von {}{}; {}; GitLab: {}; Dateien: {}{}\n",
             pr.number,
             pr.title,
             pr.author,
+            pr.fix_of.map(|n| format!(" (Reparatur der App für !{n})")).unwrap_or_default(),
             pr.size,
             gate,
             files,
@@ -564,8 +581,25 @@ pub fn review_args(
     gitlab: bool,
     proofs: Option<&crate::proof::Proofs>,
 ) -> Vec<String> {
+    judge_args(prompt, REVIEW_SCHEMA, model, effort, max_budget_usd, gitlab, proofs)
+}
+
+/// The repair run: the review's tools and sandbox, Edit only inside the worktree, the answer as `REPAIR_SCHEMA`.
+pub fn repair_args(prompt: &str, model: Option<&str>, effort: Option<&str>, max_budget_usd: Option<f64>, gitlab: bool, proofs: &crate::proof::Proofs) -> Vec<String> {
+    judge_args(prompt, REPAIR_SCHEMA, model, effort, max_budget_usd, gitlab, Some(proofs))
+}
+
+fn judge_args(
+    prompt: &str,
+    schema: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    max_budget_usd: Option<f64>,
+    gitlab: bool,
+    proofs: Option<&crate::proof::Proofs>,
+) -> Vec<String> {
     let mut args: Vec<String> =
-        vec!["-p".into(), prompt.into(), "--output-format".into(), "stream-json".into(), "--verbose".into(), "--json-schema".into(), REVIEW_SCHEMA.into()];
+        vec!["-p".into(), prompt.into(), "--output-format".into(), "stream-json".into(), "--verbose".into(), "--json-schema".into(), schema.into()];
     if let Some(model) = model.filter(|m| !m.is_empty()) {
         args.extend(["--model".into(), model.to_owned()]);
     }
@@ -590,6 +624,39 @@ pub fn review_args(
     args.push("--disallowedTools".into());
     args.extend(disallowed);
     args
+}
+
+/// Claude's answer after a repair: whether build and tests pass, what changed, what it ran.
+pub const REPAIR_SCHEMA: &str = r#"{"type":"object","properties":{"done":{"type":"boolean"},"summary":{"type":"string"},"proof":{"type":"string"}},"required":["done","summary","proof"]}"#;
+
+/// Asks Claude to adapt the code in `dir` (the update's worktree) to the update.
+pub fn repair_prompt(plan: &crate::repocare::Plan, pr: &crate::repocare::PullRequest, dir: &std::path::Path, proofs: &crate::proof::Proofs) -> String {
+    let (word, mark) = if crate::gitlab::project(&plan.repo).is_some() { ("MR", "!") } else { ("PR", "#") };
+    format!(
+        "Passe im Repository {repo} den Code an das Update aus {word} {mark}{number} „{title}“ an. Das aktuelle Verzeichnis \
+         ({root}) enthält die Wegwerf-Kopie {dir}: genau der Commit dieses {word}s, die Abhängigkeit ist dort schon \
+         angehoben. Die Bewertung hat ergeben: {reason}\nVorhaben: {repair}\n\n\
+         Regeln:\n\
+         - Ändere nur, was die Anpassung an die neue Version braucht: Code und, wenn der Build es verlangt, Manifest- oder \
+         Lock-Dateien. Keine anderen Abhängigkeiten anheben, nichts umbauen, was nicht dazugehört, Verhalten unverändert lassen.\n\
+         - Keine Tests abschwächen, überspringen oder löschen; keine Dateien löschen; keine Pipeline-Dateien (.github, \
+         .gitlab, .gitlab-ci.yml) und nichts unter .git.\n\
+         - Keine Hilfsdateien in der Kopie: eigene Prüfprojekte in einem Unterordner von {root} neben der Kopie.\n\
+         - Bauen und testen (z. B. cargo build und cargo test mit --manifest-path, npm ci und npm test mit --prefix, go test \
+         mit -C), einzeln, ohne cd. Fertig ist es erst, wenn Build und Tests grün sind. Nicht committen, nicht pushen: \
+         Das macht die App, die deine Änderungen danach prüft.\n\
+         Befehle laufen in einer Sandbox: schreiben nur in {root} und dem Cache, Netz nur zu Paket-Registries.\n\n\
+         Antwort: done true nur, wenn Build und Tests mit deiner Anpassung grün sind; sonst false und in summary warum. \
+         summary: zwei bis vier Sätze auf Deutsch, was geändert wurde (für den Text des neuen {word}s). proof: was du \
+         ausgeführt hast und mit welchem Ergebnis.",
+        repo = plan.repo,
+        number = pr.number,
+        title = pr.title,
+        root = proofs.root.display(),
+        dir = dir.display(),
+        reason = pr.reason,
+        repair = pr.repair.as_deref().unwrap_or("die Breaking Changes der neuen Version im Code nachziehen"),
+    )
 }
 
 /// Inside the worktrees too: no git internals, no pipelines.

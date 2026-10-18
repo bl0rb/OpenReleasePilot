@@ -202,6 +202,20 @@ Plan als **Nachweis**; ein Major mit grüner CI, dessen Breaking Changes den gen
 nicht treffen, ist gelb statt rot. PRs, die Claude offen lässt, stehen als „N brauchen dich“ da, nicht
 als „Nichts zu tun“.
 
+**Reparieren lassen:** Lässt Claude ein Update offen, weil der Code angepasst werden muss (eine entfernte
+API, der Build bricht), und ist die Anpassung überschaubar, beschreibt Claude sie, und der Plan bietet sie
+unter **Reparieren lassen** an, nicht angehakt. Angehakt passt Claude nach der Freigabe den Code in einer
+Wegwerf-Kopie auf dem Commit des Updates an, in derselben Sandbox; fertig ist es erst mit grünem Build und
+grünen Tests. Die App prüft die geänderten Dateien (keine Pipeline-Dateien, nichts unter `.git`, nichts
+gelöscht, Größengrenzen), legt über die API einen Commit auf den Commit des Updates und öffnet daraus einen
+neuen PR vom Branch `openreleasepilot/fix-<n>`. Der Branch des Updates bleibt unberührt (Dependabot würde
+einen Branch mit fremden Commits nicht mehr neu aufbauen); nach dem Merge der Reparatur schließt der Bot
+seinen PR selbst. Gemergt wird beim Reparieren nichts: Den neuen PR bewertet der nächste Pflegeplan wie den
+eines Menschen (Diff vollständig, höchstens gelb), mit einem eigenen Claude-Lauf, und gemergt wird nur
+nach deiner Freigabe. Eine Reparatur, die Update-, Signatur- oder Zugangsdaten-Code berührt (z. B.
+`update.rs`, `verify.rs`), steht nur zur Wahl und wird nie von selbst eingeplant. Ein Abbruch mitten in der
+Reparatur wird beim Fortsetzen erkannt: Ist der PR schon offen, gilt sie als erledigt.
+
 Direkt vor jedem Schreiben prüft die App erneut:
 
 - **Merge:** noch offen und kein Entwurf, gleicher Head-Commit, gleicher Zielbranch und gleiches

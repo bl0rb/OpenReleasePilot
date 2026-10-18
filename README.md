@@ -197,6 +197,19 @@ after the review. What Claude ran shows in the plan as **Nachweis**; a major wit
 changes provably miss the code it uses becomes yellow instead of red. Pull requests Claude keeps open
 show as "N brauchen dich", not as "nothing to do".
 
+**Repairs (Reparieren lassen):** when Claude keeps an update open because the code must be adapted (an API
+was removed, the build breaks) and the adaptation is contained, it describes it, and the plan offers it
+under **Reparieren lassen**, unticked. Ticked, Claude adapts the code after the approval in a throwaway
+worktree on the update's commit, in the same sandbox; it is done only with a green build and green tests.
+The app checks the changed files (no pipeline files, nothing under `.git`, nothing deleted, size limits),
+creates a commit on top of the update's commit through the API and opens a new pull request from
+`openreleasepilot/fix-<n>`. The update's own branch stays untouched (Dependabot stops rebasing a branch with
+foreign commits); once the repair is merged, the bot closes its pull request itself. Repairing merges
+nothing: the next care plan reviews the new pull request like one by a person (whole diff, at most yellow)
+in a separate Claude run, and it is merged only after your approval. A repair that touches update,
+signature or credential code (e.g. `update.rs`, `verify.rs`) is only offered for choice, never planned. An
+interruption during a repair is resolved on resume: if its pull request is open, the repair counts as done.
+
 Right before each write the app checks again:
 
 - **Merge:** still open and no draft, same head commit, same target branch and repository, mergeable

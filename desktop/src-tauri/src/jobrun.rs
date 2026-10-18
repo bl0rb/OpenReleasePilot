@@ -12,7 +12,7 @@ use openreleasepilot_core::jobs::{self, CareItem, ItemKind, ItemOutcome, Job, Jo
 use openreleasepilot_core::repocare::{self, Action, CiWait, Done, Plan, PlanSet, ReleaseWait, RunState};
 use openreleasepilot_core::repos::RepoTarget;
 use openreleasepilot_core::forge::Forge;
-use openreleasepilot_core::{git, github, proof, shell};
+use openreleasepilot_core::{git, github, proof, repair, shell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -391,6 +391,7 @@ pub fn plan_summary(plans: &[Plan]) -> String {
         (sum(&|p| p.tag.is_some() as usize), "Tag".to_owned(), "Tags".to_owned()),
         (sum(&|p| p.branches.len() + p.local_branches.len()), "Branch löschen".to_owned(), "Branches löschen".to_owned()),
         (sum(&|p| p.prs.iter().filter(|pr| pr.optional).count()), format!("{word} zur Wahl"), format!("{word}s zur Wahl")),
+        (sum(&|p| if p.clone.is_some() { p.prs.iter().filter(|pr| pr.repair.is_some()).count() } else { 0 }), "Reparatur zur Wahl".to_owned(), "Reparaturen zur Wahl".to_owned()),
     ]
     .into_iter()
     .filter(|(n, ..)| *n > 0)
@@ -524,8 +525,13 @@ fn care_run(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
         }
         job.items[n].writing = true;
         save(ctx, job)?;
+        let result = if item.kind == ItemKind::Repair {
+            repair_item(ctx, plan, &item, &job.options.model)
+        } else {
+            let state = job.run_states.entry(item.repo.clone()).or_insert_with(|| RunState::new(plan));
+            execute(plan, &item, state)
+        };
         let state = job.run_states.entry(item.repo.clone()).or_insert_with(|| RunState::new(plan));
-        let result = execute(plan, &item, state);
         let (outcome, text) = match result {
             Ok(Done::Ok(text)) => (ItemOutcome::Done, text),
             Ok(Done::Nothing(text)) => (ItemOutcome::AlreadyDone, text),
@@ -578,7 +584,70 @@ fn execute(plan: &Plan, item: &CareItem, state: &mut RunState) -> Result<Done> {
         ItemKind::LocalSync => repocare::sync_local(plan, state),
         ItemKind::LocalBranch => repocare::delete_local_branch(plan, plan.local_branches.iter().find(|b| b.name == item.reference).context("Branch nicht im Plan")?, state),
         ItemKind::Tag => Ok(Done::Skipped("im Release-Schritt".into())),
+        ItemKind::Repair => Ok(Done::Skipped("Reparatur braucht Claude".into())),
     }
+}
+
+/// Claude adapts the code to the update in a throwaway worktree on the update's commit; the app
+/// checks the changed files and opens a repair pull request from `repair::fix_branch`. Nothing is
+/// pushed unless build and tests passed in Claude's run and the changes pass the app's checks.
+fn repair_item(ctx: &Ctx, plan: &Plan, item: &CareItem, chosen_model: &str) -> Result<Done> {
+    let number: u64 = item.reference.parse().context("PR-Nummer unlesbar")?;
+    let pr = plan.prs.iter().find(|p| p.number == number).context("PR nicht im Plan")?;
+    let word = Forge::of(&plan.repo).request();
+    if let Some(fix) = repair::existing(plan, number)? {
+        return Ok(Done::Nothing(format!("Reparatur {} ist schon offen: {}", repocare::request_ref(&plan.repo, fix.number), fix.url)));
+    }
+    if let Some(why) = repocare::still_current(plan, pr)? {
+        return Ok(Done::Skipped(format!("{word} {why}; neue Vorschau nötig")));
+    }
+    let proofs = proof::Proofs::prepare_only(plan, &[number])?;
+    let Some((_, dir)) = proofs.trees.first().cloned() else {
+        let why = proofs.missing.first().map(|(_, why)| why.clone()).unwrap_or_else(|| "keine Wegwerf-Kopie".into());
+        return Ok(Done::Skipped(format!("keine Wegwerf-Kopie: {why}")));
+    };
+    let (model, effort, budget) = claude_settings(ctx, &[chosen_model]);
+    let prompt = claude::repair_prompt(plan, pr, &dir, &proofs);
+    let args = claude::repair_args(&prompt, model.as_deref(), effort.as_deref(), budget, matches!(Forge::of(&plan.repo), Forge::Gitlab { .. }), &proofs);
+    ctx.cmd(format!("  $ claude -p … --model {} (passt den Code für {} an, in der Sandbox)", model.as_deref().unwrap_or("Standard"), item.label));
+    let mut outcome = None;
+    let code = shell::stream("claude", &args, &proofs.root, &proofs.env(), &ctx.runner, |line| match claude::parse(line) {
+        Event::Line(text) => ctx.log("claude", format!("  {text}")),
+        Event::Done(done) => outcome = Some(done),
+        Event::Ignore => {}
+    })?;
+    let outcome = outcome.ok_or_else(|| anyhow!("Claude Code hat ohne Ergebnis beendet (Exit-Code {code})"))?;
+    if let Some(cost) = outcome.cost_usd {
+        ctx.info(format!("  Claude-Reparatur {cost:.2} USD"));
+    }
+    if !outcome.success {
+        return Ok(Done::Skipped(format!("Claude hat die Reparatur nicht abgeschlossen: {}", outcome.text)));
+    }
+    let answer: RepairAnswer = serde_json::from_value(outcome.structured.context("Claude hat keine strukturierte Antwort geliefert")?)
+        .context("Claudes Antwort passt nicht zum Schema")?;
+    if !answer.done {
+        return Ok(Done::Skipped(format!("nicht repariert: {}", answer.summary.trim())));
+    }
+    let changes = match repair::collect(&dir)? {
+        Ok(changes) if changes.files.is_empty() => return Ok(Done::Skipped("Claude hat nichts geändert".into())),
+        Ok(changes) => changes,
+        Err(problems) => return Ok(Done::Skipped(format!("Änderungen abgelehnt, nichts gepusht: {}", problems.join("; ")))),
+    };
+    // Checked again right before the write: the update may have moved while Claude worked.
+    if let Some(why) = repocare::still_current(plan, pr)? {
+        return Ok(Done::Skipped(format!("{word} {why} während der Reparatur; nichts gepusht")));
+    }
+    ctx.info(format!("  {} Datei(en) geändert: {}", changes.files.len(), changes.files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>().join(", ")));
+    let fix = repair::publish(plan, pr, &dir, changes, answer.summary.trim(), answer.proof.trim())?;
+    Ok(Done::Ok(format!("Reparatur {} eröffnet: {} – {}", repocare::request_ref(&plan.repo, fix.number), fix.url, answer.proof.trim())))
+}
+
+#[derive(serde::Deserialize)]
+struct RepairAnswer {
+    done: bool,
+    summary: String,
+    #[serde(default)]
+    proof: String,
 }
 
 // MARK: Release

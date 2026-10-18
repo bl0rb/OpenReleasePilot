@@ -67,6 +67,11 @@ pub struct Proofs {
 impl Proofs {
     /// One worktree per pull request of the plan, at the head commit the preview saw. Needs the local clone.
     pub fn prepare(plan: &Plan) -> Result<Proofs> {
+        Proofs::prepare_only(plan, &[])
+    }
+
+    /// Like `prepare`, only for these pull requests (all when empty).
+    pub fn prepare_only(plan: &Plan, numbers: &[u64]) -> Result<Proofs> {
         let clone = PathBuf::from(plan.clone.as_deref().context("keine lokale Kopie")?);
         let slug = slug(&plan.repo);
         let root = std::env::temp_dir().join("OpenReleasePilot-Proof").join(&slug);
@@ -79,7 +84,7 @@ impl Proofs {
         let cache = cache.canonicalize()?;
         let mut proofs = Proofs { root, cache, clone, trees: Vec::new(), missing: Vec::new() };
 
-        let prs: Vec<_> = plan.prs.iter().filter(|pr| !pr.head_sha.is_empty()).collect();
+        let prs: Vec<_> = plan.prs.iter().filter(|pr| !pr.head_sha.is_empty() && (numbers.is_empty() || numbers.contains(&pr.number))).collect();
         for pr in prs.iter().skip(MAX_TREES) {
             proofs.missing.push((pr.number, format!("mehr als {MAX_TREES} PRs")));
         }

@@ -138,6 +138,13 @@ pub struct PullRequest {
     /// What Claude ran in a throwaway worktree to back its verdict, and the result.
     #[serde(default)]
     pub proof: Option<String>,
+    /// Claude's plan for adapting the code to the update, when it is contained enough to try; offered
+    /// to the user as a repair (`repair`), never run without the approval naming it.
+    #[serde(default)]
+    pub repair: Option<String>,
+    /// This pull request is the app's repair of that one (its branch is `repair::fix_branch`).
+    #[serde(default)]
+    pub fix_of: Option<u64>,
     /// e.g. `+12 −3 in 2 Dateien`, for the prompt.
     #[serde(skip)]
     pub size: String,
@@ -187,6 +194,9 @@ pub struct Verdict {
     /// What Claude ran in the throwaway worktree, and the result.
     #[serde(default)]
     pub proof: String,
+    /// For an update kept open because the code must be adapted: what to change.
+    #[serde(default)]
+    pub repair: String,
     #[serde(default, rename = "supersededBy")]
     pub superseded_by: Option<u64>,
 }
@@ -384,6 +394,7 @@ pub fn apply_review(plan: &mut Plan, verdicts: &[Verdict]) -> Vec<String> {
         pr.superseded_by = None;
         pr.optional = false;
         pr.proof = None;
+        pr.repair = None;
         let matching: Vec<&Verdict> = verdicts.iter().filter(|v| v.number == pr.number).collect();
         let verdict = match matching.as_slice() {
             [] => {
@@ -434,7 +445,26 @@ pub fn apply_review(plan: &mut Plan, verdicts: &[Verdict]) -> Vec<String> {
             _ => (Action::Keep, reason),
         };
         // Claude's "keep" is advice: a merge that the app's rules allow stays the user's choice.
-        pr.optional = pr.action == Action::Keep && verdict.action == "keep" && safe && pr.ready;
+        // Not for the app's own repairs: their merge is never offered against Claude's advice.
+        pr.optional = pr.action == Action::Keep && verdict.action == "keep" && safe && pr.ready && pr.fix_of.is_none();
+        if pr.fix_of.is_some() && pr.action == Action::Merge {
+            let sensitive: Vec<&str> = pr.files.iter().map(String::as_str).filter(|f| crate::repair::sensitive(f)).collect();
+            if !sensitive.is_empty() {
+                // A repair that touches update, signature or credential code merges only when the user ticks it.
+                pr.action = Action::Keep;
+                pr.optional = true;
+                pr.reason = format!("Reparatur berührt sicherheitskritische Dateien ({}); nur auf deinen ausdrücklichen Wunsch: {}", sensitive.join(", "), pr.reason);
+            }
+        }
+        let repair = verdict.repair.trim();
+        if pr.action == Action::Keep && !pr.optional && pr.dependabot && pr.fix_of.is_none() && !repair.is_empty() {
+            pr.repair = Some(repair.to_owned());
+        }
+    }
+    // A pull request whose repair is open already needs no second one.
+    let repaired: Vec<u64> = plan.prs.iter().filter_map(|pr| pr.fix_of).collect();
+    for pr in plan.prs.iter_mut().filter(|pr| repaired.contains(&pr.number)) {
+        pr.repair = None;
     }
     // Low risk first, as in the dependabot-pr skill.
     let order = |pr: &PullRequest| match pr.risk.as_deref() {
@@ -1105,6 +1135,14 @@ pub(crate) fn pull(repo: &str, number: u64) -> Result<Value> {
     get(&path)?.with_context(|| format!("PR #{number} nicht gefunden"))
 }
 
+/// Why the pull request is no longer the one the preview saw (closed, new commits, other target); `None` while it is.
+pub fn still_current(plan: &Plan, pr: &PullRequest) -> Result<Option<String>> {
+    if let Some(p) = crate::gitlab::project(&plan.repo) {
+        return crate::gitlab::still_current(&p, plan, pr);
+    }
+    Ok(changed(plan, pr, &pull(&plan.repo, pr.number)?))
+}
+
 /// `None` when GitHub reports the pull request mergeable and the CI of its head passed; else why not.
 fn gate(repo: &str, pr: &Value) -> Result<Option<String>> {
     if pr["draft"].as_bool() == Some(true) {
@@ -1160,6 +1198,7 @@ fn pull_request(pr: &Value, repo: &str) -> PullRequest {
         author,
         head_sha: text(&pr["head"]["sha"]),
         head_branch: same_repo(pr, repo).then(|| text(&pr["head"]["ref"])),
+        fix_of: same_repo(pr, repo).then(|| crate::repair::fix_of(&text(&pr["head"]["ref"]))).flatten(),
         base: text(&pr["base"]["ref"]),
         url: text(&pr["html_url"]),
         size: format!(
@@ -1277,7 +1316,38 @@ mod tests {
     }
 
     fn verdict(number: u64, action: &str, risk: &str) -> Verdict {
-        Verdict { number, action: action.into(), risk: risk.into(), bump: String::new(), reason: "ok".into(), proof: String::new(), superseded_by: None }
+        Verdict { number, action: action.into(), risk: risk.into(), bump: String::new(), reason: "ok".into(), proof: String::new(), repair: String::new(), superseded_by: None }
+    }
+
+    #[test]
+    fn repairs_are_offered_for_kept_updates_only() {
+        let fix = |number: u64, of: u64, files: &[&str]| PullRequest {
+            fix_of: Some(of),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            head_branch: Some(crate::repair::fix_branch(of)),
+            ..pr(number, true, false, false)
+        };
+        let mut plan = Plan { prs: vec![pr(2, false, false, true), pr(3, true, false, false), pr(4, false, false, true), fix(5, 4, &["src/github.rs"])], ..Plan::default() };
+        let with_repair = |mut v: Verdict| {
+            v.repair = "API nachziehen".into();
+            v
+        };
+        apply_review(
+            &mut plan,
+            &[with_repair(verdict(2, "keep", "red")), with_repair(verdict(3, "keep", "red")), with_repair(verdict(4, "keep", "red")), verdict(5, "keep", "yellow")],
+        );
+        let by = |n: u64| plan.prs.iter().find(|p| p.number == n).unwrap();
+        assert_eq!(by(2).repair.as_deref(), Some("API nachziehen"), "a kept update gets the offer");
+        assert_eq!(by(3).repair, None, "not for a pull request by a person");
+        assert_eq!(by(4).repair, None, "its repair is open already");
+        assert!(!by(5).optional, "a repair is never offered for merging against Claude's advice");
+
+        let mut plan = Plan { prs: vec![fix(6, 2, &["desktop/core/src/update.rs", "desktop/core/src/github.rs"]), fix(7, 3, &["src/github.rs"])], ..Plan::default() };
+        apply_review(&mut plan, &[verdict(6, "merge", "yellow"), verdict(7, "merge", "yellow")]);
+        let by = |n: u64| plan.prs.iter().find(|p| p.number == n).unwrap();
+        assert_eq!((by(6).action, by(6).optional), (Action::Keep, true), "touches update code: only when ticked");
+        assert!(by(6).reason.contains("update.rs"), "{}", by(6).reason);
+        assert_eq!(by(7).action, Action::Merge);
     }
 
     #[test]
@@ -1834,6 +1904,50 @@ mod tests {
         assert!(!root.exists());
         let list = output("git", &["worktree", "list", "--porcelain"], &checkout).unwrap();
         assert!(!list.contains(&*root.to_string_lossy()), "{list}");
+    }
+
+    /// `cargo test -p openreleasepilot-core repairs_a_real_pull_request -- --ignored --nocapture`:
+    /// Claude adapts this checkout's code to PR `ORP_REPAIR_PR` of this app's own repository in a
+    /// throwaway worktree (model `ORP_REPAIR_MODEL`, default sonnet; up to 3 dollars) and the app
+    /// collects the changes. Pushes and opens the repair pull request only with `ORP_REPAIR_PUBLISH=1`.
+    #[test]
+    #[ignore = "network, Claude, writes worktrees into this checkout"]
+    fn repairs_a_real_pull_request() {
+        let number: u64 = std::env::var("ORP_REPAIR_PR").expect("ORP_REPAIR_PR").parse().unwrap();
+        let mut plan = scan(&own_target(), true, false);
+        assert!(plan.error.is_none(), "{:?}", plan.error);
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        plan.clone = Some(checkout.to_string_lossy().into_owned());
+        let pr = plan.prs.iter_mut().find(|pr| pr.number == number).expect("open PR");
+        pr.repair = Some("die Breaking Changes der neuen Version im Code nachziehen".into());
+        pr.reason = format!("Gate: {}", pr.gate);
+        let pr = pr.clone();
+        assert_eq!(crate::repair::existing(&plan, number).unwrap().map(|f| f.number), None, "no repair open yet");
+        let proofs = crate::proof::Proofs::prepare_only(&plan, &[number]).unwrap();
+        let (_, dir) = proofs.trees.first().cloned().expect("a worktree");
+        let model = std::env::var("ORP_REPAIR_MODEL").unwrap_or_else(|_| "sonnet".into());
+        let prompt = crate::claude::repair_prompt(&plan, &pr, &dir, &proofs);
+        let args = crate::claude::repair_args(&prompt, Some(&model), None, Some(3.0), false, &proofs);
+        let mut outcome = None;
+        crate::shell::stream("claude", &args, &proofs.root, &proofs.env(), &Runner::default(), |line| match crate::claude::parse(line) {
+            crate::claude::Event::Line(text) => println!("{text}"),
+            crate::claude::Event::Done(done) => outcome = Some(done),
+            crate::claude::Event::Ignore => {}
+        })
+        .unwrap();
+        let outcome = outcome.expect("a result");
+        println!("cost {:?}, denials {:?}", outcome.cost_usd, outcome.denials);
+        let answer = outcome.structured.expect("structured output");
+        println!("answer {answer:#}");
+        let changes = crate::repair::collect(&dir).unwrap();
+        match &changes {
+            Ok(c) => println!("stat\n{}\ndiff bytes {}", c.stat, c.diff.len()),
+            Err(problems) => println!("refused {problems:?}"),
+        }
+        if std::env::var("ORP_REPAIR_PUBLISH").is_ok() && answer["done"] == true {
+            let fix = crate::repair::publish(&plan, &pr, &dir, changes.unwrap(), answer["summary"].as_str().unwrap(), answer["proof"].as_str().unwrap()).unwrap();
+            println!("opened #{} {}", fix.number, fix.url);
+        }
     }
 
     #[test]

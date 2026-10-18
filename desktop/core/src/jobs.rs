@@ -223,6 +223,9 @@ pub enum ItemKind {
     LocalBranch,
     /// Only for leaving a planned tag out; the tag itself is the release step.
     Tag,
+    /// Claude adapts the code to an update; the app opens a repair pull request (see `repair`).
+    /// Always offered for choice, never planned.
+    Repair,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -596,6 +599,7 @@ pub fn care_result(items: &[CareItem]) -> (StepState, String) {
         (ItemKind::Merge, format!("{word} gemergt"), format!("{word}s gemergt")),
         (ItemKind::Close, format!("{word} geschlossen"), format!("{word}s geschlossen")),
         (ItemKind::Rebase, "Rebase angestoßen".to_owned(), "Rebases angestoßen".to_owned()),
+        (ItemKind::Repair, format!("Reparatur-{word} eröffnet"), format!("Reparatur-{word}s eröffnet")),
         (ItemKind::Branch, "Branch gelöscht".to_owned(), "Branches gelöscht".to_owned()),
         (ItemKind::LocalBranch, "lokaler Branch gelöscht".to_owned(), "lokale Branches gelöscht".to_owned()),
     ] {
@@ -651,6 +655,11 @@ pub fn care_items(set: &PlanSet) -> Vec<CareItem> {
         for pr in plan.prs.iter().filter(|pr| pr.action == Action::Keep && pr.optional) {
             items.push(CareItem { optional: true, ..item(ItemKind::Merge, pr.number.to_string(), crate::repocare::request_ref(&plan.repo, pr.number), pr.title.clone()) });
         }
+        // A repair needs the local clone for its worktree.
+        for pr in plan.prs.iter().filter(|pr| pr.action == Action::Keep && pr.repair.is_some() && plan.clone.is_some()) {
+            let label = format!("Reparatur von {}", crate::repocare::request_ref(&plan.repo, pr.number));
+            items.push(CareItem { optional: true, ..item(ItemKind::Repair, pr.number.to_string(), label, pr.title.clone()) });
+        }
         if let Some(tag) = &plan.tag {
             items.push(item(ItemKind::Tag, tag.clone(), format!("Tag {tag}"), "im Release-Schritt".into()));
         }
@@ -676,6 +685,7 @@ fn kind_key(kind: ItemKind) -> &'static str {
         ItemKind::LocalSync => "sync",
         ItemKind::LocalBranch => "local",
         ItemKind::Tag => "tag",
+        ItemKind::Repair => "repair",
     }
 }
 
@@ -703,8 +713,8 @@ pub fn approve_plan(job: &mut Job, plan_id: u64, excluded: &[String], included: 
         let chosen = item.optional && included.contains(&item.id) && !excluded.contains(&item.id);
         if item.optional && !chosen {
             item.outcome = Some(ItemOutcome::Excluded);
-            item.detail = "nicht gewählt; bleibt offen, wie Claude riet".into();
-        } else if chosen {
+            item.detail = if item.kind == ItemKind::Repair { "nicht gewählt".into() } else { "nicht gewählt; bleibt offen, wie Claude riet".into() };
+        } else if chosen && item.kind == ItemKind::Merge {
             // The user's choice turns the advice into a planned merge; the run checks it like any other.
             let plan = set.plans.iter_mut().find(|p| p.key == item.repo);
             if let Some(pr) = plan.and_then(|p| p.prs.iter_mut().find(|pr| pr.number.to_string() == item.reference)) {
@@ -917,6 +927,13 @@ pub fn resolve_item(item: &CareItem, plan: &crate::repocare::Plan, since: u64, s
             match crate::shell::output("git", &["rev-parse", "--verify", "--quiet", &reference], std::path::Path::new(dir)) {
                 Err(_) => found("gelöscht"),
                 Ok(_) => Resolution::NotDone,
+            }
+        }
+        ItemKind::Repair => {
+            let pr = plan.prs.iter().find(|p| p.number == number().unwrap_or(0)).context("PR nicht im Plan")?;
+            match crate::repair::existing(plan, pr.number)? {
+                Some(fix) => found(&format!("Reparatur {} eröffnet: {}", crate::repocare::request_ref(&plan.repo, fix.number), fix.url)),
+                None => Resolution::NotDone,
             }
         }
         ItemKind::LocalSync | ItemKind::Tag => Resolution::NotDone,
@@ -1198,6 +1215,33 @@ mod tests {
         assert_eq!(plan.prs[0].action, Action::Merge);
         assert!(plan.prs[0].reason.starts_with("von dir gewählt"));
         assert_eq!(plan.tag.as_deref(), Some("v1.3.1"));
+    }
+
+    #[test]
+    fn a_repair_is_offered_and_runs_only_when_chosen() {
+        let kept = PullRequest { number: 2, action: Action::Keep, reviewed: true, risk: Some("red".into()), repair: Some("ureq-3-API nachziehen".into()), ..PullRequest::default() };
+        let mut plan = Plan { key: "o/app".into(), repo: "o/app".into(), default_branch: "main".into(), prs: vec![kept], ..Plan::default() };
+        let set = |plan: &Plan| PlanSet { id: 9, created_at: 0, prs: true, cleanup: false, release: false, model: String::new(), targets: Vec::new(), plans: vec![plan.clone()] };
+        assert!(care_items(&set(&plan)).is_empty(), "no worktree without a local clone, so no repair");
+
+        plan.clone = Some("/clone".into());
+        let items = care_items(&set(&plan));
+        assert_eq!(items.iter().map(|i| (i.id.as_str(), i.kind, i.optional)).collect::<Vec<_>>(), [("o/app|repair|2", ItemKind::Repair, true)]);
+
+        let mut job = job(&all());
+        job.items = items.clone();
+        job.plan = Some(set(&plan));
+        job.step_mut("care").unwrap().state = StepState::NeedsApproval;
+        approve_plan(&mut job, 9, &[], &[], 1).unwrap();
+        assert_eq!(job.items[0].outcome, Some(ItemOutcome::Excluded), "not chosen, not run");
+
+        let mut job = self::job(&all());
+        job.items = items;
+        job.plan = Some(set(&plan));
+        job.step_mut("care").unwrap().state = StepState::NeedsApproval;
+        approve_plan(&mut job, 9, &[], &["o/app|repair|2".into()], 1).unwrap();
+        assert_eq!(job.items[0].outcome, None, "runs");
+        assert_eq!(job.plan.as_ref().unwrap().plans[0].prs[0].action, Action::Keep, "choosing a repair never merges the update");
     }
 
     fn proposal(fingerprint: &str, checks_ok: bool) -> Proposal {

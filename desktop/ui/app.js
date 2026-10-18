@@ -1891,7 +1891,8 @@ const OUTCOMES = {
   cancelled: ['idle', 'Abgebrochen'], excluded: ['idle', 'Ausgenommen'],
 };
 // What a carried-out item became, per kind, for the repository's summary: "3 gemergt", "2 bereits gelöscht".
-const DONE_TEXT = { merge: 'gemergt', close: 'geschlossen', rebase: 'Rebase angestoßen', branch: 'gelöscht', localBranch: 'lokal gelöscht', localSync: 'abgeglichen' };
+const REPAIR_CHECK = 'Anhaken heißt: Claude passt den Code in einer Wegwerf-Kopie auf dem Commit dieses PRs an (Sandbox, Build und Tests müssen grün sein). Die App prüft die geänderten Dateien (keine Pipeline-Dateien, nichts gelöscht) und öffnet daraus einen neuen PR vom Branch openreleasepilot/fix-…; der PR selbst bleibt unberührt. Gemergt wird nichts: Den neuen PR bewertet der nächste Pflegeplan, gemergt wird er erst nach deiner Freigabe. Kostet einen weiteren Claude-Lauf.';
+const DONE_TEXT = { repair: 'Reparatur eröffnet', merge: 'gemergt', close: 'geschlossen', rebase: 'Rebase angestoßen', branch: 'gelöscht', localBranch: 'lokal gelöscht', localSync: 'abgeglichen' };
 
 function careBlock(job, step) {
   const set = job.plan;
@@ -1905,7 +1906,7 @@ function careBlock(job, step) {
   const offered = job.items.filter((i) => i.optional).length;
   return [
     h('div', { class: 'note' }, `Plan von ${formatTime(set.createdAt)}${cost ? `, Claude-Prüfung ${usd(cost)}` : ''}. ${decide
-      ? `Häkchen entfernen nimmt einzelne Aktionen aus${offered ? '; unter „Zur Wahl“ kannst du Merges anhaken, von denen Claude abrät' : ''}. Mehr kann die Freigabe nicht hinzufügen. Vor jeder Aktion prüft die App erneut, was sich geändert hat, wird übersprungen.`
+      ? `Häkchen entfernen nimmt einzelne Aktionen aus${offered ? '; Angebotenes (Merges, von denen Claude abrät, und Reparaturen) läuft nur, wenn du es anhakst' : ''}. Mehr kann die Freigabe nicht hinzufügen. Vor jeder Aktion prüft die App erneut, was sich geändert hat, wird übersprungen.`
       : 'Erledigtes bleibt bestehen, auch nach Fehlern oder Abbruch.'}`),
     h('div', { class: 'runs' }, set.plans.map((p) => planRepo(job, p, decide, marks, set.plans.length === 1))),
     decide && decisionBar(
@@ -1949,11 +1950,15 @@ function planRepo(job, p, decide, marks, single) {
       button(requestRef(p.repo, pr.number), () => call('open_url', { url: pr.url }), { cls: 'link mono', title: `Auf ${serviceOf(p.repo)} öffnen` }),
       h('span', { class: 'item-title', title: pr.title }, pr.bump ? `${pr.title.replace(/ from .* to .*$/, '')} ${pr.bump}` : pr.title),
       !pr.dependabot && h('span', { class: 'muted small' }, pr.author),
+      pr.fixOf && badge('accent', `Reparatur für ${requestRef(p.repo, pr.fixOf)}`),
       h('span', { class: 'spacer' }), risk && badge(risk[0], `Claude: ${risk[1]}`)], [
       pr.reason && h('div', { class: 'item-reason selectable' }, pr.reviewed ? `Claude: ${pr.reason}` : pr.reason),
       pr.proof && h('div', { class: 'item-reason selectable' }, `Nachweis: ${pr.proof}`),
+      item.kind === 'repair' && pr.repair && h('div', { class: 'item-reason selectable' }, `Vorhaben: ${pr.repair}`),
+      decide && item.kind === 'repair' && h('div', { class: 'item-check' }, REPAIR_CHECK.replaceAll('PR', requestWord(p.repo))),
       pr.supersededBy && h('div', { class: 'item-reason' }, `Ersetzt durch #${pr.supersededBy}`),
-      decide && item.optional && h('div', { class: 'item-check' }, 'Claude rät, ihn offen zu lassen; nach den Regeln der App wäre er mergebar. Anhaken heißt: nach der Freigabe mergen, mit denselben Prüfungen direkt davor (noch offen, gleicher Commit, mergebar, CI des PR-Commits grün).'),
+      decide && item.optional && item.kind === 'merge' && pr.fixOf && h('div', { class: 'item-check' }, `Reparatur der App, die sicherheitskritische Dateien ändert: nie von selbst eingeplant. Anhaken heißt: nach der Freigabe mergen, mit denselben Prüfungen direkt davor (noch offen, gleicher Commit, mergebar, CI des ${requestWord(p.repo)}-Commits grün). Den Diff vorher selbst ansehen.`),
+      decide && item.optional && item.kind === 'merge' && !pr.fixOf && h('div', { class: 'item-check' }, 'Claude rät, ihn offen zu lassen; nach den Regeln der App wäre er mergebar. Anhaken heißt: nach der Freigabe mergen, mit denselben Prüfungen direkt davor (noch offen, gleicher Commit, mergebar, CI des PR-Commits grün).'),
       decide && APP_CHECK[pr.action] && h('div', { class: 'item-check' }, gitlabHost(p.repo)
         ? APP_CHECK[pr.action].replaceAll('GitHub', 'GitLab').replaceAll('Dependabot', 'Renovate').replaceAll('CI des PR-Commits', 'Pipeline des MR-Commits').replaceAll('PR', 'MR')
         : APP_CHECK[pr.action]),
@@ -1968,8 +1973,10 @@ function planRepo(job, p, decide, marks, single) {
   };
   const group = (title, list) => list.length > 0 && [h('div', { class: 'item-group' }, `${title} (${list.length})`), ...list];
   const of = (kind) => items.filter((i) => i.kind === kind);
-  const keep = p.prs.filter((pr) => pr.action === 'keep' && !pr.optional);
-  const choice = items.filter((i) => i.optional);
+  const repairs = items.filter((i) => i.kind === 'repair');
+  // A PR offered for repair shows there, with its reason; the rest of the kept ones below.
+  const keep = p.prs.filter((pr) => pr.action === 'keep' && !pr.optional && !repairs.some((i) => i.reference === String(pr.number)));
+  const choice = items.filter((i) => i.optional && i.kind === 'merge');
   const counts = ['merge', 'close', 'rebase'].map((k) => [k, of(k).filter((i) => !i.optional).length]).filter(([, n]) => n);
   const branches = of('branch').length + of('localBranch').length;
   // Once carried out, the summary tells what happened, not what the plan intended.
@@ -1989,6 +1996,7 @@ function planRepo(job, p, decide, marks, single) {
       carried ? results() : [
         counts.map(([k, n]) => badge(k === 'merge' ? 'green' : k === 'close' ? 'red' : 'accent', `${n} ${{ merge: 'mergen', close: 'schließen', rebase: 'Rebase' }[k]}`)),
         choice.length > 0 && badge('orange', `${choice.length} zur Wahl`),
+        repairs.length > 0 && badge('accent', `${repairs.length} ${repairs.length === 1 ? 'Reparatur' : 'Reparaturen'} zur Wahl`),
         of('tag').length > 0 && badge('green', `Tag ${p.tag ?? of('tag')[0].reference} geplant`),
         branches > 0 && badge('', `${branches} Branches löschen`)],
       keep.length > 0 && badge('orange', `${keep.length} ${keep.length === 1 ? 'braucht' : 'brauchen'} dich`)),
@@ -1999,6 +2007,7 @@ function planRepo(job, p, decide, marks, single) {
       h('div', { class: 'items' },
         group('Mergen', of('merge').filter((i) => !i.optional).map(prLine)),
         group('Zur Wahl: Claude rät, offen zu lassen', choice.map(prLine)),
+        group('Reparieren lassen', repairs.map(prLine)),
         group('Schließen', of('close').map(prLine)),
         group('Rebase anstoßen', of('rebase').map(prLine)),
         group('Tag', of('tag').map((item) => line(item, [h('strong', null, item.reference), h('span', { class: 'muted small' }, `nach ${p.lastTag ?? '?'}`), h('span', { class: 'spacer' }), decide && badge('', 'bedingt')],
@@ -2008,7 +2017,7 @@ function planRepo(job, p, decide, marks, single) {
         group('Lokale Kopie abgleichen', of('localSync').map((i) => line(i, h('span', null, 'git fetch --prune origin'), decide && h('div', { class: 'item-reason' }, `Vor dem Löschen, weil ${p.localSync}. Misslingt der Abgleich, löscht die App lokal nichts.`)))),
         group('Aufräumen lokal', of('localBranch').map((i) => branchLine(i, p.localBranches))),
         keep.length > 0 && [h('div', { class: 'item-group' }, `Bleibt offen (${keep.length})`), ...keep.map((pr) => h('div', { class: 'item' },
-          h('div', { class: 'item-line' }, button(requestRef(p.repo, pr.number), () => call('open_url', { url: pr.url }), { cls: 'link mono' }), h('span', { class: 'item-title' }, pr.title), h('span', { class: 'spacer' }), pr.risk && badge(RISKS[pr.risk][0], `Claude: ${RISKS[pr.risk][1]}`)),
+          h('div', { class: 'item-line' }, button(requestRef(p.repo, pr.number), () => call('open_url', { url: pr.url }), { cls: 'link mono' }), h('span', { class: 'item-title' }, pr.title), pr.fixOf && badge('accent', `Reparatur für ${requestRef(p.repo, pr.fixOf)}`), h('span', { class: 'spacer' }), pr.risk && badge(RISKS[pr.risk][0], `Claude: ${RISKS[pr.risk][1]}`)),
           h('div', { class: 'item-reason selectable' }, pr.reviewed ? `Claude: ${pr.reason}` : pr.reason),
           pr.proof && h('div', { class: 'item-reason selectable' }, `Nachweis: ${pr.proof}`)))]),
       p.cleanupNote && h('div', { class: 'note orange' }, p.cleanupNote),

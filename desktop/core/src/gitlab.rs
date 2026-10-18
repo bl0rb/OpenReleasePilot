@@ -29,7 +29,7 @@ pub struct Project {
 
 impl Project {
     /// `projects/<encoded path>`, the start of every project path in the API.
-    fn api(&self) -> String {
+    pub(crate) fn api(&self) -> String {
         format!("projects/{}", encode(&self.path))
     }
 
@@ -541,6 +541,7 @@ fn pull_request(mr: &Value) -> PullRequest {
         author,
         head_sha: text(&mr["sha"]),
         head_branch: same_project(mr).then(|| text(&mr["source_branch"])),
+        fix_of: same_project(mr).then(|| crate::repair::fix_of(&text(&mr["source_branch"]))).flatten(),
         base: text(&mr["target_branch"]),
         url: text(&mr["web_url"]),
         size: mr["changes_count"].as_str().map(|n| format!("{n} Dateien")).unwrap_or_default(),
@@ -696,6 +697,11 @@ fn changed(plan: &Plan, pr: &PullRequest, current: &Value) -> Option<String> {
         return Some(format!("zielt jetzt auf {base} statt auf {}", plan.default_branch));
     }
     None
+}
+
+/// See `repocare::still_current`.
+pub fn still_current(p: &Project, plan: &Plan, pr: &PullRequest) -> Result<Option<String>> {
+    Ok(changed(plan, pr, &merge_request(p, pr.number)?))
 }
 
 fn note(p: &Project, iid: u64, body: &str) -> Result<()> {
