@@ -75,11 +75,19 @@ const ICONS = {
   back: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
   check: '<path d="M5 12l5 5 9-10"/>',
   shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
+  repo: '<path d="M5 4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1z"/><path d="M9 3v18M12 8h4M12 12h4"/>',
+  jobs: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m3.5 6 1 1 2-2M3.5 12l1 1 2-2M3.5 18l1 1 2-2"/>',
+  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
+  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
+  warning: '<path d="M12 3 2 20h20z"/><path d="M12 9v5M12 17h.01"/>',
+  error: '<path d="M8 2h8l6 6v8l-6 6H8l-6-6V8z"/><path d="m15 9-6 6M9 9l6 6"/>',
+  done: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
+  download: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
 };
 
-function icon(name) {
+function icon(name, cls = '') {
   const span = document.createElement('span');
-  span.innerHTML = `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
+  span.innerHTML = `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
   return span.firstElementChild;
 }
 
@@ -168,39 +176,87 @@ function setView(next) {
   lastRunning = view.running;
   lastJobRunning = view.jobRunning;
   for (const key of [...selection]) if (!view.repositories.some((r) => r.key === key)) selection.delete(key);
-  renderToolbar();
+  const root = document.documentElement;
+  root.classList.toggle('vibrancy', !!view.vibrancy);
+  root.classList.toggle('mac', view.platform === 'macos');
+  renderSidebar();
   renderBanners();
   renderMain();
-  renderFooter();
+  renderToast();
   if (view.pendingHostKey && !hostKeyOpen) hostKeyDialog();
 }
 
-function renderToolbar() {
+let sidebarSignature = '';
+
+/** Areas on the left, settings and version below; like KeyZapper. */
+function renderSidebar() {
   const attention = view.repositories.filter((r) => r.health.state === 'blocked' || r.health.state === 'needsAttention').length;
   const decisions = view.jobs.filter((j) => j.status.state === 'needsApproval').length;
-  const nav = (id, label, extra) => h('button', {
-    type: 'button', class: `nav-item ${area === id ? 'active' : ''}`, 'aria-current': area === id ? 'page' : null,
-    onclick: () => showArea(id),
-  }, label, extra);
-  const badge = (n, text, cls = '') => n > 0 && h('span', { class: `nav-badge ${cls}`, title: text, 'aria-label': text }, n);
-  const where = [
-    view.repositories.length === 1 ? '1 Repository' : `${view.repositories.length} Repositories`,
-    view.site ? `Website ${view.site.name}` : view.config.projectDir ? 'Website nicht lesbar' : 'ohne Website',
-  ].join(' · ');
+  const open = openJobs().length;
   const started = view.repositories.length > 0 || !!view.config.projectDir;
-  document.getElementById('toolbar').replaceChildren(...[
-    h('div', { class: 'brand' },
-      h('img', { src: 'icon.svg', alt: '' }),
-      h('div', null, h('h1', null, 'OpenReleasePilot'), h('div', { class: 'project' }, where))),
-    started && h('nav', { class: 'nav', 'aria-label': 'Bereiche' },
-      nav('repos', 'Repositories', badge(attention, `${attention} brauchen Aufmerksamkeit`)),
-      nav('runs', 'Aufträge', badge(decisions, `${decisions} warten auf eine Entscheidung`, 'decision')),
-      view.config.projectDir && nav('website', 'Website')),
-    h('span', { class: 'spacer' }),
-    area === 'website' && view.site && button(view.site.url.replace(/^https?:\/\//, ''), () => call('open_url', { url: view.site.url }), { iconName: 'external', cls: 'link', title: 'Live-Seite öffnen' }),
-    area === 'website' && view.site && button('Produkt zur Website hinzufügen …', addProductDialog,
-      { iconName: 'plus', disabled: !!view.running, title: 'Ein Repository als neues Produkt auf der Website aufnehmen' }),
-    button('Einstellungen', settingsDialog, { iconName: 'gear', disabled: !!view.running, title: 'Zugänge, Ausführungsregeln, optionale Website' }),
+  const areas = started ? [
+    ['repos', 'Repositories', 'repo', attention ? [attention, 'warning', `${attention} brauchen Aufmerksamkeit`] : [view.repositories.length || null]],
+    ['runs', 'Aufträge', 'jobs', decisions ? [decisions, 'decision', `${decisions} warten auf eine Entscheidung`] : [open || null, null, open ? `${open} offen` : null]],
+    view.config.projectDir && ['website', 'Website', 'globe', view.running ? ['…', null, 'Ein Schritt läuft'] : [null]],
+  ].filter(Boolean) : [];
+  const signature = JSON.stringify([area, areas, !!view.running, view.version, view.devBuild, view.checkingUpdate]);
+  if (signature === sidebarSignature) return;
+  sidebarSignature = signature;
+  const check = (beta) => () => call('check_for_updates', { beta });
+  document.getElementById('sidebar').replaceChildren(
+    h('div', { class: 'brand', 'data-tauri-drag-region': '' }, h('img', { class: 'logo', src: 'icon.svg', alt: '' }), 'OpenReleasePilot'),
+    ...areas.map(([id, label, symbol, [count, tone, text]]) => h('button', {
+      type: 'button', class: `nav-item${area === id ? ' active' : ''}`, 'aria-current': area === id ? 'page' : null,
+      onclick: () => showArea(id),
+    }, icon(symbol), h('span', null, label),
+    count != null && h('span', { class: `nav-badge ${tone ?? ''}`, title: text, 'aria-label': text }, count))),
+    h('div', { class: 'sidebar-footer' },
+      h('button', {
+        type: 'button', class: 'nav-item', disabled: !!view.running, title: 'Zugänge, Ausführungsregeln, optionale Website', onclick: settingsDialog,
+      }, icon('gear'), h('span', null, 'Einstellungen')),
+      h('div', { class: 'version' },
+        view.devBuild ? 'OpenReleasePilot Entwicklungsversion' : `OpenReleasePilot ${view.version}`,
+        view.checkingUpdate ? h('span', null, 'Suche nach Updates …')
+          : [button('Nach Updates suchen', check(false), { cls: 'link' }), button('Beta-Version suchen', check(true), { cls: 'link' })])),
+  );
+}
+
+/** Title, one line of state and the area's own actions above each area. */
+const pageHead = h('header', { class: 'page-header', 'data-tauri-drag-region': '' });
+
+function renderPageHeader() {
+  const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+  let title;
+  let subtitle;
+  let actions = [];
+  if (area === 'runs') {
+    const open = openJobs();
+    const decisions = open.filter((j) => j.status.state === 'needsApproval').length;
+    title = 'Aufträge';
+    subtitle = open.length
+      ? [count(open.length, 'offener Auftrag', 'offene Aufträge'), decisions && count(decisions, 'wartet auf eine Entscheidung', 'warten auf eine Entscheidung')].filter(Boolean).join(' · ')
+      : 'Keine offenen Aufträge';
+  } else if (area === 'website') {
+    title = view.site ? `Website ${view.site.name}` : 'Website';
+    subtitle = view.site ? 'Prüfen, Inhalte aktualisieren, Veröffentlichen, Live-Seite prüfen' : 'Die Projektdatei der Website ist nicht lesbar';
+    actions = view.site ? [
+      button(view.site.url.replace(/^https?:\/\//, ''), () => call('open_url', { url: view.site.url }), { iconName: 'external', title: 'Live-Seite öffnen' }),
+      button('Produkt hinzufügen …', addProductDialog,
+        { iconName: 'plus', disabled: !!view.running, title: 'Ein Repository als neues Produkt auf der Website aufnehmen' }),
+    ] : [];
+  } else {
+    const n = (state) => view.repositories.filter((r) => r.health.state === state).length;
+    title = 'Repositories';
+    subtitle = [count(view.repositories.length, 'Repository', 'Repositories'),
+      n('blocked') && `${n('blocked')} blockiert`,
+      n('needsAttention') && count(n('needsAttention'), 'braucht Aufmerksamkeit', 'brauchen Aufmerksamkeit'),
+      n('healthy') && `${n('healthy')} in Ordnung`].filter(Boolean).join(' · ');
+  }
+  pageHead.replaceChildren(...[
+    h('div', { class: 'page-title', 'data-tauri-drag-region': '' },
+      h('h1', { 'data-tauri-drag-region': '' }, title),
+      subtitle && h('p', { 'data-tauri-drag-region': '' }, subtitle)),
+    actions.length > 0 && h('div', { class: 'page-actions' }, actions),
   ].filter(Boolean));
 }
 
@@ -214,23 +270,28 @@ function showArea(id) {
   if (area === 'repos' && !repoKey) repoListScroll = main.scrollTop;
   if (area === 'runs' && !jobId) jobListScroll = main.scrollTop;
   area = id;
-  renderToolbar();
+  renderSidebar();
   renderBanners();
   renderMain();
   if (id === 'repos') main.scrollTop = repoKey ? 0 : repoListScroll;
   if (id === 'runs') main.scrollTop = jobId ? 0 : jobListScroll;
 }
 
+const BANNER_ICONS = { warning: 'warning', error: 'error', update: 'download' };
+
 function banner(kind, text, actions = []) {
-  return h('div', { class: `banner ${kind}` }, h('div', { class: 'text selectable' }, text),
+  return h('div', { class: `banner ${kind}`, role: kind === 'error' || kind === 'warning' ? 'alert' : 'status' },
+    icon(BANNER_ICONS[kind] ?? 'info'),
+    h('div', { class: 'banner-text selectable' }, text),
     actions.map(([label, action, opts]) => button(label, action, opts)));
 }
 
 function updateBanner(u) {
   const installing = view.installingUpdate;
   const busy = view.running ? 'Erst nach dem laufenden Schritt' : view.jobRunning ? 'Erst nach dem laufenden Auftrag' : null;
-  return h('div', { class: 'banner update' },
-    h('div', { class: 'text' },
+  return h('div', { class: 'banner update', role: 'status' },
+    icon('download'),
+    h('div', { class: 'banner-text' },
       h('strong', null, `${u.prerelease ? 'Beta: ' : ''}OpenReleasePilot ${u.version} ist verfügbar (installiert: ${view.version})`),
       h('div', { class: 'muted small' }, installing ? 'Paket wird geladen, geprüft und installiert …'
         : `${u.prerelease ? 'Beta-Versionen sind zum Testen gedacht. ' : ''}Die Installation benötigt Administratorrechte, danach startet die App neu.`)),
@@ -240,22 +301,10 @@ function updateBanner(u) {
       { cls: 'primary', disabled: installing || !!busy, title: busy }));
 }
 
-function renderFooter() {
-  const checking = view.checkingUpdate;
-  const check = (beta) => () => call('check_for_updates', { beta });
-  document.getElementById('footer').replaceChildren(
-    h('span', null, view.devBuild ? 'OpenReleasePilot Entwicklungsversion' : `OpenReleasePilot ${view.version}`),
-    h('span', { class: 'spacer' }),
-    ...(checking ? [h('span', null, 'Suche nach Updates …')] : [
-      button('Nach Updates suchen', check(false), { cls: 'link' }),
-      button('Beta-Version suchen', check(true), { cls: 'link' })]));
-}
-
 function renderBanners() {
   const items = [];
   if (view.availableUpdate) items.push(updateBanner(view.availableUpdate));
   if (view.error) items.push(banner('error', view.error, [['Schließen', () => call('dismiss')]]));
-  if (view.notice) items.push(banner('info', view.notice, [['Schließen', () => call('dismiss')]]));
   if (view.jobsUnreadable.length) items.push(banner('warning', `Gespeicherte Aufträge nicht lesbar: ${view.jobsUnreadable.join('; ')}`));
   if (view.signedIn === false && view.repositories.some((r) => forgeOf(r) === 'github')) {
     items.push(banner('warning', 'Die GitHub-CLI ist nicht angemeldet: Status nur für öffentliche Repositories, Pflege nicht möglich. Im Terminal: gh auth login, oder ein eigenes Token in den Einstellungen.'));
@@ -267,6 +316,26 @@ function renderBanners() {
   if (area === 'website' && view.siteError) items.push(banner('warning', `Website: ${view.siteError}`, [['Einstellungen', settingsDialog]]));
   if (area === 'website' && view.site && !view.sftpReady) items.push(banner('warning', 'SFTP ist noch nicht eingerichtet: Veröffentlichen ist erst danach möglich.', [['Einstellungen', settingsDialog]]));
   document.getElementById('banners').replaceChildren(...items);
+}
+
+// MARK: Toasts
+
+let toastText = null;
+let toastTimer = null;
+
+/** Notices show briefly at the bottom right, so they are seen wherever the user clicked. */
+function renderToast() {
+  if (view.notice === toastText) return;
+  toastText = view.notice;
+  clearTimeout(toastTimer);
+  const container = document.getElementById('toasts');
+  if (!toastText) return container.replaceChildren();
+  const dismiss = () => call('dismiss_notice');
+  const later = (ms) => { clearTimeout(toastTimer); toastTimer = setTimeout(dismiss, ms); };
+  container.replaceChildren(h('div', { class: 'toast', onmouseenter: () => clearTimeout(toastTimer), onmouseleave: () => later(3000) },
+    icon('done', 'green'), h('div', { class: 'toast-text selectable' }, toastText),
+    button('Schließen', dismiss, { iconName: 'close', iconOnly: true })));
+  later(7000);
 }
 
 let skeleton = null;
@@ -295,7 +364,8 @@ function renderMain() {
   }
   if (view.config.projectDir && !skeleton) buildWebsite();
   if (!view.config.projectDir && skeleton) skeleton = null;
-  const roots = [reposUi.root, runsUi.root, skeleton?.root].filter(Boolean);
+  renderPageHeader();
+  const roots = [pageHead, reposUi.root, runsUi.root, skeleton?.root].filter(Boolean);
   if (main.children.length !== roots.length || roots.some((r, i) => main.children[i] !== r)) main.replaceChildren(...roots);
   reposUi.root.hidden = area !== 'repos';
   runsUi.root.hidden = area !== 'runs';
@@ -873,7 +943,6 @@ function renderRepos() {
     const allVisible = careable.length > 0 && careable.every((r) => selection.has(r.key));
     const filtered = repoQuery || repoFilter !== 'all';
     reposUi.head.replaceChildren(...[
-      h('h2', null, 'Repositories'),
       repos.length > 0 && h('label', { class: 'check-all', title: filtered ? 'Alle sichtbaren pflegbaren Repositories an- oder abwählen' : 'Alle pflegbaren Repositories an- oder abwählen' },
         h('input', {
           type: 'checkbox', id: 'repos-select-all', checked: allVisible,

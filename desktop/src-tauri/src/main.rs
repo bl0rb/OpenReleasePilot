@@ -23,7 +23,7 @@ use openreleasepilot_core::site::{self, Site};
 use openreleasepilot_core::verify::Report;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_dialog::DialogExt;
@@ -257,6 +257,19 @@ pub fn show_window(app: &AppHandle) {
     }
 }
 
+static VIBRANCY: AtomicBool = AtomicBool::new(false);
+
+/// Puts the system's translucent material behind the window: vibrancy on macOS, Mica on Windows 11.
+/// False where it is not available (Windows 10, Linux); the page then paints its own background.
+fn apply_window_material(window: &tauri::WebviewWindow) -> bool {
+    use window_vibrancy::{NSVisualEffectMaterial, NSVisualEffectState};
+    if cfg!(windows) {
+        window_vibrancy::apply_mica(window, None).is_ok()
+    } else {
+        window_vibrancy::apply_vibrancy(window, NSVisualEffectMaterial::Sidebar, Some(NSVisualEffectState::FollowsWindowActiveState), None).is_ok()
+    }
+}
+
 /// Runs blocking work (files, network, dialogs) off the main thread.
 async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
     tauri::async_runtime::spawn_blocking(f).await.expect("background task panicked")
@@ -278,6 +291,10 @@ struct View {
     version: String,
     /// Debug build: no update check.
     dev_build: bool,
+    /// `macos`, `windows` or `linux`.
+    platform: &'static str,
+    /// The system material shows behind the window; the page leaves its sidebar transparent.
+    vibrancy: bool,
     config: Config,
     project_display: String,
     /// Folder with the clones, as displayed (auto value if not set).
@@ -469,6 +486,8 @@ fn get_view(app: AppHandle) -> View {
         View {
             version,
             dev_build: cfg!(debug_assertions),
+            platform: std::env::consts::OS,
+            vibrancy: VIBRANCY.load(Ordering::Relaxed),
             config: m.config.clone(),
             project_display: if m.config.project_dir.is_empty() { String::new() } else { abbreviate_home(&expand_home(&m.config.project_dir)) },
             workspace_display: abbreviate_home(&m.config.workspace()),
@@ -943,6 +962,13 @@ async fn install_update(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn dismiss_update(app: AppHandle) {
     with_model(&app, |m| m.available_update = None);
+    changed(&app);
+}
+
+/// The toast with a notice closed (by itself or by the user); an error stays.
+#[tauri::command]
+fn dismiss_notice(app: AppHandle) {
+    with_model(&app, |m| m.notice = None);
     changed(&app);
 }
 
@@ -1729,6 +1755,8 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(Shared(Mutex::new(Model::load())))
         .setup(|app| {
+            let material = app.get_webview_window("main").is_some_and(|w| apply_window_material(&w));
+            VIBRANCY.store(material, Ordering::Relaxed);
             // Without a menu bar icon (a Linux desktop without one) the app works as before.
             if let Err(e) = tray::init(app.handle()) {
                 eprintln!("no menu bar icon: {e}");
@@ -1754,6 +1782,7 @@ fn main() {
             pick_file,
             open_url,
             dismiss,
+            dismiss_notice,
             run_step,
             run_all,
             run_add_product,

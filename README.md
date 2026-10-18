@@ -11,7 +11,7 @@ or a wiki up to date, and, if you have one, updates and publishes a static websi
 step. Everything that changes something on GitHub, GitLab, in a wiki or on a website is first shown as a
 concrete proposal and only carried out after your approval.
 
-The app has three areas, switched in the toolbar, and its settings under **Einstellungen** (settings):
+The app has three areas, switched in the sidebar, and its settings under **Einstellungen** (settings) at the bottom of it:
 
 | Area | What it is for |
 |---|---|
@@ -389,7 +389,7 @@ Up to version 0.1.3 the app was called OpenFTPUpdater-AI. OpenReleasePilot does 
 ## App updates
 
 As in ClaudeKeyZapper: at start, the app quietly looks up the latest release of this repository on
-GitHub once; **Nach Updates suchen** in the footer checks manually. If a newer version exists, a banner
+GitHub once; **Nach Updates suchen** at the bottom of the sidebar checks manually. If a newer version exists, a banner
 appears at the top. **Installieren** downloads the `.pkg` from `github.com`, checks it against the SHA-256
 digest GitHub publishes for the release asset and against the release's minisign signature
 (`<package>.minisig`, verified with the public key built into the app,

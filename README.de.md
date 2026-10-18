@@ -11,7 +11,7 @@ weitere Dokumentation oder ein Wiki aktuell und aktualisiert und veröffentlicht
 als letzten Schritt eine statische Website. Alles, was auf GitHub, GitLab, in einem Wiki oder auf einer Website
 etwas ändert, zeigt die App vorher als konkreten Vorschlag und führt es erst nach deiner Freigabe aus.
 
-Die App hat drei Bereiche, umschaltbar in der Kopfleiste, und ihre Einstellungen unter **Einstellungen**:
+Die App hat drei Bereiche, umschaltbar in der Seitenleiste, und ihre Einstellungen unter **Einstellungen** unten darin:
 
 | Bereich | Wofür |
 |---|---|
@@ -407,7 +407,7 @@ nicht; die alte App nach dem Umstieg löschen (Einstellungen und Passwort werden
 ## Updates der App
 
 Wie bei ClaudeKeyZapper: Beim Start fragt die App einmal still das neueste Release dieses Repositories
-auf GitHub ab; manuell geht es über **Nach Updates suchen** in der Fußzeile. Ist eine neuere Version da,
+auf GitHub ab; manuell geht es über **Nach Updates suchen** unten in der Seitenleiste. Ist eine neuere Version da,
 erscheint oben ein Banner. **Installieren** lädt die `.pkg` von `github.com`, prüft sie gegen die
 SHA-256-Prüfsumme, die GitHub für das Release-Asset veröffentlicht, und gegen die minisign-Signatur des
 Releases (`<Paket>.minisig`, geprüft mit dem in die App eingebauten öffentlichen Schlüssel,

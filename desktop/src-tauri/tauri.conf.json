@@ -9,14 +9,18 @@
   },
   "app": {
     "withGlobalTauri": true,
+    "macOSPrivateApi": true,
     "windows": [
       {
         "label": "main",
         "title": "OpenReleasePilot",
         "width": 1080,
         "height": 800,
-        "minWidth": 820,
-        "minHeight": 560
+        "minWidth": 860,
+        "minHeight": 560,
+        "transparent": true,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true
       }
     ],
     "security": {
