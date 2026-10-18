@@ -83,6 +83,9 @@ const ICONS = {
   error: '<path d="M8 2h8l6 6v8l-6 6H8l-6-6V8z"/><path d="m15 9-6 6M9 9l6 6"/>',
   done: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
   download: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
+  more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
+  trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
+  blank: '',
 };
 
 function icon(name, cls = '') {
@@ -97,6 +100,73 @@ function button(label, onClick, { iconName, cls, disabled, title, iconOnly, id }
     title: title ?? (iconOnly ? label : null), 'aria-label': iconOnly ? label : null,
     onclick: (e) => { e.stopPropagation(); onClick?.(e); },
   }, iconName && icon(iconName), !iconOnly && label);
+}
+
+/** A frequent secondary action as an icon; while `busy` a spinner stands in for the icon. */
+function iconButton(label, onClick, iconName, { id, disabled, busy, title } = {}) {
+  const b = button(label, onClick, { id, iconName: busy ? null : iconName, iconOnly: true, disabled: disabled || busy, title: title ?? label });
+  if (busy) b.prepend(h('span', { class: 'spinner', 'aria-hidden': 'true' }));
+  return b;
+}
+
+// MARK: Menus
+
+let openedMenu = null;
+/** The menu button whose menu the last outside click closed, so that click does not open it again. */
+let closedByTrigger = null;
+
+function closeMenu() {
+  openedMenu?.remove();
+  openedMenu = null;
+}
+
+/** Opens a menu below `anchor`; items are [label, action, { iconName, danger, disabled, title }] or '-'. */
+function openMenu(anchor, items) {
+  closeMenu();
+  const menu = h('div', { class: 'menu', popover: 'manual', role: 'menu' },
+    items.filter(Boolean).map((item) => (item === '-' ? h('div', { class: 'menu-separator', role: 'separator' })
+      : h('button', { type: 'button', role: 'menuitem', class: item[2]?.danger ? 'danger' : null, disabled: item[2]?.disabled, title: item[2]?.title,
+        onclick: () => { closeMenu(); item[1](); } }, icon(item[2]?.iconName ?? 'blank'), item[0]))));
+  menu.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      closeMenu();
+      anchor.focus();
+      return;
+    }
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    e.preventDefault();
+    const entries = [...menu.querySelectorAll('button:not(:disabled)')];
+    const next = entries.indexOf(document.activeElement) + (e.key === 'ArrowDown' ? 1 : -1);
+    entries[(next + entries.length) % entries.length]?.focus();
+  });
+  document.body.append(menu);
+  menu.showPopover();
+  openedMenu = menu;
+  const rect = anchor.getBoundingClientRect();
+  const { offsetWidth: width, offsetHeight: height } = menu;
+  menu.style.left = `${Math.max(8, Math.min(rect.right - width, innerWidth - width - 8))}px`;
+  menu.style.top = `${rect.bottom + 4 + height <= innerHeight ? rect.bottom + 4 : Math.max(8, rect.top - 4 - height)}px`;
+  menu.querySelector('button:not(:disabled)')?.focus();
+}
+
+// Menus close on clicks outside, when the window loses focus or changes size.
+document.addEventListener('pointerdown', (e) => {
+  closedByTrigger = null;
+  if (!openedMenu || openedMenu.contains(e.target)) return;
+  closedByTrigger = e.target.closest?.('[aria-haspopup="menu"]') ?? null;
+  closeMenu();
+}, true);
+window.addEventListener('blur', closeMenu);
+window.addEventListener('resize', closeMenu);
+
+/** "⋯": rarer and destructive actions of a view; `items()` is read when it opens. */
+function menuButton(label, items, { id } = {}) {
+  const trigger = button(label, () => {
+    if (closedByTrigger === trigger) closedByTrigger = null;
+    else openMenu(trigger, items());
+  }, { id, iconName: 'more', iconOnly: true });
+  trigger.setAttribute('aria-haspopup', 'menu');
+  return trigger;
 }
 
 const formatTime = (secs) => new Date(secs * 1000).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' });
@@ -216,19 +286,20 @@ function renderSidebar() {
       }, icon('gear'), h('span', null, 'Einstellungen')),
       h('div', { class: 'version' },
         view.devBuild ? 'OpenReleasePilot Entwicklungsversion' : `OpenReleasePilot ${view.version}`,
-        view.checkingUpdate ? h('span', null, 'Suche nach Updates …')
-          : [button('Nach Updates suchen', check(false), { cls: 'link' }), button('Beta-Version suchen', check(true), { cls: 'link' })])),
+        view.checkingUpdate ? h('span', null, 'Suche nach Updates …') : button('Nach Updates suchen', check(false), { cls: 'link' }))),
   );
 }
 
-/** Title, one line of state and the area's own actions above each area. */
+/** Title, one line of state and the view's actions above each area: one primary action at most,
+ *  frequent ones as icons, rare and destructive ones in "⋯". The open details fill it themselves. */
 const pageHead = h('header', { class: 'page-header', 'data-tauri-drag-region': '' });
+// Set by the area renderers: { back: [label, action, id], title, chip, subtitle, actions }.
+const headerParts = { repos: null, runs: null, website: null };
 
 function renderPageHeader() {
   const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
   let title;
   let subtitle;
-  let actions = [];
   if (area === 'runs') {
     const open = openJobs();
     const decisions = open.filter((j) => j.status.state === 'needsApproval').length;
@@ -239,11 +310,6 @@ function renderPageHeader() {
   } else if (area === 'website') {
     title = view.site ? `Website ${view.site.name}` : 'Website';
     subtitle = view.site ? 'Prüfen, Inhalte aktualisieren, Veröffentlichen, Live-Seite prüfen' : 'Die Projektdatei der Website ist nicht lesbar';
-    actions = view.site ? [
-      button(view.site.url.replace(/^https?:\/\//, ''), () => call('open_url', { url: view.site.url }), { iconName: 'external', title: 'Live-Seite öffnen' }),
-      button('Produkt hinzufügen …', addProductDialog,
-        { iconName: 'plus', disabled: !!view.running, title: 'Ein Repository als neues Produkt auf der Website aufnehmen' }),
-    ] : [];
   } else {
     const n = (state) => view.repositories.filter((r) => r.health.state === state).length;
     title = 'Repositories';
@@ -252,10 +318,15 @@ function renderPageHeader() {
       n('needsAttention') && count(n('needsAttention'), 'braucht Aufmerksamkeit', 'brauchen Aufmerksamkeit'),
       n('healthy') && `${n('healthy')} in Ordnung`].filter(Boolean).join(' · ');
   }
+  const parts = headerParts[area] ?? {};
+  const drag = { 'data-tauri-drag-region': '' };
+  const actions = (parts.actions ?? []).filter(Boolean);
+  pageHead.classList.toggle('with-back', !!parts.back);
   pageHead.replaceChildren(...[
-    h('div', { class: 'page-title', 'data-tauri-drag-region': '' },
-      h('h1', { 'data-tauri-drag-region': '' }, title),
-      subtitle && h('p', { 'data-tauri-drag-region': '' }, subtitle)),
+    h('div', { class: 'page-title', ...drag },
+      parts.back && button(parts.back[0], parts.back[1], { id: parts.back[2], iconName: 'back', cls: 'link page-back', title: 'Zurück zur Übersicht' }),
+      h('div', { class: 'page-title-line', ...drag }, h('h1', { class: 'ellipsis', title: parts.title, ...drag }, parts.title ?? title), parts.chip),
+      (parts.title ? parts.subtitle : subtitle) && h('p', drag, parts.title ? parts.subtitle : subtitle)),
     actions.length > 0 && h('div', { class: 'page-actions' }, actions),
   ].filter(Boolean));
 }
@@ -392,21 +463,17 @@ function buildWebsite() {
     tasks: h('div', { class: 'list tasks' }),
     taskTech: h('div', { class: 'checks' }),
     instructions: h('textarea', { id: 'instructions', rows: 1, placeholder: 'z. B. „Ergänze im nudgit-Abschnitt den Hinweis auf die Chrome-Erweiterung“ – leer lassen für ein reines Release-Update' }),
-    runAll: null,
     detailHead: h('div', { class: 'detail-head' }),
     tabResult: h('button', { type: 'button', class: 'tab', role: 'tab', id: 'tab-result', 'aria-controls': 'detail-result', onclick: () => showTab('result') }, 'Ergebnis'),
     tabLog: h('button', { type: 'button', class: 'tab', role: 'tab', id: 'tab-log', 'aria-controls': 'log', onclick: () => showTab('log') }),
     detailResult: h('div', { class: 'detail-result', id: 'detail-result', role: 'tabpanel', 'aria-labelledby': 'tab-result' }),
     log: h('pre', { class: 'log', id: 'log', role: 'tabpanel', 'aria-labelledby': 'tab-log', tabindex: '0' }),
   };
-  skeleton.runAll = button('Aktualisieren und veröffentlichen', () => call('run_all', { instructions: skeleton.instructions.value }),
-    { iconName: 'forward', title: 'Prüfen, Inhalte aktualisieren (wenn nötig), Veröffentlichen und Live-Seite prüfen nacheinander; geht bis zur Live-Seite und stoppt beim ersten Fehler' });
   skeleton.root = h('div', { class: 'area' },
     h('div', { class: 'note' }, 'Der direkte Website-Ablauf. Als letzter Schritt eines Pflegeauftrags läuft dieselbe Website-Aktualisierung mit Vorschau und Freigabe im Bereich Repositories.'),
     h('section', { class: 'section' },
       h('div', { class: 'section-head' }, h('h2', null, 'Ablauf'),
-        h('span', { class: 'muted small' }, 'Schritte einzeln starten oder alle nacheinander bis zur Live-Seite'),
-        h('span', { class: 'spacer' }), skeleton.runAll),
+        h('span', { class: 'muted small' }, 'Schritte einzeln starten oder oben alle nacheinander bis zur Live-Seite')),
       skeleton.steps),
     h('div', { class: 'config' },
       h('section', { class: 'section panel' },
@@ -428,7 +495,19 @@ function buildWebsite() {
 }
 
 function renderWebsite() {
-  skeleton.runAll.disabled = !!view.running || !view.site;
+  headerParts.website = {
+    actions: view.site ? [
+      iconButton('Live-Seite öffnen', () => call('open_url', { url: view.site.url }), 'external', { id: 'site-open', title: `Live-Seite öffnen: ${view.site.url}` }),
+      menuButton('Weitere Aktionen', () => [
+        ['Produkt hinzufügen …', addProductDialog, { iconName: 'plus', disabled: !!view.running, title: 'Ein Repository als neues Produkt auf der Website aufnehmen' }],
+      ], { id: 'site-more' }),
+      button('Aktualisieren und veröffentlichen', () => call('run_all', { instructions: skeleton.instructions.value }), {
+        id: 'site-run-all', cls: 'primary', iconName: 'forward', disabled: !!view.running,
+        title: 'Prüfen, Inhalte aktualisieren (wenn nötig), Veröffentlichen und Live-Seite prüfen nacheinander; geht bis zur Live-Seite und stoppt beim ersten Fehler',
+      }),
+    ] : [],
+  };
+  renderPageHeader();
   skeleton.instructions.disabled = !!view.running;
   renderSteps();
   renderProducts();
@@ -459,7 +538,7 @@ function renderProducts() {
       h('span', { class: 'row-text inline' }, h('strong', null, p.name), h('span', { class: 'muted small mono ellipsis', title: p.repo }, p.repo))),
     p.local ? h('span') : h('span', { class: 'badge orange', title: p.localPath ? `Kein lokaler Klon unter ${p.localPath}` : 'Kein localPath in site.json' }, 'kein Klon'),
     versionBadge(p)))]
-    : [h('div', { class: 'note empty-list' }, 'Noch keine Produkte: „Produkt zur Website hinzufügen …“ in der Kopfleiste nimmt eins auf.')]));
+    : [h('div', { class: 'note empty-list' }, 'Noch keine Produkte: „Produkt hinzufügen …“ im ⋯-Menü oben rechts nimmt eins auf.')]));
 }
 
 function renderTasks() {
@@ -507,7 +586,8 @@ function renderSteps() {
     const action = running
       ? button('Abbrechen', () => invoke('cancel'), { iconName: 'stop', cls: 'danger' })
       : button('Starten', () => call('run_step', { step: step.id, instructions: skeleton.instructions.value }),
-        { iconName: 'play', cls: next === step.id ? 'primary' : null, disabled: !!view.running || !ready(step.id) });
+        // The page's primary action is "Aktualisieren und veröffentlichen"; the suggested step stands out more quietly.
+        { iconName: 'play', cls: next === step.id ? 'suggested' : null, disabled: !!view.running || !ready(step.id) });
     const summary = state.stale ? 'Nach Aktualisierung oder Veröffentlichung erneut prüfen' : state.summary;
     return h('div', {
       class: `step ${selected === step.id ? 'selected' : ''}`, role: 'button', tabindex: '0',
@@ -920,6 +1000,8 @@ function renderRepos() {
     if (repo) {
       reposUi.decisions.hidden = true;
       reposUi.body.replaceChildren(repoDetail(repo));
+      headerParts.repos = repoDetailHeader(repo);
+      renderPageHeader();
       return;
     }
     const card = forges().find((f) => f.id === forge);
@@ -930,6 +1012,8 @@ function renderRepos() {
       reposUi.overview.hidden = true;
       renderDecisions();
       reposUi.body.replaceChildren(...(card ? [gitlabPanel()] : []));
+      headerParts.repos = null;
+      renderPageHeader();
       return;
     }
     // An instance glab is not signed in to: how to sign in, then its repositories as far as readable.
@@ -951,24 +1035,31 @@ function renderRepos() {
         }), filtered ? 'Alle Treffer' : 'Alle'),
       h('span', { class: 'muted small', role: 'status' }, repos.length
         ? [`${repos.length} verwaltet`, filtered && `${visible.length} angezeigt`,
-          chosen.length && `${chosen.length} ausgewählt${hiddenChosen ? `, davon ${hiddenChosen} ausgeblendet` : ''}`].filter(Boolean).join(' · ')
+          chosen.length && `${chosen.length} ausgewählt${hiddenChosen ? `, davon ${hiddenChosen} ausgeblendet` : ''}`,
+          reading && 'Status wird gelesen …', securing && 'Sicherheit wird geprüft …'].filter(Boolean).join(' · ')
         : ''),
-      h('span', { class: 'spacer' }),
-      (reading || securing) && button('Lesen abbrechen', () => call('cancel_repo_refresh'), { id: 'repos-cancel-read' }),
-      repos.length > 0 && button(reading ? 'Wird gelesen …' : 'Status aktualisieren', () => call('refresh_repos', { keys: [] }),
-        { id: 'repos-refresh', iconName: 'refresh', disabled: reading, title: `Liest den Stand aller Repositories auf ${card.name}: nur lesend, ohne Claude` }),
-      repos.length > 0 && button(securing ? 'Wird geprüft …' : chosen.length ? `Sicherheit prüfen (${chosen.length})` : 'Sicherheit prüfen',
-        () => call('check_security', { keys: chosen.map((r) => r.key) }),
-        { id: 'repos-security', iconName: 'shield', disabled: securing,
-          title: `Prüft ${chosen.length ? 'die ausgewählten' : 'alle'} Repositories auf ${card.name}: Schutz des Default-Branches (direkte Pushes, Force-Push), Secret- und Abhängigkeits-Scanning, offene Alerts, Workflow-Rechte. Nur lesend, ohne Claude.` }),
-      button('Hinzufügen …', addReposDialog, { id: 'repos-add', iconName: 'plus', title: 'Lokale Repositories in die Verwaltung aufnehmen' }),
-      repos.length > 0 && button(chosen.length ? `Pflegen (${chosen.length}) …` : 'Pflegen …', () => jobDialog(chosen.map((r) => r.key)),
-        { id: 'repos-care', iconName: 'branch', cls: chosen.length ? 'primary' : null, disabled: !chosen.length || !!view.running,
-          title: chosen.length ? `Pflegeauftrag für die ${chosen.length} ausgewählten Repositories${hiddenChosen ? `, auch die ${hiddenChosen} ausgeblendeten` : ''}` : 'Erst Repositories auswählen (Häkchen auf den Karten)' }),
+      (reading || securing) && button('Abbrechen', () => call('cancel_repo_refresh'), { id: 'repos-cancel-read', cls: 'link', title: 'Laufende Lesevorgänge abbrechen; was schon gelesen ist, bleibt' }),
     ].filter(Boolean));
-    reposUi.note.textContent = repos.length
-      ? '„Status aktualisieren“ liest nur. Ein Pflegeauftrag legt dir vor jeder Änderung einen Vorschlag zur Freigabe vor.'
-      : '';
+    reposUi.note.hidden = true;
+    headerParts.repos = {
+      actions: [
+        repos.length > 0 && iconButton('Status aktualisieren', () => call('refresh_repos', { keys: [] }), 'refresh', {
+          id: 'repos-refresh', busy: reading,
+          title: `Status aktualisieren: liest den Stand aller Repositories auf ${card.name}, nur lesend und ohne Claude. Ändern tut erst ein Pflegeauftrag, und der legt dir vorher jeden Vorschlag zur Freigabe vor.`,
+        }),
+        menuButton('Weitere Aktionen', () => [
+          ['Repositories hinzufügen …', addReposDialog, { iconName: 'plus' }],
+          repos.length > 0 && [chosen.length ? `Sicherheit prüfen (${chosen.length} ausgewählt)` : 'Sicherheit aller prüfen', () => call('check_security', { keys: chosen.map((r) => r.key) }), {
+            iconName: 'shield', disabled: securing,
+            title: 'Schutz des Default-Branches (direkte Pushes, Force-Push), Secret- und Abhängigkeits-Scanning, offene Alerts, Workflow-Rechte. Nur lesend, ohne Claude.',
+          }],
+        ], { id: 'repos-more' }),
+        repos.length > 0 && button(chosen.length ? `Pflegen (${chosen.length}) …` : 'Pflegen …', () => jobDialog(chosen.map((r) => r.key)),
+          { id: 'repos-care', iconName: 'branch', cls: 'primary', disabled: !chosen.length || !!view.running,
+            title: chosen.length ? `Pflegeauftrag für die ${chosen.length} ausgewählten Repositories${hiddenChosen ? `, auch die ${hiddenChosen} ausgeblendeten` : ''}` : 'Erst Repositories auswählen (Häkchen auf den Karten)' }),
+      ],
+    };
+    renderPageHeader();
     reposUi.filterBar.hidden = repos.length < 2;
     reposUi.filters.replaceChildren(...REPO_FILTERS.map(([id, label, test]) => {
       const n = id === 'all' ? repos.length : repos.filter(test).length;
@@ -1027,14 +1118,17 @@ function stepPills(j, details) {
 
 function jobCard(j) {
   const decide = j.status.state === 'needsApproval';
-  return h('div', { class: `job-card ${JOB_STATE[j.status.state]?.[0] ?? ''}` },
-    h('div', { class: 'job-card-head' }, h('strong', { class: 'ellipsis' }, jobTitle(j)), h('span', { class: 'spacer' }), jobChip(j.status, j.running)),
+  // The whole card opens the job; a button only where a decision waits.
+  return h('div', { class: `job-card ${JOB_STATE[j.status.state]?.[0] ?? ''}`, onclick: () => openJob(j.id) },
+    h('div', { class: 'job-card-head' },
+      h('button', { type: 'button', class: 'repo-name', id: domId('job-open', j.id), onclick: (e) => { e.stopPropagation(); openJob(j.id); } }, h('strong', { class: 'ellipsis' }, jobTitle(j))),
+      h('span', { class: 'spacer' }), jobChip(j.status, j.running)),
     h('div', { class: 'job-card-reason selectable' }, j.status.reason),
     stepPills(j, true),
     h('div', { class: 'line' },
       h('span', { class: 'muted small' }, `Auftrag vom ${formatTime(j.createdAt)}`),
       h('span', { class: 'spacer' }),
-      button(decide ? 'Entscheiden …' : 'Ansehen', () => openJob(j.id), { cls: decide ? 'primary' : null, id: domId('job-open', j.id) })));
+      decide && button('Entscheiden …', () => openJob(j.id), { cls: 'primary', id: domId('job-decide', j.id) })));
 }
 
 function openRepo(key) {
@@ -1169,22 +1263,10 @@ function repoDetail(r) {
       queueMicrotask(() => call('load_repo_details', { key: r.key }));
     }
   }
-  const locked = r.capabilities.care ?? (r.job ? 'gehört zu einem offenen Auftrag' : null);
   // Security findings that matter go up front; otherwise the check follows the content targets.
   const urgent = r.security?.checks.some((c) => c.level === 'high' || c.level === 'medium');
   const security = h('section', { class: `panel section ${urgent ? 'urgent' : ''}`, id: 'repo-security-section' }, securitySection(r));
   return h('div', { class: 'repo-detail' },
-    h('div', { class: 'repo-detail-head' },
-      h('nav', { class: 'crumbs', 'aria-label': 'Pfad' },
-        button(gitlabHost(r.repo) ? `GitLab ${gitlabHost(r.repo)}` : 'GitHub', closeRepo, { id: 'repo-back', iconName: 'back', cls: 'link', title: 'Zurück zur Übersicht' }),
-        h('span', { class: 'muted', 'aria-hidden': 'true' }, '›'),
-        h('h2', { class: 'ellipsis', title: r.repo }, repoParts(r.repo).path)),
-      healthChip(r),
-      h('span', { class: 'spacer' }),
-      button(r.loading ? 'Wird gelesen …' : 'Status aktualisieren', () => call('refresh_repos', { keys: [r.key] }),
-        { id: 'repo-refresh', iconName: 'refresh', disabled: r.loading, title: `Liest den Stand von ${r.repo} auf ${serviceOf(r.repo)}: nur lesend, ohne Claude` }),
-      access?.url && button(`Auf ${serviceOf(r.repo)}`, () => call('open_url', { url: access.url }), { id: 'repo-github', iconName: 'external' }),
-      button('Pflegen …', () => jobDialog([r.key]), { id: 'repo-care', cls: 'primary', iconName: 'branch', disabled: !!locked || !!view.running, title: locked ? `Nicht möglich: ${locked}` : `Pflegeauftrag für ${r.repo}` })),
     statusLine(r),
     r.job && h('div', { class: `note-box ${JOB_STATE[r.job.status.state]?.[0] ?? ''}` },
       h('span', null, h('strong', null, 'Offener Auftrag: '), jobChip(r.job.status, false), h('span', { class: 'selectable' }, ` ${r.job.status.reason}`)),
@@ -1197,6 +1279,23 @@ function repoDetail(r) {
     !urgent && security,
     fold(r.key, 'tech', 'Technische Details', statusFacts(r, branch)),
     fold(r.key, 'manage', 'Verwaltung', manageSection(r), manageDrafts.get(r.key)?.dirty));
+}
+
+/** The details' page header: back to the service, name and state, refresh, open, care. */
+function repoDetailHeader(r) {
+  const access = ok(r.facts?.access);
+  const locked = r.capabilities.care ?? (r.job ? 'gehört zu einem offenen Auftrag' : null);
+  return {
+    back: [gitlabHost(r.repo) ? `GitLab ${gitlabHost(r.repo)}` : 'GitHub', closeRepo, 'repo-back'],
+    title: repoParts(r.repo).path,
+    chip: healthChip(r),
+    actions: [
+      iconButton('Status aktualisieren', () => call('refresh_repos', { keys: [r.key] }), 'refresh',
+        { id: 'repo-refresh', busy: r.loading, title: `Status aktualisieren: liest den Stand von ${r.repo} auf ${serviceOf(r.repo)}, nur lesend und ohne Claude` }),
+      access?.url && iconButton(`Auf ${serviceOf(r.repo)} öffnen`, () => call('open_url', { url: access.url }), 'external', { id: 'repo-github' }),
+      button('Pflegen …', () => jobDialog([r.key]), { id: 'repo-care', cls: 'primary', iconName: 'branch', disabled: !!locked || !!view.running, title: locked ? `Nicht möglich: ${locked}` : `Pflegeauftrag für ${r.repo}` }),
+    ],
+  };
 }
 
 function findings(r) {
@@ -1559,7 +1658,6 @@ function buildRuns() {
     root: h('div', { class: 'area runs-area' }),
     list: h('div', { class: 'runs-list' }),
     detail: h('div', { class: 'job-detail' }),
-    head: h('div', { class: 'repo-detail-head' }),
     status: h('div', { class: 'job-status' }),
     facts: h('div', { class: 'facts' }),
     tabResult: h('button', { type: 'button', class: 'tab', role: 'tab', id: 'job-tab-result', 'aria-controls': 'job-result', onclick: () => showJobTab('result') }, 'Ergebnis'),
@@ -1567,7 +1665,7 @@ function buildRuns() {
     result: h('div', { class: 'detail-result', id: 'job-result', role: 'tabpanel', 'aria-labelledby': 'job-tab-result' }),
     log: h('pre', { class: 'log', id: 'job-log', role: 'tabpanel', 'aria-labelledby': 'job-tab-log', tabindex: '0' }),
   };
-  runsUi.detail.append(runsUi.head, runsUi.status, runsUi.facts,
+  runsUi.detail.append(runsUi.status, runsUi.facts,
     h('section', { class: 'detail' },
       h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Auftrag', onkeydown: jobTabKey }, runsUi.tabResult, runsUi.tabLog),
       runsUi.result, runsUi.log));
@@ -1580,6 +1678,8 @@ function renderRuns() {
   runsUi.list.hidden = !!jobId;
   runsUi.detail.hidden = !jobId;
   if (!jobId) {
+    headerParts.runs = null;
+    renderPageHeader();
     keepFocus(renderJobList);
     return;
   }
@@ -1656,20 +1756,27 @@ function renderJob(summary, job) {
   const running = summary.running;
   const finished = JOB_FINISHED.has(status.state);
   const canContinue = !running && !finished && ['planned', 'waiting', 'blocked'].includes(status.state);
-  runsUi.head.replaceChildren(...[
-    button('Alle Aufträge', closeJob, { id: 'job-back', iconName: 'back' }),
-    h('h2', { class: 'ellipsis' }, `Auftrag: ${jobTitle(summary)}`),
-    jobChip(status, running),
-    h('span', { class: 'spacer' }),
-    canContinue && button(status.state === 'waiting' ? 'Erneut prüfen' : 'Fortsetzen', () => act('continue_job', { id: summary.id }),
-      { id: 'job-continue', cls: 'primary', iconName: 'play', disabled: !!view.running, title: view.running ? 'Erst nach dem laufenden Schritt' : null }),
-    running && button('Abbrechen', () => act('end_job', { id: summary.id }), { id: 'job-cancel', iconName: 'stop', cls: 'danger', title: 'Hält nach dem laufenden Teilschritt an; Erledigtes bleibt' }),
-    !running && !finished && button('Auftrag beenden …', () => confirmDialog('Auftrag beenden', 'Den Auftrag beenden? Was noch nicht erledigt ist, bleibt unerledigt; nichts Erledigtes wird zurückgenommen.', 'Beenden',
-      () => act('end_job', { id: summary.id })), { id: 'job-end' }),
-    finished && button('Auftragsverlauf löschen …', () => confirmDialog('Auftragsverlauf löschen',
-      'Gelöscht werden die gespeicherten Daten dieses Auftrags, sein Log und seine temporären Arbeitsdaten. Was der Auftrag auf GitHub oder GitLab, im Wiki oder auf der Website geändert hat, bleibt bestehen und wird nicht zurückgenommen.',
-      'Verlauf löschen', () => act('delete_job', { id: summary.id }).then((ok) => ok && closeJob()), { danger: true }), { id: 'job-delete', cls: 'danger' }),
-  ].filter(Boolean));
+  const endJob = () => confirmDialog('Auftrag beenden', 'Den Auftrag beenden? Was noch nicht erledigt ist, bleibt unerledigt; nichts Erledigtes wird zurückgenommen.', 'Beenden',
+    () => act('end_job', { id: summary.id }));
+  const deleteJob = () => confirmDialog('Auftragsverlauf löschen',
+    'Gelöscht werden die gespeicherten Daten dieses Auftrags, sein Log und seine temporären Arbeitsdaten. Was der Auftrag auf GitHub oder GitLab, im Wiki oder auf der Website geändert hat, bleibt bestehen und wird nicht zurückgenommen.',
+    'Verlauf löschen', () => act('delete_job', { id: summary.id }).then((ok) => ok && closeJob()), { danger: true });
+  const more = [
+    !running && !finished && ['Auftrag beenden …', endJob, { iconName: 'stop', danger: true }],
+    finished && ['Auftragsverlauf löschen …', deleteJob, { iconName: 'trash', danger: true }],
+  ].filter(Boolean);
+  headerParts.runs = {
+    back: ['Alle Aufträge', closeJob, 'job-back'],
+    title: `Auftrag: ${jobTitle(summary)}`,
+    chip: jobChip(status, running),
+    actions: [
+      more.length > 0 && menuButton('Weitere Aktionen', () => more, { id: 'job-more' }),
+      canContinue && button(status.state === 'waiting' ? 'Erneut prüfen' : 'Fortsetzen', () => act('continue_job', { id: summary.id }),
+        { id: 'job-continue', cls: 'primary', iconName: 'play', disabled: !!view.running, title: view.running ? 'Erst nach dem laufenden Schritt' : null }),
+      running && button('Abbrechen', () => act('end_job', { id: summary.id }), { id: 'job-cancel', iconName: 'stop', cls: 'danger', title: 'Hält nach dem laufenden Teilschritt an; Erledigtes bleibt' }),
+    ],
+  };
+  renderPageHeader();
   runsUi.status.replaceChildren(
     h('div', { class: `note-box ${JOB_STATE[status.state]?.[0] ?? ''}` },
       h('strong', null, status.reason), status.next && h('div', { class: 'muted small' }, `Nächster Schritt: ${status.next}`)));
@@ -2760,7 +2867,10 @@ function settingsDialog() {
           h('label', { class: 'check-line' },
             h('input', { type: 'checkbox', id: 's-update-check', checked: s.updateCheck, onchange: (e) => { s.updateCheck = e.target.checked; } }),
             'Beim Start nach neuen Versionen suchen'),
-          h('div', { class: 'note' }, 'Fragt das neueste Release auf GitHub ab. Installiert wird nur auf Klick, nach Prüfung von SHA-256-Prüfsumme und Signatur.')),
+          h('div', { class: 'note' }, 'Fragt das neueste Release auf GitHub ab. Installiert wird nur auf Klick, nach Prüfung von SHA-256-Prüfsumme und Signatur.'),
+          h('div', { class: 'line' },
+            button(view.checkingUpdate ? 'Suche läuft …' : 'Jetzt nach Beta-Version suchen', () => call('check_for_updates', { beta: true }),
+              { id: 's-beta', cls: 'link', disabled: view.checkingUpdate, title: 'Beta-Versionen sind zum Testen gedacht; gefunden wird auch eine neuere stabile Version' }))),
         s.message && h('div', { class: 'note error-text', role: 'alert', id: 's-message', tabindex: '-1' }, s.message),
       ],
       actions: [

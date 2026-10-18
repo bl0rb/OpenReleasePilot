@@ -165,10 +165,34 @@ button:focus-visible, .repo-card:focus-visible, summary:focus-visible, .diff:foc
 dialog:focus { outline: none; }
 
 .page-header { display: flex; align-items: flex-end; gap: 12px; padding: 14px 0 2px; }
-.page-title { flex: 1; min-width: 0; }
-.page-header h1 { margin: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.015em; }
+.page-title { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: flex-start; }
+.page-title-line { display: flex; align-items: center; gap: 10px; min-width: 0; max-width: 100%; }
+.page-header h1 { margin: 0; min-width: 0; font-size: 22px; font-weight: 700; letter-spacing: -0.015em; }
+.page-header .chip { flex: none; }
 .page-header p { margin: 3px 0 0; color: var(--muted); }
-.page-actions { display: flex; align-items: center; gap: 6px; }
+.page-back { margin-bottom: 2px; gap: 4px; font-size: 12px; color: var(--muted); }
+.page-back .icon { width: 14px; height: 14px; }
+.page-back:hover:not(:disabled) { color: var(--text); }
+/* One primary action at most, frequent ones as icons, the rest in "⋯". */
+.page-actions { flex: none; display: flex; align-items: center; gap: 4px; }
+.page-actions button.primary { margin-left: 6px; }
+button.icon-only .spinner { width: 14px; height: 14px; border-width: 2px; color: var(--accent); }
+button.suggested { background: var(--accent-soft); color: var(--accent); }
+button.suggested:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+
+/* Menus */
+.menu {
+  position: fixed; inset: auto; margin: 0; min-width: 220px; padding: 5px;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--surface); color: var(--text);
+  box-shadow: 0 12px 32px rgb(0 0 0 / .2);
+}
+.menu button { display: flex; width: 100%; justify-content: flex-start; gap: 8px; padding: 5px 8px; background: none; font-weight: 400; border-radius: 6px; }
+.menu button .icon { color: var(--muted); }
+.menu button:hover:not(:disabled), .menu button:focus-visible { background: var(--accent-fill); color: #fff; outline: none; }
+.menu button:hover:not(:disabled) .icon, .menu button:focus-visible .icon { color: #fff; }
+.menu button.danger { color: var(--red); }
+.menu button.danger:hover:not(:disabled), .menu button.danger:focus-visible { background: var(--red); color: #fff; }
+.menu-separator { height: 1px; margin: 4px 6px; background: var(--border); }
 
 /* Banners: full width under the title bar, an icon for the kind. */
 #banners:empty { display: none; }
@@ -465,8 +489,6 @@ legend { font-weight: 600; padding: 0 4px; }
 .repo-card-rel { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 
 .repo-detail { display: flex; flex-direction: column; gap: 12px; }
-.repo-detail-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-.repo-detail-head h2 { margin: 0; font-size: 16px; min-width: 0; }
 .repo-detail h3 { margin: 0; font-size: 13px; }
 .findings { display: flex; flex-direction: column; gap: 6px; }
 .finding ul { margin: 2px 0 0; padding-left: 18px; }
@@ -490,7 +512,9 @@ legend { font-weight: 600; padding: 0 4px; }
   position: relative; display: flex; flex-direction: column; gap: 6px; min-width: 0;
   padding: 12px 14px 12px 18px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); box-shadow: var(--shadow);
 }
-.job-row { cursor: pointer; transition: border-color .12s, box-shadow .12s; }
+.job-row, .job-card { cursor: pointer; transition: border-color .12s, box-shadow .12s; }
+.job-card:hover { border-color: var(--border-strong); box-shadow: 0 2px 10px rgb(0 0 0 / .06); }
+.job-card .line { min-height: var(--control-h); }
 .job-card-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .job-card-head strong { font-size: 14px; min-width: 0; }
 .job-card-head .chip { flex: none; }
@@ -555,9 +579,6 @@ legend { font-weight: 600; padding: 0 4px; }
 .segment-count { font-size: 11px; color: var(--muted); font-weight: 400; }
 
 /* Repository details: a path back, then what concerns this repository. */
-.crumbs { display: flex; align-items: center; gap: 8px; min-width: 0; }
-.crumbs > button.link { flex: none; }
-.repo-detail-head .crumbs { flex: 0 1 auto; }
 .repo-detail > .note-box { flex-direction: column; align-items: stretch; }
 .panel.urgent { border-color: color-mix(in srgb, var(--red) 40%, transparent); box-shadow: 0 0 0 2px var(--red-soft); }
 

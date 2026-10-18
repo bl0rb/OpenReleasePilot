@@ -19,6 +19,9 @@ Die App hat drei Bereiche, umschaltbar in der Seitenleiste, und ihre Einstellung
 | **Aufträge** | jeder Pflegeauftrag: Schritte, Pläne, Vorschläge mit Diff, Ergebnisse und Log; laufende, wartende und bisherige |
 | **Website** (nur mit Website) | die vier Schritte der Website: Prüfen, Inhalte aktualisieren, Veröffentlichen, Live-Seite prüfen |
 
+Jede Ansicht hat oben rechts höchstens eine Hauptaktion; Aktualisieren (↻) und Öffnen einer Seite (↗)
+stehen als Symbole daneben, seltene und nicht umkehrbare Aktionen im ⋯-Menü. Karten öffnen per Klick.
+
 Solange die App läuft, zeigt ein Symbol in der Menüleiste, wie es steht: wie viele Repositories blockiert
 sind, Aufmerksamkeit brauchen oder in Ordnung sind, die betroffenen Repositories mit ihrem Hauptgrund, die
 offenen Aufträge und ob eine neue Version da ist. Die Zahl neben dem Symbol sind die Entscheidungen, die auf
@@ -54,7 +57,7 @@ widerspricht, auch das), aber die Produktauswahl der Website entscheidet nicht, 
 
 ## Zustand der Repositories
 
-**Status aktualisieren** liest nur bei GitHub: kein Claude, keine Kosten, kein Schreiben, kein
+**Status aktualisieren** (↻ oben rechts) liest nur bei GitHub: kein Claude, keine Kosten, kein Schreiben, kein
 `git fetch`. Gelesen wird beim ersten Öffnen des Bereichs und auf Anforderung, nie im Hintergrund; schlägt
 das Lesen fehl, bleibt der ältere Stand sichtbar, aber als alt markiert, und Daten älter als fünf Minuten
 gelten als veraltet. Ohne `gh`-Anmeldung lassen sich öffentliche Repositories trotzdem lesen (GitHub
@@ -87,7 +90,7 @@ Kopie) und die **Verwaltung**.
 
 ## Sicherheitsprüfung
 
-**Sicherheit prüfen** (in der Übersicht für alle oder die ausgewählten Repositories, oder im Abschnitt
+**Sicherheit prüfen** (in der Übersicht im ⋯-Menü für alle oder die ausgewählten Repositories, oder im Abschnitt
 **Sicherheit** eines Repositorys) liest nur GitHub: kein Claude, keine Kosten, kein Schreiben, etwa 10
 bis 20 Anfragen je Repository. Sie ist vom Zustand oben getrennt und läuft nur auf Wunsch. Das Ergebnis
 steht mit dem Schlimmsten zuerst; was in Ordnung oder nicht lesbar ist, ist eingeklappt.
@@ -415,7 +418,7 @@ Releases (`<Paket>.minisig`, geprüft mit dem in die App eingebauten öffentlich
 macOS und startet die App als neue Version neu; ohne Prüfsumme oder gültige Signatur wird abgelehnt.
 Scheitert die Installation, öffnet sich stattdessen der macOS-Installer. Nicht während ein Schritt oder
 Auftrag läuft. Beta-Versionen (`X.Y.Z-beta.N`) gibt es nur über
-**Beta-Version suchen** oder wenn schon eine Beta installiert ist. Entwicklungs-Builds prüfen nicht.
+**Jetzt nach Beta-Version suchen** unter **Einstellungen → App** oder wenn schon eine Beta installiert ist. Entwicklungs-Builds prüfen nicht.
 
 ## Voraussetzungen
 

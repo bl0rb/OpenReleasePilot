@@ -19,6 +19,9 @@ The app has three areas, switched in the sidebar, and its settings under **Einst
 | **Aufträge** (jobs) | every care job: its steps, plans, proposals with their diffs, results and log; running, waiting and earlier ones |
 | **Website** (only with a website) | the website's own four steps: Prüfen (check), Inhalte aktualisieren (update content), Veröffentlichen (publish), Live-Seite prüfen (verify the live site) |
 
+Each view has at most one main action at its top right; refreshing (↻) and opening a page (↗) are
+icons next to it, rarer and irreversible actions are in the ⋯ menu. Cards open with a click.
+
 While the app runs, an icon in the menu bar shows how things stand: how many repositories are blocked,
 need attention or are fine, the affected repositories with their main reason, the open jobs and whether a
 new version is available. The number next to the icon is the decisions waiting for you. Clicking a
@@ -54,7 +57,7 @@ also that), but the website's product selection does not decide what the app man
 
 ## Repository status
 
-**Status aktualisieren** reads GitHub only: no Claude, no cost, no write, no `git fetch`. It runs when
+**Status aktualisieren** (↻ at the top right) reads GitHub only: no Claude, no cost, no write, no `git fetch`. It runs when
 the area is first opened and on request, never in the background; a failed read keeps the older state
 but marks it as old, and data older than five minutes is shown as old. Without a `gh` login public
 repositories can still be read (GitHub then allows 60 requests per hour; a repository needs about eight).
@@ -86,7 +89,7 @@ local clone) and the **Verwaltung** (management) settings.
 
 ## Security check
 
-**Sicherheit prüfen** (in the overview for all or the selected repositories, or in a repository's
+**Sicherheit prüfen** (in the overview's ⋯ menu for all or the selected repositories, or in a repository's
 **Sicherheit** section) reads GitHub only: no Claude, no cost, no write, about 10 to 20 requests per
 repository. It is separate from the health state above and runs only on request. The result is shown
 worst first; what is fine or could not be read is folded away.
@@ -395,8 +398,8 @@ digest GitHub publishes for the release asset and against the release's minisign
 (`<package>.minisig`, verified with the public key built into the app,
 [desktop/update-key.pub](desktop/update-key.pub)), installs it behind the macOS administrator prompt and
 starts the app again as the new version; without a digest or a valid signature the update is refused. If
-installing in place fails, the macOS installer opens instead. Not while a step or a job runs. Betas (`X.Y.Z-beta.N`) are only offered through **Beta-Version
-suchen** or when a beta is installed. Development builds do not check.
+installing in place fails, the macOS installer opens instead. Not while a step or a job runs. Betas (`X.Y.Z-beta.N`) are only offered through **Jetzt nach Beta-Version
+suchen** under **Einstellungen → App** or when a beta is installed. Development builds do not check.
 
 ## Requirements
 
