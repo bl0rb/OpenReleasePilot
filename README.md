@@ -184,8 +184,20 @@ rules of the `dependabot-pr` skill: risk class (green, yellow, red; below 1.0 a 
 non-zero digit counts as major), release notes from the upstream repository, only manifest/lock/workflow
 files in Dependabot pull requests, SHA pins of Actions, related dependencies only together, majors checked
 against the actual use in the code. It costs Claude usage, roughly a few cents up to about a dollar per
-repository depending on the model and the number of pull requests. Right before each write the app
-checks again:
+repository depending on the model and the number of pull requests.
+
+**With proofs** (on by default, needs the local clone): instead of guessing, Claude builds and tests each
+pull request in a throwaway worktree of the clone, detached at the commit the preview saw, and writes a
+short check where it helps (same hashes for known inputs, same paths). Its shell runs in Claude Code's
+sandbox: writes only inside the worktrees and a proof cache in the temp folder (own package caches, never
+the user's), network only to package registries, credentials such as `~/.ssh` and `~/.config/gh`
+unreadable; `gh`/`glab` run outside the sandbox only as far as the read-only rules allow. A dependency's
+build script runs on this Mac too, inside that sandbox. Nothing is pushed, and the worktrees are removed
+after the review. What Claude ran shows in the plan as **Nachweis**; a major with green CI whose breaking
+changes provably miss the code it uses becomes yellow instead of red. Pull requests Claude keeps open
+show as "N brauchen dich", not as "nothing to do".
+
+Right before each write the app checks again:
 
 - **Merge:** still open and no draft, same head commit, same target branch and repository, mergeable
   according to GitHub, CI of the head commit passed; GitHub gets the expected head commit, so a push in

@@ -34,6 +34,8 @@ const MAX_LOG_LINES: usize = 20_000;
 pub struct JobOptions {
     /// Review and merge/close/rebase pull requests.
     pub prs: bool,
+    /// Claude may build and test each pull request in a throwaway worktree of the local clone (sandboxed).
+    pub proof: bool,
     /// Delete merged branches.
     pub cleanup: bool,
     /// Patch tag (and published release) where a release rule exists.

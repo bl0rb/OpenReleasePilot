@@ -816,9 +816,19 @@ function jobChip(status, running) {
   return h('span', { class: `chip ${cls}`, title: status.reason }, running && h('span', { class: 'spinner' }), text);
 }
 
-function stepChip(state) {
-  const [cls, text] = STEP_STATE[state] ?? ['idle', state];
-  return h('span', { class: `chip ${cls}` }, state === 'running' && h('span', { class: 'spinner' }), text);
+/** A step's state in colour and words. A care plan with nothing to do but PRs Claude keeps open is not done: they wait for the user. */
+function stepLook(job, step) {
+  if (step.kind === 'care' && step.state === 'nothingToDo') {
+    // The job list carries the count; the full job has the plan.
+    const open = step.waiting ?? (job.plan?.plans ?? []).reduce((n, p) => n + p.prs.filter((pr) => pr.action === 'keep' && !pr.optional).length, 0);
+    if (open > 0) return ['warning', `${open} ${open === 1 ? 'braucht' : 'brauchen'} dich`];
+  }
+  return STEP_STATE[step.state] ?? ['idle', step.state];
+}
+
+function stepChip(job, step) {
+  const [cls, text] = stepLook(job, step);
+  return h('span', { class: `chip ${cls}` }, step.state === 'running' && h('span', { class: 'spinner' }), text);
 }
 
 // MARK: Repositories: hosting services
@@ -1110,8 +1120,8 @@ function jobTitle(j) {
 /** The job's steps with their state in words, never by colour alone. */
 function stepPills(j, details) {
   return h('ul', { class: 'job-card-steps', 'aria-label': 'Schritte' }, j.steps.map((s) => {
-    const state = STEP_STATE[s.state]?.[1] ?? s.state;
-    return h('li', { class: `step-pill ${STEP_STATE[s.state]?.[0] ?? ''}`, title: details && s.detail ? `${s.label}: ${state} – ${s.detail}` : null },
+    const [cls, state] = stepLook(j, s);
+    return h('li', { class: `step-pill ${cls}`, title: details && s.detail ? `${s.label}: ${state} – ${s.detail}` : null },
       h('span', null, s.label), h('span', { class: 'step-pill-state' }, ` · ${state}`));
   }));
 }
@@ -1839,7 +1849,7 @@ function stepBlock(job, step, running) {
   const stopped = ['failed', 'blocked'].includes(step.state) && step.detail;
   return h('details', { class: `run step-block ${decide ? 'decide' : ''}`, open, ontoggle: (e) => stepOpen.set(key, e.target.open) },
     h('summary', null,
-      h('strong', null, step.label), stepChip(step.state),
+      h('strong', null, step.label), stepChip(job, step),
       h('span', { class: 'muted small ellipsis step-detail', title: step.detail }, step.detail),
       h('span', { class: 'spacer' }),
       step.links.map((l) => button(l.label, () => call('open_url', { url: l.url }), { cls: 'link', iconName: 'external' }))),
@@ -1941,6 +1951,7 @@ function planRepo(job, p, decide, marks, single) {
       !pr.dependabot && h('span', { class: 'muted small' }, pr.author),
       h('span', { class: 'spacer' }), risk && badge(risk[0], `Claude: ${risk[1]}`)], [
       pr.reason && h('div', { class: 'item-reason selectable' }, pr.reviewed ? `Claude: ${pr.reason}` : pr.reason),
+      pr.proof && h('div', { class: 'item-reason selectable' }, `Nachweis: ${pr.proof}`),
       pr.supersededBy && h('div', { class: 'item-reason' }, `Ersetzt durch #${pr.supersededBy}`),
       decide && item.optional && h('div', { class: 'item-check' }, 'Claude rät, ihn offen zu lassen; nach den Regeln der App wäre er mergebar. Anhaken heißt: nach der Freigabe mergen, mit denselben Prüfungen direkt davor (noch offen, gleicher Commit, mergebar, CI des PR-Commits grün).'),
       decide && APP_CHECK[pr.action] && h('div', { class: 'item-check' }, gitlabHost(p.repo)
@@ -1980,10 +1991,11 @@ function planRepo(job, p, decide, marks, single) {
         choice.length > 0 && badge('orange', `${choice.length} zur Wahl`),
         of('tag').length > 0 && badge('green', `Tag ${p.tag ?? of('tag')[0].reference} geplant`),
         branches > 0 && badge('', `${branches} Branches löschen`)],
-      keep.length > 0 && badge('', `${keep.length} bleiben offen`)),
+      keep.length > 0 && badge('orange', `${keep.length} ${keep.length === 1 ? 'braucht' : 'brauchen'} dich`)),
     h('div', { class: 'run-body' },
       p.error && h('div', { class: 'note error-text' }, p.error),
       p.reviewNote && h('div', { class: 'note orange' }, p.reviewNote),
+      p.proofNote && h('div', { class: 'note' }, p.proofNote),
       h('div', { class: 'items' },
         group('Mergen', of('merge').filter((i) => !i.optional).map(prLine)),
         group('Zur Wahl: Claude rät, offen zu lassen', choice.map(prLine)),
@@ -1997,7 +2009,8 @@ function planRepo(job, p, decide, marks, single) {
         group('Aufräumen lokal', of('localBranch').map((i) => branchLine(i, p.localBranches))),
         keep.length > 0 && [h('div', { class: 'item-group' }, `Bleibt offen (${keep.length})`), ...keep.map((pr) => h('div', { class: 'item' },
           h('div', { class: 'item-line' }, button(requestRef(p.repo, pr.number), () => call('open_url', { url: pr.url }), { cls: 'link mono' }), h('span', { class: 'item-title' }, pr.title), h('span', { class: 'spacer' }), pr.risk && badge(RISKS[pr.risk][0], `Claude: ${RISKS[pr.risk][1]}`)),
-          h('div', { class: 'item-reason selectable' }, pr.reviewed ? `Claude: ${pr.reason}` : pr.reason)))]),
+          h('div', { class: 'item-reason selectable' }, pr.reviewed ? `Claude: ${pr.reason}` : pr.reason),
+          pr.proof && h('div', { class: 'item-reason selectable' }, `Nachweis: ${pr.proof}`)))]),
       p.cleanupNote && h('div', { class: 'note orange' }, p.cleanupNote),
       p.cloneNote && h('div', { class: 'note orange' }, `Lokale Branches übersprungen: ${p.cloneNote}`),
       p.githubDeletesMerged && of('merge').length > 0 && h('div', { class: 'note' }, 'GitHub löscht die Branches gemergter PRs in diesem Repository selbst.'),
@@ -2552,7 +2565,7 @@ function jobDialog(keys) {
   const withRule = allowed.filter((r) => r.release);
   const targets = view.targets.filter((t) => t.sources.some((k) => allowed.some((r) => r.key === k)));
   const feedsWebsite = !!view.websiteSources && allowed.some((r) => view.websiteSources.includes(r.key));
-  const o = { prs: true, cleanup: false, release: false, targets: new Map(), website: false, model: '', instructions: '' };
+  const o = { prs: true, proof: true, cleanup: false, release: false, targets: new Map(), website: false, model: '', instructions: '' };
   const s = { error: '', busy: false };
   // The words of the services the chosen repositories live on.
   const lab = allowed.some((r) => gitlabHost(r.repo));
@@ -2571,6 +2584,7 @@ function jobDialog(keys) {
         excluded.length > 0 && h('div', { class: 'note orange' }, `Ausgenommen: ${excluded.map((r) => `${r.repo} (${r.capabilities.care ?? 'gehört zu einem offenen Auftrag'})`).join(', ')}`),
         h('fieldset', null, h('legend', null, 'Repository-Pflege'),
           option('prs', `${pick('Pull Requests', 'Merge Requests')} prüfen und übernehmen`, `Claude bewertet jeden offenen ${pick('PR', 'MR')} auf den Default-Branch (Risikoklasse, Release-Notes, Versions-Pins, zusammengehörige Abhängigkeiten, Nutzung im Code); das kostet Claude-Nutzung. Gemergt wird nur, was ${service} mergebar mit grüner CI meldet und Claude grün oder gelb einstuft. Überflüssige ${pick('PRs', 'MRs')} werden mit Begründung geschlossen, ${pick('Dependabot-PRs', 'Renovate-MRs')} mit Konflikt neu aufgebaut.`),
+          o.prs && h('div', { class: 'sub-option' }, option('proof', 'Mit Nachweisen prüfen', `Statt zu vermuten, baut und testet Claude jeden ${pick('PR', 'MR')} in einer Wegwerf-Kopie und schreibt bei Bedarf einen kurzen Test. In der Sandbox von Claude Code: schreiben nur dort, Netz nur zu Paket-Registries, Zugangsdaten gesperrt. Build-Skripte neuer Abhängigkeiten laufen dabei auf diesem Mac. Dauert länger; ohne lokale Kopie wird nur gelesen; gepusht wird nichts.`)),
           option('cleanup', 'Gemergte Branches aufräumen', `Branches, deren Commits auf ${service} vollständig im Default-Branch sind oder deren ${pick('PR', 'MR')} gemergt wurde, auf ${service} und in der lokalen Kopie. Geschützte, ausgecheckte und Branches offener ${pick('PRs', 'MRs')} bleiben.`),
           option('release', 'Release: nächste Patch-Version taggen', withRule.length
             ? `Nur für Repositories mit Release-Regel (${withRule.map((r) => r.repo).join(', ')}), nur auf grüner CI genau des Ziel-Commits; danach wartet die App bei Bedarf auf das veröffentlichte ${service}-Release.`
@@ -2598,7 +2612,7 @@ function jobDialog(keys) {
           s.busy = true; s.error = ''; render();
           try {
             const options = {
-              prs: o.prs, cleanup: o.cleanup, release: o.release, website: o.website, model: o.model, instructions: o.instructions,
+              prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, website: o.website, model: o.model, instructions: o.instructions,
               targets: [...o.targets].map(([id, basis]) => ({ id, basis })),
             };
             const id = await invoke('start_job', { input: { repos: allowed.map((r) => r.key), options } });

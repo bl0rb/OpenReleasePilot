@@ -12,7 +12,7 @@ use openreleasepilot_core::jobs::{self, CareItem, ItemKind, ItemOutcome, Job, Jo
 use openreleasepilot_core::repocare::{self, Action, CiWait, Done, Plan, PlanSet, ReleaseWait, RunState};
 use openreleasepilot_core::repos::RepoTarget;
 use openreleasepilot_core::forge::Forge;
-use openreleasepilot_core::{git, github, shell};
+use openreleasepilot_core::{git, github, proof, shell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -263,7 +263,7 @@ fn care_scan(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
             continue;
         }
         if options.prs && !plan.prs.is_empty() {
-            match review(ctx, plan, model.as_deref(), effort.as_deref(), budget) {
+            match review(ctx, plan, model.as_deref(), effort.as_deref(), budget, options.proof) {
                 Ok(()) => {}
                 Err(e) if ctx.runner.is_cancelled() => return Err(e),
                 Err(e) => {
@@ -284,7 +284,8 @@ fn care_scan(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
                     Action::Rebase => ("info", "Rebase anstoßen"),
                     Action::Keep => ("info", "bleibt offen"),
                 };
-                ctx.log(kind, format!("  {} {}: {what} – {}", repocare::request_ref(&plan.repo, pr.number), pr.title, pr.reason));
+                let proof = pr.proof.as_ref().map(|p| format!(" · Nachweis: {p}")).unwrap_or_default();
+                ctx.log(kind, format!("  {} {}: {what} – {}{proof}", repocare::request_ref(&plan.repo, pr.number), pr.title, pr.reason));
             }
         }
         repocare::finish(plan, options.cleanup, options.release);
@@ -313,7 +314,7 @@ fn care_scan(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
     job.plan = Some(set);
     let note = if unreadable > 0 { format!("; {unreadable} Repository/ies nicht lesbar") } else { String::new() };
     let unreviewed = unreviewed(&set_plans(job));
-    let (state, detail) = scan_result(all_unreadable, job.items.is_empty(), &summary, &note, &unreviewed);
+    let (state, detail) = scan_result(all_unreadable, job.items.is_empty(), &summary, &note, &unreviewed, &waiting_on_user(&set_plans(job)));
     job.steps[i].set(state, detail, now());
     Ok(())
 }
@@ -340,7 +341,26 @@ fn claude_login_hint(why: &str) -> Option<&'static str> {
 
 /// The care step after the preview. Pull requests Claude could not judge are open work, never
 /// "nothing to do": with nothing else planned the step is blocked until a new review.
-fn scan_result(all_unreadable: bool, no_items: bool, summary: &str, note: &str, unreviewed: &Option<(Vec<String>, String)>) -> (StepState, String) {
+/// `4 PRs`: pull requests Claude advises to keep open, which the plan does not touch; empty without
+/// any. Not "nothing to do": they wait for the user (the UI shows "4 brauchen dich").
+fn waiting_on_user(plans: &[Plan]) -> String {
+    let n: usize = plans.iter().map(|p| p.prs.iter().filter(|pr| pr.action == Action::Keep && !pr.optional).count()).sum();
+    match n {
+        0 => String::new(),
+        1 => format!("1 {}", request_word(plans)),
+        n => format!("{n} {}s", request_word(plans)),
+    }
+}
+
+fn request_word(plans: &[Plan]) -> &'static str {
+    match plans.iter().filter(|p| Forge::of(&p.repo) != Forge::Github).count() {
+        0 => "PR",
+        n if n == plans.len() => "MR",
+        _ => "PR/MR",
+    }
+}
+
+fn scan_result(all_unreadable: bool, no_items: bool, summary: &str, note: &str, unreviewed: &Option<(Vec<String>, String)>, waiting: &str) -> (StepState, String) {
     let missing = unreviewed.as_ref().map(|(names, why)| {
         let hint = claude_login_hint(why).map(|h| format!(" {h}")).unwrap_or_else(|| " Danach „Neu prüfen“.".to_owned());
         format!("Claude-Prüfung fehlgeschlagen ({}): PRs nicht bewertet – {why}.{hint}", names.join(", "))
@@ -349,6 +369,8 @@ fn scan_result(all_unreadable: bool, no_items: bool, summary: &str, note: &str, 
         (StepState::Failed, "Kein Repository lesbar; Details im Plan".to_owned())
     } else if let (true, Some(missing)) = (no_items, &missing) {
         (StepState::Blocked, missing.clone())
+    } else if no_items && !waiting.is_empty() {
+        (StepState::NothingToDo, format!("Claude rät, {waiting} offen zu lassen{note}"))
     } else if no_items {
         (StepState::NothingToDo, format!("Nichts zu tun{note}"))
     } else if let Some(missing) = missing {
@@ -361,12 +383,7 @@ fn scan_result(all_unreadable: bool, no_items: bool, summary: &str, note: &str, 
 /// `3 PRs mergen, 1 Tag, 5 Branches löschen`, or `nichts zu tun`.
 pub fn plan_summary(plans: &[Plan]) -> String {
     let sum = |f: &dyn Fn(&Plan) -> usize| plans.iter().map(f).sum::<usize>();
-    let gitlab = plans.iter().filter(|p| Forge::of(&p.repo) != Forge::Github).count();
-    let word = match gitlab {
-        0 => "PR",
-        n if n == plans.len() => "MR",
-        _ => "PR/MR",
-    };
+    let word = request_word(plans);
     let parts: Vec<String> = [
         (sum(&|p| p.count(Action::Merge)), format!("{word} mergen"), format!("{word}s mergen")),
         (sum(&|p| p.count(Action::Close)), format!("{word} schließen"), format!("{word}s schließen")),
@@ -402,23 +419,29 @@ pub fn require_logins(repos: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Claude judges the open pull requests of one repository, read-only, in its local clone if there is one.
-fn review(ctx: &Ctx, plan: &mut Plan, model: Option<&str>, effort: Option<&str>, budget: Option<f64>) -> Result<()> {
-    let dir = match &plan.clone {
-        Some(dir) => PathBuf::from(dir),
-        None => {
+/// Claude judges the open pull requests of one repository. With `proof` and a local clone it may build
+/// and test each one in a throwaway worktree (sandboxed, removed afterwards); otherwise it only reads,
+/// in the local clone if there is one.
+fn review(ctx: &Ctx, plan: &mut Plan, model: Option<&str>, effort: Option<&str>, budget: Option<f64>, proof: bool) -> Result<()> {
+    let proofs = if proof { prepare_proofs(ctx, plan) } else { None };
+    let dir = match (&proofs, &plan.clone) {
+        (Some(proofs), _) => proofs.root.clone(),
+        (None, Some(dir)) => PathBuf::from(dir),
+        (None, None) => {
             let dir = std::env::temp_dir().join("OpenReleasePilot-Review");
             std::fs::create_dir_all(&dir).context("Arbeitsordner für die Prüfung anlegen")?;
             dir
         }
     };
-    let prompt = claude::review_prompt(plan);
+    let prompt = claude::review_prompt(plan, proofs.as_ref());
     let forge = Forge::of(&plan.repo);
-    let args = claude::review_args(&prompt, model, effort, budget, matches!(forge, Forge::Gitlab { .. }));
-    ctx.cmd(format!("  $ claude -p … --model {} (prüft {} {}s, nur lesend)", model.unwrap_or("Standard"), plan.prs.len(), forge.request()));
+    let args = claude::review_args(&prompt, model, effort, budget, matches!(forge, Forge::Gitlab { .. }), proofs.as_ref());
+    let how = if proofs.is_some() { "mit Nachweisen in der Sandbox" } else { "nur lesend" };
+    ctx.cmd(format!("  $ claude -p … --model {} (prüft {} {}s, {how})", model.unwrap_or("Standard"), plan.prs.len(), forge.request()));
+    let env = proofs.as_ref().map(|p| p.env()).unwrap_or_default();
     let mut outcome = None;
     // No GITHUB_TOKEN: gh reads with its own login; the allowlist keeps Claude to reading.
-    let code = shell::stream("claude", &args, &dir, &HashMap::new(), &ctx.runner, |line| match claude::parse(line) {
+    let code = shell::stream("claude", &args, &dir, &env, &ctx.runner, |line| match claude::parse(line) {
         Event::Line(text) => ctx.log("claude", format!("  {text}")),
         Event::Done(done) => outcome = Some(done),
         Event::Ignore => {}
@@ -428,6 +451,8 @@ fn review(ctx: &Ctx, plan: &mut Plan, model: Option<&str>, effort: Option<&str>,
     if !outcome.success {
         bail!("{}", outcome.text);
     }
+    // The worktrees go before the verdicts are applied; nothing of them is needed any more.
+    drop(proofs);
     let review: repocare::Review = serde_json::from_value(outcome.structured.context("Claude hat keine strukturierte Antwort geliefert")?)
         .context("Claudes Antwort passt nicht zum Schema")?;
     let problems = repocare::apply_review(plan, &review.prs);
@@ -438,6 +463,36 @@ fn review(ctx: &Ctx, plan: &mut Plan, model: Option<&str>, effort: Option<&str>,
         plan.review_note = Some(format!("Nicht verwendbare Bewertungen, die betroffenen PRs bleiben offen: {}", problems.join("; ")));
     }
     Ok(())
+}
+
+/// The throwaway worktrees for Claude's proofs, or why there are none (`Plan::proof_note`).
+fn prepare_proofs(ctx: &Ctx, plan: &mut Plan) -> Option<proof::Proofs> {
+    if plan.clone.is_none() {
+        plan.proof_note = Some("Keine lokale Kopie: Claude hat ohne Nachweise geprüft.".into());
+        return None;
+    }
+    match proof::Proofs::prepare(plan) {
+        Ok(proofs) => {
+            for (number, why) in &proofs.missing {
+                ctx.warn(format!("  {}: keine Wegwerf-Kopie ({why})", repocare::request_ref(&plan.repo, *number)));
+            }
+            if proofs.trees.is_empty() {
+                plan.proof_note = Some("Keine Wegwerf-Kopie angelegt: Claude hat ohne Nachweise geprüft.".into());
+                return None;
+            }
+            if !proofs.missing.is_empty() {
+                let n = proofs.missing.len();
+                plan.proof_note = Some(format!("Für {n} {}{} keine Wegwerf-Kopie; dort ohne Nachweis.", Forge::of(&plan.repo).request(), if n == 1 { "" } else { "s" }));
+            }
+            ctx.info(format!("  {} Wegwerf-Kopien für Nachweise in {} (Sandbox, werden danach gelöscht)", proofs.trees.len(), proofs.root.display()));
+            Some(proofs)
+        }
+        Err(e) => {
+            ctx.warn(format!("  Wegwerf-Kopien nicht angelegt: {e:#}"));
+            plan.proof_note = Some(format!("Wegwerf-Kopien nicht angelegt ({e:#}): Claude hat ohne Nachweise geprüft."));
+            None
+        }
+    }
 }
 
 /// Carries out the approved items one by one, each checked again right before it writes (see
@@ -1004,14 +1059,17 @@ mod tests {
     #[test]
     fn an_unjudged_pull_request_is_not_nothing_to_do() {
         let expired = failed("Failed to authenticate: OAuth session expired and could not be refreshed");
-        let (state, detail) = scan_result(false, true, "nichts zu tun", "", &expired);
+        let (state, detail) = scan_result(false, true, "nichts zu tun", "", &expired, "");
         assert_eq!(state, StepState::Blocked);
         assert!(detail.contains("Weave") && detail.contains("/login"), "{detail}");
-        let (state, detail) = scan_result(false, false, "2 Branches löschen", "", &expired);
+        let (state, detail) = scan_result(false, false, "2 Branches löschen", "", &expired, "");
         assert_eq!(state, StepState::NeedsApproval, "the rest of the plan can still be approved");
         assert!(detail.contains("nicht bewertet"), "{detail}");
-        assert_eq!(scan_result(false, true, "nichts zu tun", "", &None).0, StepState::NothingToDo);
-        assert_eq!(scan_result(true, true, "", "", &expired).0, StepState::Failed);
+        assert_eq!(scan_result(false, true, "nichts zu tun", "", &None, "").0, StepState::NothingToDo);
+        let (state, detail) = scan_result(false, true, "nichts zu tun", "", &None, "4 PRs");
+        assert_eq!(state, StepState::NothingToDo, "the job may finish; the open PRs stay with the user");
+        assert_eq!(detail, "Claude rät, 4 PRs offen zu lassen");
+        assert_eq!(scan_result(true, true, "", "", &expired, "").0, StepState::Failed);
     }
 
     #[test]
@@ -1019,7 +1077,7 @@ mod tests {
         assert!(claude_login_hint("Failed to authenticate: OAuth session expired").is_some());
         assert!(claude_login_hint("API Error: 401 unauthorized").is_some());
         assert!(claude_login_hint("Claude hat keine strukturierte Antwort geliefert").is_none());
-        let (_, detail) = scan_result(false, true, "", "", &failed("Budget überschritten"));
+        let (_, detail) = scan_result(false, true, "", "", &failed("Budget überschritten"), "");
         assert!(detail.ends_with("Danach „Neu prüfen“."), "{detail}");
     }
 }

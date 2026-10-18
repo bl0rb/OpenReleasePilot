@@ -349,6 +349,7 @@ button.suggested:hover:not(:disabled) { background: color-mix(in srgb, var(--acc
 .chip-ref { max-width: 100%; padding: 1px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface-2); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .check-line.top { align-items: flex-start; }
 .check-line.top input { margin-top: 2px; }
+.sub-option { margin-left: 24px; }
 
 .result-text {
   white-space: pre-wrap;

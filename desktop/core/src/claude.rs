@@ -358,7 +358,7 @@ pub const GITLAB_REVIEW_DISALLOWED: &[&str] = &[
 ];
 
 /// One entry per pull request; see `repocare::Review`.
-pub const REVIEW_SCHEMA: &str = r#"{"type":"object","properties":{"prs":{"type":"array","items":{"type":"object","properties":{"number":{"type":"integer"},"action":{"type":"string","enum":["merge","keep","close"]},"risk":{"type":"string","enum":["green","yellow","red"]},"bump":{"type":"string"},"reason":{"type":"string"},"supersededBy":{"type":"integer"}},"required":["number","action","risk","reason"]}}},"required":["prs"]}"#;
+pub const REVIEW_SCHEMA: &str = r#"{"type":"object","properties":{"prs":{"type":"array","items":{"type":"object","properties":{"number":{"type":"integer"},"action":{"type":"string","enum":["merge","keep","close"]},"risk":{"type":"string","enum":["green","yellow","red"]},"bump":{"type":"string"},"reason":{"type":"string"},"proof":{"type":"string"},"supersededBy":{"type":"integer"}},"required":["number","action","risk","reason"]}}},"required":["prs"]}"#;
 
 /// The rules of the dependabot-pr skill, so the review does not depend on it being installed.
 const REVIEW_RULES: &str = "\
@@ -449,18 +449,21 @@ Gib für jeden MR der Liste genau einen Eintrag zurück: number ist die MR-Numme
 Deutsch, bump zum Beispiel „18.0.14 → 18.1.0“, wenn erkennbar.";
 
 /// Asks Claude to judge the open pull requests of one repository.
-pub fn review_prompt(plan: &crate::repocare::Plan) -> String {
+pub fn review_prompt(plan: &crate::repocare::Plan, proofs: Option<&crate::proof::Proofs>) -> String {
     if let Some(project) = crate::gitlab::project(&plan.repo) {
-        return gitlab_review_prompt(plan, &project);
+        return gitlab_review_prompt(plan, &project, proofs);
     }
     let mut text = format!(
         "Bewerte die offenen Pull Requests auf {} im Repository {}, bevor die App sie mergt. Du entscheidest nur; \
-         mergen, schließen und kommentieren übernimmt die App. Ändere keine Dateien.\n",
-        plan.default_branch, plan.repo
+         mergen, schließen und kommentieren übernimmt die App. {}\n",
+        plan.default_branch,
+        plan.repo,
+        if proofs.is_some() { "Dateien änderst du nur in den Nachweis-Ordnern unten." } else { "Ändere keine Dateien." }
     );
-    text.push_str(&match &plan.clone {
-        Some(dir) => format!("Das aktuelle Verzeichnis ist der lokale Klon ({dir}); prüfe dort, wie der Code die Abhängigkeiten nutzt.\n\n"),
-        None => format!("Es gibt keinen lokalen Klon; Code liest du bei Bedarf mit gh api repos/{}/contents/<pfad> oder gh pr diff.\n\n", plan.repo),
+    text.push_str(&match (&plan.clone, proofs) {
+        (_, Some(proofs)) => proof_section(proofs, "PR", "#"),
+        (Some(dir), None) => format!("Das aktuelle Verzeichnis ist der lokale Klon ({dir}); prüfe dort, wie der Code die Abhängigkeiten nutzt.\n\n"),
+        (None, None) => format!("Es gibt keinen lokalen Klon; Code liest du bei Bedarf mit gh api repos/{}/contents/<pfad> oder gh pr diff.\n\n", plan.repo),
     });
     text.push_str(REVIEW_RULES);
     text.push_str("\n\nOffene Pull Requests:\n");
@@ -482,16 +485,18 @@ pub fn review_prompt(plan: &crate::repocare::Plan) -> String {
     text
 }
 
-fn gitlab_review_prompt(plan: &crate::repocare::Plan, project: &crate::gitlab::Project) -> String {
+fn gitlab_review_prompt(plan: &crate::repocare::Plan, project: &crate::gitlab::Project, proofs: Option<&crate::proof::Proofs>) -> String {
     let url = project.web_url();
     let mut text = format!(
         "Bewerte die offenen Merge Requests auf {} im GitLab-Projekt {url}, bevor die App sie mergt. Du entscheidest nur; \
-         mergen, schließen und kommentieren übernimmt die App. Ändere keine Dateien. glab-Befehle immer mit -R {url}.\n",
-        plan.default_branch
+         mergen, schließen und kommentieren übernimmt die App. {} glab-Befehle immer mit -R {url}.\n",
+        plan.default_branch,
+        if proofs.is_some() { "Dateien änderst du nur in den Nachweis-Ordnern unten." } else { "Ändere keine Dateien." }
     );
-    text.push_str(&match &plan.clone {
-        Some(dir) => format!("Das aktuelle Verzeichnis ist der lokale Klon ({dir}); prüfe dort, wie der Code die Abhängigkeiten nutzt.\n\n"),
-        None => format!(
+    text.push_str(&match (&plan.clone, proofs) {
+        (_, Some(proofs)) => proof_section(proofs, "MR", "!"),
+        (Some(dir), None) => format!("Das aktuelle Verzeichnis ist der lokale Klon ({dir}); prüfe dort, wie der Code die Abhängigkeiten nutzt.\n\n"),
+        (None, None) => format!(
             "Es gibt keinen lokalen Klon; Code liest du bei Bedarf mit glab mr diff <iid> -R {url} oder glab api --hostname {} projects/{}/repository/files/<pfad>/raw?ref={}.\n\n",
             project.host,
             crate::gitlab::encode(&project.path),
@@ -518,9 +523,47 @@ fn gitlab_review_prompt(plan: &crate::repocare::Plan, project: &crate::gitlab::P
     text
 }
 
-/// Read-only review run with the answer as JSON (`Outcome::structured`). `gitlab`: the tools for
-/// merge requests instead of pull requests.
-pub fn review_args(prompt: &str, model: Option<&str>, effort: Option<&str>, max_budget_usd: Option<f64>, gitlab: bool) -> Vec<String> {
+/// What Claude may do in the throwaway worktrees, and what a proof changes about the verdict.
+fn proof_section(proofs: &crate::proof::Proofs, word: &str, mark: &str) -> String {
+    let mut text = format!(
+        "Nachweise: Für jeden {word} unten liegt eine Wegwerf-Kopie auf genau seinem Commit bereit; das aktuelle Verzeichnis \
+         ({}) enthält sie. Prüfe dort, wie der Code die Abhängigkeiten nutzt, und kläre konkrete Sorgen durch Ausprobieren statt \
+         durch Vermuten: bauen und testen (z. B. cargo build, cargo test, npm ci, npm test, go test ./..., jeweils mit dem \
+         Ordner als Arbeitsverzeichnis über --manifest-path, --prefix oder -C statt cd), und bei Bedarf einen kurzen Test \
+         oder ein Prüfprogramm anlegen, das alte und neue Ausgabe vergleicht (gleiche Hashes für bekannte Eingaben, gleiche \
+         Pfade, gleiches Kodier-Ergebnis). Eigene Prüfprojekte legst du in einem neuen Unterordner des aktuellen \
+         Verzeichnisses an (z. B. check-sha2), nie unter /tmp. Die Kopien werden danach gelöscht, nichts davon wird gepusht. Befehle laufen in \
+         einer Sandbox: schreiben nur in diesen Ordnern, Netz nur zu Paket-Registries. Schlägt ein Befehl an der Sandbox \
+         fehl, gilt der Nachweis als nicht erbracht.\n",
+        proofs.root.display()
+    );
+    for (number, dir) in proofs.listing() {
+        text.push_str(&format!("- {mark}{number}: {dir}\n"));
+    }
+    for (number, why) in &proofs.missing {
+        text.push_str(&format!("- {mark}{number}: keine Kopie ({why}); Code bei Bedarf über die Kopien der anderen oder gh/glab lesen\n"));
+    }
+    text.push_str(&format!(
+        "Ein Nachweis zählt nur, wenn er die konkrete Sorge trifft und du ihn selbst ausgeführt hast. Ist bei einem Major \
+         die CI grün und belegt dein Nachweis, dass die Breaking Changes den genutzten Code nicht betreffen, ist das Risiko \
+         yellow statt red. Schreib in proof knapp, was du ausgeführt hast und mit welchem Ergebnis (z. B. „cargo test grün; \
+         SHA-256 von drei Testvektoren identisch“); ohne eigenen Nachweis lass proof weg. Was du nicht nachweisen kannst, \
+         bleibt red und keep. Bei Code, der Updates oder Signaturen prüft, bleibt ein {word} ohne Nachweis immer red.\n\n"
+    ));
+    text
+}
+
+/// Review run with the answer as JSON (`Outcome::structured`). `gitlab`: the tools for merge requests
+/// instead of pull requests. Without `proofs` it only reads; with them, Bash runs in Claude Code's
+/// sandbox (see `proof::Proofs::settings`) and files change only inside the worktrees.
+pub fn review_args(
+    prompt: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    max_budget_usd: Option<f64>,
+    gitlab: bool,
+    proofs: Option<&crate::proof::Proofs>,
+) -> Vec<String> {
     let mut args: Vec<String> =
         vec!["-p".into(), prompt.into(), "--output-format".into(), "stream-json".into(), "--verbose".into(), "--json-schema".into(), REVIEW_SCHEMA.into()];
     if let Some(model) = model.filter(|m| !m.is_empty()) {
@@ -533,12 +576,34 @@ pub fn review_args(prompt: &str, model: Option<&str>, effort: Option<&str>, max_
         args.extend(["--max-budget-usd".into(), budget.to_string()]);
     }
     let (allowed, disallowed) = if gitlab { (GITLAB_REVIEW_ALLOWED, GITLAB_REVIEW_DISALLOWED) } else { (REVIEW_ALLOWED, REVIEW_DISALLOWED) };
+    let mut allowed: Vec<String> = allowed.iter().map(|s| s.to_string()).collect();
+    let mut disallowed: Vec<String> = disallowed.iter().map(|s| s.to_string()).collect();
+    if let Some(proofs) = proofs {
+        // A bare Edit or Write in the deny list would win over any allow rule; an Edit rule covers Write.
+        disallowed.retain(|tool| tool != "Edit" && tool != "Write");
+        disallowed.extend(PROOF_DISALLOWED.iter().map(|s| s.to_string()));
+        allowed.push(format!("Edit(/{}/**)", proofs.root.display()));
+        args.extend(["--settings".into(), proofs.settings(), "--permission-mode".into(), "dontAsk".into()]);
+    }
     args.push("--allowedTools".into());
-    args.extend(allowed.iter().map(|s| s.to_string()));
+    args.extend(allowed);
     args.push("--disallowedTools".into());
-    args.extend(disallowed.iter().map(|s| s.to_string()));
+    args.extend(disallowed);
     args
 }
+
+/// Inside the worktrees too: no git internals, no pipelines.
+const PROOF_DISALLOWED: &[&str] = &[
+    "Edit(**/.git/**)",
+    "Edit(**/.git)",
+    "Edit(**/.github/**)",
+    "Edit(**/.gitlab/**)",
+    "Edit(**/.gitlab-ci.yml)",
+    "Bash(git add*)",
+    "Bash(git worktree*)",
+    "Bash(git remote*)",
+    "Bash(git config*)",
+];
 
 // MARK: Content work (README, documentation, wiki)
 

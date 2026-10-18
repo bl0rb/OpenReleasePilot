@@ -189,6 +189,19 @@ rot; unter 1.0 zählt die erste Stelle ungleich null als Major), Release-Notes a
 Repository, in Dependabot-PRs nur Manifest-, Lock-, Workflow- und Dockerfiles, SHA-Pins von Actions,
 zusammengehörige Abhängigkeiten nur gemeinsam, Majors gegen die tatsächliche Nutzung im Code. Das kostet
 Claude-Nutzung, je nach Modell und Zahl der PRs etwa ein paar Cent bis rund einen Dollar pro Repository.
+
+**Mit Nachweisen** (standardmäßig an, braucht die lokale Kopie): Statt zu vermuten, baut und testet
+Claude jeden PR in einer Wegwerf-Kopie (Worktree der lokalen Kopie, auf dem Commit der Vorschau) und
+schreibt bei Bedarf einen kurzen Test (gleiche Hashes für bekannte Eingaben, gleiche Pfade). Die Shell
+läuft in der Sandbox von Claude Code: schreiben nur in den Wegwerf-Ordnern und einem Nachweis-Cache im
+Temp-Ordner (eigene Paket-Caches, nie die deinen), Netz nur zu Paket-Registries, Zugangsdaten wie
+`~/.ssh` und `~/.config/gh` nicht lesbar; `gh`/`glab` laufen nur so weit außerhalb der Sandbox, wie die
+Leseregeln es erlauben. Build-Skripte der Abhängigkeiten laufen dabei auf diesem Mac, in dieser Sandbox.
+Gepusht wird nichts, die Kopien werden nach der Bewertung gelöscht. Was Claude ausgeführt hat, steht im
+Plan als **Nachweis**; ein Major mit grüner CI, dessen Breaking Changes den genutzten Code nachweislich
+nicht treffen, ist gelb statt rot. PRs, die Claude offen lässt, stehen als „N brauchen dich“ da, nicht
+als „Nichts zu tun“.
+
 Direkt vor jedem Schreiben prüft die App erneut:
 
 - **Merge:** noch offen und kein Entwurf, gleicher Head-Commit, gleicher Zielbranch und gleiches

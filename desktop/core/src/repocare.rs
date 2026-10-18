@@ -79,6 +79,9 @@ pub struct Plan {
     pub local_sync: Option<String>,
     /// Why the local clone was left out.
     pub clone_note: Option<String>,
+    /// Why Claude judged without (all) proofs, although they were asked for.
+    #[serde(default)]
+    pub proof_note: Option<String>,
     /// The repository could not be looked at; nothing happens there.
     pub error: Option<String>,
     /// GitHub deletes head branches after a merge itself.
@@ -132,6 +135,9 @@ pub struct PullRequest {
     pub optional: bool,
     /// Why the action: Claude's reason, or the gate.
     pub reason: String,
+    /// What Claude ran in a throwaway worktree to back its verdict, and the result.
+    #[serde(default)]
+    pub proof: Option<String>,
     /// e.g. `+12 −3 in 2 Dateien`, for the prompt.
     #[serde(skip)]
     pub size: String,
@@ -178,6 +184,9 @@ pub struct Verdict {
     #[serde(default)]
     pub bump: String,
     pub reason: String,
+    /// What Claude ran in the throwaway worktree, and the result.
+    #[serde(default)]
+    pub proof: String,
     #[serde(default, rename = "supersededBy")]
     pub superseded_by: Option<u64>,
 }
@@ -374,6 +383,7 @@ pub fn apply_review(plan: &mut Plan, verdicts: &[Verdict]) -> Vec<String> {
         pr.bump = None;
         pr.superseded_by = None;
         pr.optional = false;
+        pr.proof = None;
         let matching: Vec<&Verdict> = verdicts.iter().filter(|v| v.number == pr.number).collect();
         let verdict = match matching.as_slice() {
             [] => {
@@ -410,6 +420,7 @@ pub fn apply_review(plan: &mut Plan, verdicts: &[Verdict]) -> Vec<String> {
         pr.reviewed = true;
         pr.risk = Some(verdict.risk.clone());
         pr.bump = Some(verdict.bump.trim().to_owned()).filter(|b| !b.is_empty());
+        pr.proof = Some(verdict.proof.trim().to_owned()).filter(|p| !p.is_empty());
         let safe = matches!(verdict.risk.as_str(), "green" | "yellow");
         (pr.action, pr.reason) = match verdict.action.as_str() {
             "close" => {
@@ -1266,7 +1277,7 @@ mod tests {
     }
 
     fn verdict(number: u64, action: &str, risk: &str) -> Verdict {
-        Verdict { number, action: action.into(), risk: risk.into(), bump: String::new(), reason: "ok".into(), superseded_by: None }
+        Verdict { number, action: action.into(), risk: risk.into(), bump: String::new(), reason: "ok".into(), proof: String::new(), superseded_by: None }
     }
 
     #[test]
@@ -1764,7 +1775,7 @@ mod tests {
     fn reviews_a_real_repository() {
         let mut plan = scan(&own_target(), true, false);
         assert!(plan.error.is_none(), "{:?}", plan.error);
-        let args = crate::claude::review_args(&crate::claude::review_prompt(&plan), Some("haiku"), None, Some(1.0), false);
+        let args = crate::claude::review_args(&crate::claude::review_prompt(&plan, None), Some("haiku"), None, Some(1.0), false, None);
         let mut outcome = None;
         crate::shell::stream("claude", &args, &std::env::temp_dir(), &HashMap::new(), &Runner::default(), |line| {
             match crate::claude::parse(line) {
@@ -1783,6 +1794,46 @@ mod tests {
             println!("#{} {:?} {:?} {:?}: {}", pr.number, pr.action, pr.risk, pr.bump, pr.reason);
         }
         assert_eq!(review.prs.len(), plan.prs.len());
+    }
+
+    /// `cargo test -p openreleasepilot-core proves_in_throwaway_worktrees -- --ignored --nocapture`:
+    /// one worktree per open PR of this app's own repository in this checkout, removed again on drop.
+    /// With `ORP_PROOF_CLAUDE=1` Claude (Haiku) also reviews with proofs; costs up to a dollar.
+    #[test]
+    #[ignore = "network, writes worktrees into this checkout"]
+    fn proves_in_throwaway_worktrees() {
+        let mut plan = scan(&own_target(), true, false);
+        assert!(plan.error.is_none(), "{:?}", plan.error);
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..").canonicalize().unwrap();
+        plan.clone = Some(checkout.to_string_lossy().into_owned());
+        let proofs = crate::proof::Proofs::prepare(&plan).unwrap();
+        println!("trees {:?}\nmissing {:?}", proofs.trees, proofs.missing);
+        assert_eq!(proofs.trees.len() + proofs.missing.len(), plan.prs.len().min(crate::proof::MAX_TREES));
+        for (number, dir) in &proofs.trees {
+            let pr = plan.prs.iter().find(|pr| pr.number == *number).unwrap();
+            assert_eq!(output("git", &["rev-parse", "HEAD"], dir).unwrap(), pr.head_sha);
+        }
+        if std::env::var("ORP_PROOF_CLAUDE").is_ok() {
+            let args = crate::claude::review_args(&crate::claude::review_prompt(&plan, Some(&proofs)), Some("haiku"), None, Some(1.0), false, Some(&proofs));
+            let mut outcome = None;
+            crate::shell::stream("claude", &args, &proofs.root, &proofs.env(), &Runner::default(), |line| match crate::claude::parse(line) {
+                crate::claude::Event::Line(text) => println!("{text}"),
+                crate::claude::Event::Done(done) => outcome = Some(done),
+                crate::claude::Event::Ignore => {}
+            })
+            .unwrap();
+            let outcome = outcome.expect("a result");
+            println!("cost {:?}, denials {:?}", outcome.cost_usd, outcome.denials);
+            let review: Review = serde_json::from_value(outcome.structured.expect("structured output")).unwrap();
+            for v in &review.prs {
+                println!("#{} {} {}: {} | Nachweis: {}", v.number, v.action, v.risk, v.reason, v.proof);
+            }
+        }
+        let root = proofs.root.clone();
+        drop(proofs);
+        assert!(!root.exists());
+        let list = output("git", &["worktree", "list", "--porcelain"], &checkout).unwrap();
+        assert!(!list.contains(&*root.to_string_lossy()), "{list}");
     }
 
     #[test]

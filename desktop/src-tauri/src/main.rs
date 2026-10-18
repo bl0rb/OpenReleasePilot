@@ -444,6 +444,8 @@ struct StepSummary {
     state: jobs::StepState,
     detail: String,
     links: Vec<jobs::Link>,
+    /// Care: pull requests Claude advises to keep open, which wait for the user (the full job has the plan instead).
+    waiting: usize,
 }
 
 fn summary(job: &Job, running: bool) -> JobSummary {
@@ -458,9 +460,22 @@ fn summary(job: &Job, running: bool) -> JobSummary {
         steps: job
             .steps
             .iter()
-            .map(|s| StepSummary { id: s.id.clone(), kind: s.kind, label: s.label.clone(), state: s.state, detail: s.detail.clone(), links: s.links.clone() })
+            .map(|s| StepSummary {
+                id: s.id.clone(),
+                kind: s.kind,
+                label: s.label.clone(),
+                state: s.state,
+                detail: s.detail.clone(),
+                links: s.links.clone(),
+                waiting: if s.kind == jobs::StepKind::Care { waiting(job) } else { 0 },
+            })
             .collect(),
     }
+}
+
+/// Pull requests of the care plan that Claude advises to keep open and the plan does not touch.
+fn waiting(job: &Job) -> usize {
+    job.plan.iter().flat_map(|set| &set.plans).flat_map(|p| &p.prs).filter(|pr| pr.action == openreleasepilot_core::repocare::Action::Keep && !pr.optional).count()
 }
 
 /// What a target is behind, judged by the last status read of its sources.
