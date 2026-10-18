@@ -3,6 +3,7 @@
 
 mod jobrun;
 mod steps;
+mod tray;
 
 use steps::{NewProductInput, Work};
 
@@ -242,6 +243,16 @@ pub fn with_model<T>(app: &AppHandle, f: impl FnOnce(&mut Model) -> T) -> T {
 /// Tells the window to fetch a new view.
 pub fn changed(app: &AppHandle) {
     let _ = app.emit("changed", ());
+    tray::update(app);
+}
+
+/// Brings the main window to the front, also from the menu bar.
+pub fn show_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
 }
 
 /// Runs blocking work (files, network, dialogs) off the main thread.
@@ -1716,6 +1727,7 @@ fn main() {
         .plugin(tauri_plugin_opener::init())
         .manage(Shared(Mutex::new(Model::load())))
         .setup(|app| {
+            tray::init(app.handle())?;
             // Like ClaudeKeyZapper: look for a new version once at start, quietly.
             let handle = app.handle().clone();
             if !cfg!(debug_assertions) && !with_model(&handle, |m| m.config.no_update_check) {

@@ -19,6 +19,12 @@ Die App hat drei Bereiche, umschaltbar in der Kopfleiste, und ihre Einstellungen
 | **Aufträge** | jeder Pflegeauftrag: Schritte, Pläne, Vorschläge mit Diff, Ergebnisse und Log; laufende, wartende und bisherige |
 | **Website** (nur mit Website) | die vier Schritte der Website: Prüfen, Inhalte aktualisieren, Veröffentlichen, Live-Seite prüfen |
 
+Solange die App läuft, zeigt ein Symbol in der Menüleiste, wie es steht: wie viele Repositories blockiert
+sind, Aufmerksamkeit brauchen oder in Ordnung sind, die betroffenen Repositories mit ihrem Hauptgrund, die
+offenen Aufträge und ob eine neue Version da ist. Die Zahl neben dem Symbol sind die Entscheidungen, die auf
+dich warten. Ein Klick auf ein Repository oder einen Auftrag öffnet ihn im Fenster; **Status aktualisieren**
+liest alle Repositories neu. Das Symbol zeigt nur, was die App schon weiß, und liest selbst nichts nach.
+
 ## Erste Schritte
 
 Die App beginnt mit **Repositories auswählen**: Sie listet die lokalen Git-Klone in deinem Repo-Ordner,

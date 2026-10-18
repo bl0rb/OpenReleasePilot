@@ -2811,6 +2811,20 @@ async function start() {
       if (runsUi && job === jobId) appendTo(runsUi.log, [line]);
     } else if (step === selected) appendLog([line]);
   });
+  // The menu bar icon asks for an area, a repository or a job.
+  await listen('show', ({ payload }) => {
+    if (!view || !reposUi) return;
+    if (payload.repo && view.repositories.some((r) => r.key === payload.repo)) {
+      if (area === 'repos') openRepo(payload.repo);
+      else { repoKey = payload.repo; showArea('repos'); }
+    } else if (payload.job && runsUi && view.jobs.some((j) => j.id === payload.job)) {
+      openJob(payload.job);
+    } else if (payload.area === 'repos' || payload.area === 'runs') {
+      // To the list: showArea closes open details when the area is already shown.
+      if (area !== payload.area) { if (payload.area === 'repos') repoKey = null; else jobId = null; }
+      showArea(payload.area);
+    }
+  });
   await refresh();
   // Ages and "veraltet" move on without an event; a fresh view keeps them right. Reads nothing remote.
   setInterval(() => { if (area !== 'website' && document.visibilityState === 'visible') refresh(); }, 30000);

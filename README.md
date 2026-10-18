@@ -19,6 +19,12 @@ The app has three areas, switched in the toolbar, and its settings under **Einst
 | **Aufträge** (jobs) | every care job: its steps, plans, proposals with their diffs, results and log; running, waiting and earlier ones |
 | **Website** (only with a website) | the website's own four steps: Prüfen (check), Inhalte aktualisieren (update content), Veröffentlichen (publish), Live-Seite prüfen (verify the live site) |
 
+While the app runs, an icon in the menu bar shows how things stand: how many repositories are blocked,
+need attention or are fine, the affected repositories with their main reason, the open jobs and whether a
+new version is available. The number next to the icon is the decisions waiting for you. Clicking a
+repository or job opens it in the window; **Status aktualisieren** reads all repositories again. The icon
+only shows what the app already knows and reads nothing by itself.
+
 ## Getting started
 
 The app starts with **Repositories auswählen**: it lists the local Git clones in your repo folder
