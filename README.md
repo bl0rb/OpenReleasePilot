@@ -6,7 +6,7 @@
 
 Desktop app that looks after the repositories you choose on GitHub and GitLab, with Claude Code doing the
 work and you making the decisions. It reads their state, reviews and merges pull and merge requests, cleans up merged
-branches, tags patch releases and waits for the published release, keeps a README, other documentation
+branches, tags releases (patch, minor or major) and waits for the published release, keeps a README, other documentation
 or a wiki up to date, and, if you have one, updates and publishes a static website as the last
 step. Everything that changes something on GitHub, GitLab, in a wiki or on a website is first shown as a
 concrete proposal and only carried out after your approval.
@@ -48,7 +48,7 @@ nothing, neither on GitHub nor the local clone nor any website configuration. In
 
 - **Local clone** (optional): only used for cleaning up local branches and for Claude's look at the
   code during a pull request review. Status and pull request care work without one.
-- **Release rule**: whether the app may tag the next patch version, with which tag prefix (`v` for
+- **Release rule**: whether the app may tag the next version, with which tag prefix (`v` for
   `v1.2.3`, empty for `1.2.3`), and whether a workflow of the repository publishes a GitHub release for
   each tag. Without a rule the app never tags; it does not guess a versioning scheme.
 
@@ -136,8 +136,10 @@ activities you pick, each optional:
 - **Pull requests**: Claude reviews every open pull request into the default branch, the app merges,
   closes or asks Dependabot to rebase (rules below).
 - **Cleanup**: delete merged branches on GitHub and in the local clone.
-- **Release**: tag the next patch version where a release rule exists, once the CI of exactly that
-  commit passed, and, if the rule says so, wait for the published GitHub release. Pull request care no
+- **Release**: tag the next version where a release rule exists, once the CI of exactly that commit
+  passed, and, if the rule says so, wait for the published GitHub release. Per job you choose **Patch**,
+  **Minor** or **Major** (`1.2.3` → `1.2.4`, `1.3.0`, `2.0.0`) and whether the version files and the
+  CHANGELOG are brought to the new version first (release preparation, below). Pull request care no
   longer implies a tag.
 - **Content targets** fed by the selected repositories: README/documentation or wiki, each with the
   basis chosen for this job (newest release or current state of the default branch).
@@ -210,6 +212,29 @@ in a separate Claude run, and it is merged only after your approval. A repair th
 signature or credential code (e.g. `update.rs`, `verify.rs`) is only offered for choice, never planned. An
 interruption during a repair is resolved on resume: if its pull request is open, the repair counts as done.
 
+**Release preparation (Versionsdateien und CHANGELOG):** with this option the release step first
+clones the default branch into the app's work folder, exactly at the commit this job's merges left, and
+brings the repository to the new version, without Claude and without guessing:
+
+- `Cargo.toml` (`[package]`, `[workspace.package]`), the repository's own packages in `Cargo.lock`,
+  `package.json`, `package-lock.json` (top level and the root package), `tauri.conf.json`,
+  `pyproject.toml` (`[project]`, `[tool.poetry]`), `Chart.yaml` (`version`, `appVersion`) and
+  `VERSION`/`version.txt`, wherever they are (not in `node_modules`, `vendor`, `target`, `dist`, `build`,
+  `.venv`), but only where the version is exactly the one of the last tag;
+- a README at the root only on lines that name the repository (such as `MyApp-1.2.3.pkg` in a repository named MyApp),
+  and there only the version as a whole (not `11.2.3` or `1.2.31`);
+- `CHANGELOG.md` at the root: a non-empty "Unreleased" section becomes the version, with an empty one
+  above it; otherwise a new section `## [x.y.z] - date` above the newest one, with the commits since the
+  last tag along the default branch (a merge with its pull request's title, release commits left out).
+  A changelog that already has the version stays as it is; without a `CHANGELOG.md` none is created.
+
+The result is shown as its own decision with the diff and the app's checks. Approved, the app opens a
+pull request from `openreleasepilot/release-<tag>` (exactly the approved files on top of that commit,
+through the API), merges it once its CI is green and the default branch has not moved, and tags the merge
+commit once its CI is green too; a merge onto anything else means no tag. Without a matching file the tag
+follows directly. **Verwerfen** means no release pull request and no tag; **Neu vorbereiten** reads the
+state again.
+
 Right before each write the app checks again:
 
 - **Merge:** still open and no draft, same head commit, same target branch and repository, mergeable
@@ -220,7 +245,7 @@ Right before each write the app checks again:
 - **Rebase:** still open, really from Dependabot, same head, still in conflict or behind; then
   `@dependabot rebase`. A Dependabot pull request that a merge of the same job put into conflict gets
   this instead of the merge, as the plan says.
-- **Tag:** the next patch version of the newest `x.y.z` tag with the rule's prefix, only if every
+- **Tag:** the next version (as chosen: patch, minor or major) of the newest `x.y.z` tag with the rule's prefix, only if every
   planned merge of the repository succeeded, the default branch is exactly where this job's merges left
   it, the release line is unchanged, there are commits since the last tag, and the CI of exactly that
   commit passed (the app waits up to 30 minutes, then the job waits and can look again). Red, unclear,

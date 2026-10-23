@@ -12,7 +12,7 @@ use openreleasepilot_core::jobs::{self, CareItem, ItemKind, ItemOutcome, Job, Jo
 use openreleasepilot_core::repocare::{self, Action, CiWait, Done, Plan, PlanSet, ReleaseWait, RunState};
 use openreleasepilot_core::repos::RepoTarget;
 use openreleasepilot_core::forge::Forge;
-use openreleasepilot_core::{git, github, proof, repair, shell};
+use openreleasepilot_core::{git, github, proof, release, repair, shell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -157,6 +157,8 @@ fn resolve_interrupted(ctx: &Ctx, job: &mut Job) -> Result<()> {
         let Some(what) = job.steps[i].writing.clone() else { continue };
         let step = &job.steps[i];
         match step.kind {
+            // The release pull request is found again from its branch, its merge from its state.
+            StepKind::Release if !what.starts_with("Tag ") => job.steps[i].writing = None,
             StepKind::Release => {
                 let key = step.subject.clone();
                 let repo = config.repository(&key).map(|r| r.repo.clone()).unwrap_or(key.clone());
@@ -288,10 +290,10 @@ fn care_scan(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
                 ctx.log(kind, format!("  {} {}: {what} – {}{proof}", repocare::request_ref(&plan.repo, pr.number), pr.title, pr.reason));
             }
         }
-        repocare::finish(plan, options.cleanup, options.release);
+        repocare::finish(plan, options.cleanup, options.release.then_some(options.bump));
         if options.release {
             match (&plan.tag, &plan.tag_note) {
-                (Some(tag), _) => ctx.ok(format!("  Tag {tag} geplant (nach {})", plan.last_tag.as_deref().unwrap_or("?"))),
+                (Some(tag), _) => ctx.ok(format!("  Tag {tag} geplant ({} nach {})", options.bump.name(), plan.last_tag.as_deref().unwrap_or("?"))),
                 (None, Some(note)) => ctx.info(format!("  kein Tag: {note}")),
                 _ => {}
             }
@@ -684,22 +686,18 @@ fn release(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
             job.steps[i].set(StepState::Blocked, why, now());
             return Ok(());
         }
+        if job.options.prepare_release && !job.steps[i].prepared && !release_prepare(ctx, job, i, &plan, &tag)? {
+            return Ok(());
+        }
         let state = job.run_states.get(&key).cloned().unwrap_or_else(|| RunState::new(&plan));
         job.steps[i].writing = Some(format!("Tag {tag}"));
         save(ctx, job)?;
         let progress = |text: &str| ctx.info(format!("  {}: {text}", plan.name));
         let result = repocare::tag(&plan, &state, &ctx.runner, &CiWait::default(), &progress);
         job.steps[i].writing = None;
-        let tag_item = job.items.iter().position(|it| it.kind == ItemKind::Tag && it.repo == key);
-        let mut mark = |outcome: ItemOutcome, text: &str| {
-            if let Some(n) = tag_item {
-                job.items[n].outcome = Some(outcome);
-                job.items[n].detail = text.to_owned();
-            }
-        };
         match result {
             Ok(Done::Ok(text)) => {
-                mark(ItemOutcome::Done, &text);
+                mark_tag(job, &key, ItemOutcome::Done, &text);
                 ctx.ok(format!("  Tag {tag}: {text}"));
                 let step = &mut job.steps[i];
                 step.links.push(Link { label: format!("Tag {tag}"), url: format!("https://github.com/{}/releases/tag/{tag}", managed.repo) });
@@ -708,25 +706,12 @@ fn release(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
                 step.detail = text;
                 save(ctx, job)?;
             }
-            Ok(Done::Pending(text)) => {
-                ctx.warn(format!("  {text}"));
-                job.steps[i].set(StepState::Waiting, text, now());
-                return Ok(());
-            }
-            Ok(Done::Nothing(text)) => {
-                mark(ItemOutcome::Done, &text);
-                ctx.info(format!("  Tag {tag}: {text}"));
-                job.steps[i].set(StepState::NothingToDo, format!("kein Tag: {text}"), now());
-                return Ok(());
-            }
-            Ok(Done::Skipped(text)) => {
-                mark(ItemOutcome::Skipped, &text);
-                ctx.warn(format!("  Tag {tag}: {text}"));
-                job.steps[i].set(StepState::Skipped, format!("kein Tag: {text}"), now());
+            Ok(done) => {
+                no_tag(ctx, job, i, &key, &tag, done);
                 return Ok(());
             }
             Err(e) => {
-                mark(ItemOutcome::Failed, &format!("{e:#}"));
+                mark_tag(job, &key, ItemOutcome::Failed, &format!("{e:#}"));
                 return Err(e);
             }
         }
@@ -767,6 +752,160 @@ fn release(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
         ReleaseWait::Pending(why) => job.steps[i].set(StepState::Waiting, format!("Tag {tag} gesetzt; {why}. Release-Workflow prüfen, dann erneut prüfen"), now()),
     }
     Ok(())
+}
+
+/// Notes what became of the planned tag in the care plan's tag item.
+fn mark_tag(job: &mut Job, key: &str, outcome: ItemOutcome, text: &str) {
+    if let Some(item) = job.items.iter_mut().find(|it| it.kind == ItemKind::Tag && it.repo == key) {
+        item.outcome = Some(outcome);
+        item.detail = text.to_owned();
+    }
+}
+
+/// The release step ends without a tag (or waits for one), for the reason in `done`.
+fn no_tag(ctx: &Ctx, job: &mut Job, i: usize, key: &str, tag: &str, done: Done) {
+    match done {
+        Done::Pending(text) => {
+            ctx.warn(format!("  {text}"));
+            job.steps[i].set(StepState::Waiting, text, now());
+        }
+        Done::Nothing(text) => {
+            mark_tag(job, key, ItemOutcome::Done, &text);
+            ctx.info(format!("  Tag {tag}: {text}"));
+            job.steps[i].set(StepState::NothingToDo, format!("kein Tag: {text}"), now());
+        }
+        Done::Skipped(text) | Done::Ok(text) => {
+            mark_tag(job, key, ItemOutcome::Skipped, &text);
+            ctx.warn(format!("  Tag {tag}: {text}"));
+            job.steps[i].set(StepState::Skipped, format!("kein Tag: {text}"), now());
+        }
+    }
+}
+
+/// The release pull request before the tag, as far as it goes now: prepared and shown for approval,
+/// opened once approved, merged once its CI is green. `true` once it is through (merged, or nothing
+/// to change), and the tag may follow on the commit in the job's run state.
+fn release_prepare(ctx: &Ctx, job: &mut Job, i: usize, plan: &Plan, tag: &str) -> Result<bool> {
+    let key = plan.key.clone();
+    if let Some(number) = job.steps[i].pr {
+        return release_merge(ctx, job, i, plan, number);
+    }
+    if let Some(proposal) = job.steps[i].content.clone() {
+        if job.steps[i].approved.as_deref() != Some(proposal.fingerprint.as_str()) || !proposal.intact() {
+            job.steps[i].set(StepState::Blocked, "Die Freigabe passt nicht zum Vorschlag; neu vorbereiten", now());
+            return Ok(false);
+        }
+        let head = repocare::head(plan)?;
+        if head != proposal.base_commit {
+            let why = format!("{} steht inzwischen auf {} statt auf {}; neu vorbereiten", plan.default_branch, content::short(&head), content::short(&proposal.base_commit));
+            job.steps[i].set(StepState::Blocked, why, now());
+            return Ok(false);
+        }
+        let word = Forge::of(&plan.repo).request();
+        ctx.info(format!("  Branch {} und Release-{word} anlegen …", proposal.branch));
+        job.steps[i].writing = Some("Release-PR".into());
+        save(ctx, job)?;
+        let result = release::publish(&job.id, plan, &proposal, tag);
+        job.steps[i].writing = None;
+        let pr = result?;
+        let r = repocare::request_ref(&plan.repo, pr.number);
+        ctx.ok(format!("  {r} erstellt: {}", pr.url));
+        let step = &mut job.steps[i];
+        step.pr = Some(pr.number);
+        step.commit = Some(pr.commit.clone());
+        step.links.push(Link { label: format!("Release-{r}"), url: pr.url });
+        save(ctx, job)?;
+        return release_merge(ctx, job, i, plan, pr.number);
+    }
+    let state = job.run_states.get(&key).cloned().unwrap_or_else(|| RunState::new(plan));
+    let base = match repocare::tag_base(plan, &state)? {
+        Ok(base) => base,
+        Err(done) => {
+            no_tag(ctx, job, i, &key, tag, done);
+            return Ok(false);
+        }
+    };
+    let last = plan.last_tag.clone().context("keine Ausgangsversion")?;
+    ctx.info(format!("  Versionsdateien und CHANGELOG von {last} auf {tag} bringen (Arbeitsordner der App, nicht deine lokale Kopie) …"));
+    match release::prepare(&job.id, plan, &base, &last, tag)? {
+        release::Prepared::Moved(why) => {
+            no_tag(ctx, job, i, &key, tag, Done::Skipped(why));
+            Ok(false)
+        }
+        release::Prepared::Nothing(why) => {
+            ctx.info(format!("  {why}"));
+            job.steps[i].prepared = true;
+            save(ctx, job)?;
+            Ok(true)
+        }
+        release::Prepared::Proposal(proposal, edits) => {
+            for edit in &edits {
+                ctx.info(format!("  {}: {}", edit.path, edit.what));
+            }
+            for check in &proposal.checks {
+                ctx.log(if check.ok { "ok" } else { "warn" }, format!("  Prüfung {}: {}", check.name, check.detail));
+            }
+            let files = proposal.files.len();
+            let failed: Vec<String> = proposal.checks.iter().filter(|c| !c.ok).map(|c| format!("{}: {}", c.name, c.detail)).collect();
+            let step = &mut job.steps[i];
+            step.content = Some(*proposal);
+            if failed.is_empty() {
+                step.set(StepState::NeedsApproval, format!("Release-{}: {files} Datei(en) auf {tag}; Freigabe nötig", Forge::of(&plan.repo).request()), now());
+            } else {
+                step.set(StepState::Failed, format!("Prüfung nicht bestanden: {}", failed.join("; ")), now());
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// Merges the release pull request once its CI is green, then notes its merge commit as the commit
+/// the tag goes on. A merge onto anything but the commit the proposal was made on counts as a
+/// foreign change: then no tag.
+fn release_merge(ctx: &Ctx, job: &mut Job, i: usize, plan: &Plan, number: u64) -> Result<bool> {
+    let r = repocare::request_ref(&plan.repo, number);
+    let base = job.steps[i].content.as_ref().map(|p| p.base_commit.clone()).context("Vorschlag des Release-PRs fehlt")?;
+    let service = Forge::of(&plan.repo).name();
+    match content::pull_request_state(&plan.repo, number)? {
+        content::PrState::Closed => {
+            job.steps[i].set(StepState::Failed, format!("{r} wurde ohne Merge geschlossen; kein Tag"), now());
+            return Ok(false);
+        }
+        content::PrState::Open => {
+            let head = repocare::head(plan)?;
+            if head != base {
+                let why = format!("{} hat sich seit dem Release-{} bewegt ({}); {r} bleibt offen, kein Tag", plan.default_branch, Forge::of(&plan.repo).request(), content::short(&head));
+                job.steps[i].set(StepState::Blocked, why, now());
+                return Ok(false);
+            }
+            let commit = job.steps[i].commit.clone().context("Commit des Release-PRs unbekannt")?;
+            job.steps[i].writing = Some("Release-Merge".into());
+            save(ctx, job)?;
+            let progress = |text: &str| ctx.info(format!("  {text}"));
+            let result = content::merge_when_green(&plan.repo, &PullRequestRef { number, url: String::new(), commit }, &ctx.runner, &CiWait::default(), &progress);
+            job.steps[i].writing = None;
+            match result? {
+                Ok(text) => ctx.ok(format!("  {r} {text}")),
+                Err(why) => {
+                    ctx.warn(format!("  {r} nicht gemergt: {why}"));
+                    job.steps[i].set(StepState::Waiting, format!("{r} noch nicht gemergt: {why}. Erneut prüfen, sobald die CI grün ist; kein Tag bis dahin"), now());
+                    return Ok(false);
+                }
+            }
+        }
+        content::PrState::Merged => {}
+    }
+    let (sha, parents) = content::merge_commit(&plan.repo, number)?.with_context(|| format!("{r} ist laut {service} nicht gemergt"))?;
+    let state = job.run_states.entry(plan.key.clone()).or_insert_with(|| RunState::new(plan));
+    if parents.first() == Some(&base) {
+        state.expected_head = Some(sha.clone());
+        ctx.info(format!("  Tag folgt auf den Merge-Commit {}", content::short(&sha)));
+    } else {
+        state.foreign = Some(format!("{r} wurde nicht direkt auf {} gemergt; dazwischen kamen fremde Änderungen", content::short(&base)));
+    }
+    job.steps[i].prepared = true;
+    save(ctx, job)?;
+    Ok(true)
 }
 
 /// Later steps of this job that wait for release step `i` and build on the newest GitHub release:

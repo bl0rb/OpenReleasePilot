@@ -3,8 +3,9 @@
 //!
 //! - `care`: read the repositories, let Claude judge the pull requests, then the plan waits for
 //!   approval; after it, the approved items run one by one (pull requests, then branches).
-//! - `release:<repo>`: the planned patch tag once the CI of its commit passed, then (if the release
-//!   rule says so) the wait for the published GitHub release.
+//! - `release:<repo>`: optionally first a release pull request (version files and CHANGELOG,
+//!   shown with its diff, approved, merged once green), then the planned tag once the CI of its
+//!   commit passed, then (if the release rule says so) the wait for the published GitHub release.
 //! - `target:<id>`: a README/documentation or wiki change, prepared, shown, approved, published.
 //! - `website`: the website's update, shown as its commit, approved, uploaded and verified.
 //!
@@ -15,7 +16,7 @@
 use crate::config::Config;
 use crate::content::{self, Basis, Proposal, TargetKind};
 use crate::paths;
-use crate::repocare::{Action, PlanSet, RunState};
+use crate::repocare::{Action, Bump, PlanSet, RunState};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -38,8 +39,13 @@ pub struct JobOptions {
     pub proof: bool,
     /// Delete merged branches.
     pub cleanup: bool,
-    /// Patch tag (and published release) where a release rule exists.
+    /// Tag of the next version (and published release) where a release rule exists.
     pub release: bool,
+    /// Which part of the version the release raises.
+    pub bump: Bump,
+    /// Before the tag: a release pull request that brings the version files and the CHANGELOG to
+    /// the new version, approved with its diff (see `release`).
+    pub prepare_release: bool,
     /// Content targets, each with the basis chosen for this job.
     pub targets: Vec<TargetChoice>,
     /// Update, publish and verify the website as the last step.
@@ -173,9 +179,13 @@ pub struct JobStep {
     pub tag: Option<String>,
     #[serde(default)]
     pub commit: Option<String>,
-    /// Docs: the pull request the step created.
+    /// Docs and release: the pull request the step created.
     #[serde(default)]
     pub pr: Option<u64>,
+    /// Release: the preparation is through (its pull request merged, or nothing to change); the
+    /// tag follows on the commit in the job's run state.
+    #[serde(default)]
+    pub prepared: bool,
     #[serde(default)]
     pub finished_at: Option<u64>,
 }
@@ -199,6 +209,7 @@ impl JobStep {
             tag: None,
             commit: None,
             pr: None,
+            prepared: false,
             finished_at: None,
         }
     }
@@ -805,6 +816,11 @@ pub fn reject_step(job: &mut Job, step_id: &str, now: u64) -> Result<(), String>
     }
     let what = if step.kind == StepKind::Website {
         "von dir verworfen; der lokale Commit bleibt unveröffentlicht im Website-Projekt"
+    } else if step.kind == StepKind::Release {
+        if step.pr.is_some() {
+            return Err("Der Release-PR ist schon erstellt; ihn auf GitHub schließen oder den Auftrag beenden".into());
+        }
+        "von dir verworfen; kein Release-PR, kein Tag"
     } else {
         "von dir verworfen; nichts veröffentlicht"
     };
@@ -836,8 +852,9 @@ pub fn redo_step(job: &mut Job, step_id: &str, now: u64) -> Result<(), String> {
         return Ok(());
     }
     let step = job.step_mut(step_id).ok_or("Schritt nicht gefunden")?;
-    if !matches!(step.kind, StepKind::Docs | StepKind::Wiki | StepKind::Website) {
-        return Err("Nur Pflegeplan, Inhalts- und Website-Schritte lassen sich neu vorbereiten".into());
+    let release_prep = step.kind == StepKind::Release && step.content.is_some() && !step.prepared && step.tag.is_none();
+    if !matches!(step.kind, StepKind::Docs | StepKind::Wiki | StepKind::Website) && !release_prep {
+        return Err("Nur Pflegeplan, Release-Vorbereitung, Inhalts- und Website-Schritte lassen sich neu vorbereiten".into());
     }
     if !matches!(step.state, StepState::NeedsApproval | StepState::Blocked | StepState::Failed | StepState::NothingToDo) {
         return Err("Dieser Schritt lässt sich jetzt nicht neu vorbereiten".into());
@@ -1278,6 +1295,43 @@ mod tests {
         redo_step(&mut job, "target:t2", 1).unwrap();
         assert_eq!(job.step("target:t2").unwrap().state, StepState::Pending);
         assert!(job.step("target:t2").unwrap().content.is_none());
+    }
+
+    #[test]
+    fn a_release_proposal_is_approved_redone_or_rejected_until_its_pull_request_exists() {
+        let mut job = job(&JobOptions { prepare_release: true, bump: Bump::Minor, ..all() });
+        let id = job.steps.iter().find(|s| s.kind == StepKind::Release).map(|s| s.id.clone()).expect("release step");
+        assert!(redo_step(&mut job, &id, 1).is_err(), "nothing prepared yet");
+        let step = job.step_mut(&id).unwrap();
+        step.state = StepState::NeedsApproval;
+        step.content = Some(proposal("fp1", true));
+        approve_step(&mut job, &id, "fp1", 1).unwrap();
+        assert_eq!(job.step(&id).unwrap().state, StepState::Approved);
+
+        let step = job.step_mut(&id).unwrap();
+        step.state = StepState::NeedsApproval;
+        redo_step(&mut job, &id, 1).unwrap();
+        let step = job.step(&id).unwrap();
+        assert!(step.content.is_none() && step.approved.is_none() && step.state == StepState::Pending);
+
+        let step = job.step_mut(&id).unwrap();
+        step.state = StepState::NeedsApproval;
+        step.content = Some(proposal("fp2", true));
+        step.pr = Some(7);
+        assert!(reject_step(&mut job, &id, 1).is_err(), "an opened release PR is not taken back by a click");
+        assert!(redo_step(&mut job, &id, 1).is_err());
+        job.step_mut(&id).unwrap().pr = None;
+        reject_step(&mut job, &id, 1).unwrap();
+        assert_eq!(job.step(&id).unwrap().detail, "von dir verworfen; kein Release-PR, kein Tag");
+        assert!(job.step(&id).unwrap().state.lets_go_on(), "a rejected release does not stop the docs");
+    }
+
+    #[test]
+    fn options_of_older_jobs_read_as_a_patch_without_preparation() {
+        let options: JobOptions = serde_json::from_str(r#"{"prs":true,"release":true}"#).unwrap();
+        assert_eq!((options.bump, options.prepare_release), (Bump::Patch, false));
+        let minor: JobOptions = serde_json::from_str(r#"{"release":true,"bump":"minor","prepareRelease":true}"#).unwrap();
+        assert_eq!((minor.bump, minor.prepare_release), (Bump::Minor, true));
     }
 
     #[test]

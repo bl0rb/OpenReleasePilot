@@ -1361,7 +1361,7 @@ function statusFacts(r, branch) {
       ok(f?.ci)?.state === 'failed' ? 'red' : ok(f?.ci)?.state === 'passed' ? 'green' : ''),
     row('Release', f ? releaseText(f) : '–'),
     row(sinceLabel, !since ? '–' : ok(since) ? String(since.value.commits) : since.state === 'failed' ? since.value : `nicht bestimmbar${since.value ? `: ${since.value}` : ''}`),
-    row('Release-Regel', r.release ? `Patch-Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, danach wartet die App auf das ${serviceOf(r.repo)}-Release` : ''}` : 'keine: die App setzt keine Tags', r.release ? '' : 'muted'),
+    row('Release-Regel', r.release ? `Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, danach wartet die App auf das ${serviceOf(r.repo)}-Release` : ''}` : 'keine: die App setzt keine Tags', r.release ? '' : 'muted'),
     row('Lokale Kopie', localText(r.local), ['found', 'notConfigured'].includes(r.local.state) ? '' : 'orange'),
     r.products.length > 0 && row('Website', [...r.products.map((p) => `${p.name}: dokumentiert ${p.documented}${p.enabled ? '' : ', nicht ausgewählt'}`)].join(' · ')),
     r.website && row('Rolle', 'zugleich das Repository der Website'),
@@ -1537,6 +1537,18 @@ function securityFixDialog(r, only) {
 
 const KIND_TEXT = { docs: 'README/Dokumentation', wiki: 'Wiki' };
 const BASIS_TEXT = { release: 'neuestes Release', commit: 'aktueller Stand des Default-Branches' };
+const BUMP_TEXT = { patch: 'Patch', minor: 'Minor', major: 'Major' };
+const BUMP_NOTE = { patch: 'Korrekturen (1.2.3 → 1.2.4)', minor: 'neue Funktionen (1.2.3 → 1.3.0)', major: 'inkompatible Änderungen (1.2.3 → 2.0.0)' };
+
+/** The version after `tag` for the bump, as `repocare::next_version` computes it; null for a tag that is no plain x.y.z. */
+function nextVersion(tag, prefix, bump) {
+  if (!tag.startsWith(prefix)) return null;
+  const parts = tag.slice(prefix.length).split('.');
+  if (parts.length !== 3 || !parts.every((p) => /^\d+$/.test(p))) return null;
+  const [major, minor, patch] = parts.map(Number);
+  const next = bump === 'major' ? [major + 1, 0, 0] : bump === 'minor' ? [major, minor + 1, 0] : [major, minor, patch + 1];
+  return `${prefix}${next.join('.')}`;
+}
 
 function deliveryText(d) {
   if (!d) return null;
@@ -1634,7 +1646,7 @@ function manageSection(r) {
     h('label', { class: 'check-line top' }, h('input', {
       type: 'checkbox', id: 'manage-release', checked: s.release, disabled: locked,
       onchange: (e) => { s.release = e.target.checked; prefixInput.disabled = !s.release; publishes.disabled = !s.release; update(); },
-    }), h('span', null, h('strong', null, 'Release-Regel: die App darf die nächste Patch-Version taggen'),
+    }), h('span', null, h('strong', null, 'Release-Regel: die App darf die nächste Version taggen'),
       h('div', { class: 'note' }, 'Die App errät keine Versionierung. Getaggt wird nur auf grüner CI genau des Ziel-Commits.'))),
     h('div', { class: 'field-row' }, h('label', { for: 'manage-prefix' }, 'Tag-Präfix'), prefixInput),
     h('label', { class: 'check-line' }, publishes, gitlabHost(r.repo)
@@ -1792,7 +1804,8 @@ function renderJob(summary, job) {
       h('strong', null, status.reason), status.next && h('div', { class: 'muted small' }, `Nächster Schritt: ${status.next}`)));
   const o = summary.options;
   const gitlabOnly = summary.repos.every((key) => gitlabHost(key));
-  const activities = [o.prs && (gitlabOnly ? 'Merge Requests' : 'Pull Requests'), o.cleanup && 'Aufräumen', o.release && 'Release'].filter(Boolean);
+  const release = o.release && `Release (${BUMP_TEXT[o.bump ?? 'patch']}${o.prepareRelease ? ', mit Versionsdateien und CHANGELOG' : ''})`;
+  const activities = [o.prs && (gitlabOnly ? 'Merge Requests' : 'Pull Requests'), o.cleanup && 'Aufräumen', release].filter(Boolean);
   const targetNames = o.targets.map((t) => `${view.targets.find((x) => x.id === t.id)?.name ?? t.id} (${t.basis === 'release' ? 'Release' : 'aktueller Stand'})`);
   runsUi.facts.replaceChildren(...[
     h('span', null, h('strong', null, 'Repositories: '), summary.repos.map(repoName).join(', ')),
@@ -2010,8 +2023,10 @@ function planRepo(job, p, decide, marks, single) {
         group('Reparieren lassen', repairs.map(prLine)),
         group('Schließen', of('close').map(prLine)),
         group('Rebase anstoßen', of('rebase').map(prLine)),
-        group('Tag', of('tag').map((item) => line(item, [h('strong', null, item.reference), h('span', { class: 'muted small' }, `nach ${p.lastTag ?? '?'}`), h('span', { class: 'spacer' }), decide && badge('', 'bedingt')],
-          decide && h('div', { class: 'item-check' }, `Im Release-Schritt: nur wenn alle geplanten Merges gelingen, ${p.defaultBranch} sich sonst nicht bewegt und die CI genau dieses Commits grün ist (bis zu 30 Minuten). Direkt vor dem Schreiben prüft die App die Release-Linie erneut.`)))),
+        group('Tag', of('tag').map((item) => line(item, [h('strong', null, item.reference), h('span', { class: 'muted small' }, `${BUMP_TEXT[job.options.bump ?? 'patch']} nach ${p.lastTag ?? '?'}`), h('span', { class: 'spacer' }), job.options.prepareRelease && badge('accent', 'mit Release-PR'), decide && badge('', 'bedingt')],
+          decide && h('div', { class: 'item-check' }, job.options.prepareRelease
+            ? `Im Release-Schritt: nur wenn alle geplanten Merges gelingen und ${p.defaultBranch} sich sonst nicht bewegt. Zuerst bringt die App die Versionsdateien und das CHANGELOG auf ${item.reference} und zeigt dir den Diff zur eigenen Freigabe; danach Release-PR, Merge bei grüner CI und der Tag auf dem Merge-Commit, sobald dessen CI grün ist (je bis zu 30 Minuten).`
+            : `Im Release-Schritt: nur wenn alle geplanten Merges gelingen, ${p.defaultBranch} sich sonst nicht bewegt und die CI genau dieses Commits grün ist (bis zu 30 Minuten). Direkt vor dem Schreiben prüft die App die Release-Linie erneut.`)))),
         !p.tag && p.tagNote && job.options.release && [h('div', { class: 'item-group' }, 'Tag'), h('div', { class: 'item-reason' }, `Kein Tag: ${p.tagNote}`)],
         group(`Aufräumen auf ${serviceOf(p.repo)}`, of('branch').map((i) => branchLine(i, p.branches))),
         group('Lokale Kopie abgleichen', of('localSync').map((i) => line(i, h('span', null, 'git fetch --prune origin'), decide && h('div', { class: 'item-reason' }, `Vor dem Löschen, weil ${p.localSync}. Misslingt der Abgleich, löscht die App lokal nichts.`)))),
@@ -2029,14 +2044,37 @@ function planRepo(job, p, decide, marks, single) {
 function releaseBlock(job, step) {
   const plan = job.plan?.plans.find((p) => p.key === step.subject);
   const rule = view.repositories.find((r) => r.key === step.subject)?.release;
+  const p = step.content;
+  const decide = step.state === 'needsApproval';
+  const word = requestWord(step.subject);
+  const redoable = p && ['needsApproval', 'blocked', 'failed'].includes(step.state) && !step.pr && !step.writing && !step.prepared;
+  const failedChecks = p?.checks.filter((c) => !c.ok) ?? [];
   return [
     waitsFor(job, step),
     h('div', { class: 'facts' },
       h('span', null, h('strong', null, 'Repository: '), repoName(step.subject)),
-      plan?.tag && h('span', null, h('strong', null, 'Geplant: '), `${plan.tag} nach ${plan.lastTag}`),
+      plan?.tag && h('span', null, h('strong', null, 'Geplant: '), `${plan.tag} (${BUMP_TEXT[job.options.bump ?? 'patch']} nach ${plan.lastTag})`),
+      job.options.prepareRelease && h('span', null, h('strong', null, 'Vorher: '), step.prepared ? (step.pr ? `Release-${word} gemergt` : 'nichts an den Versionsdateien zu ändern') : `Release-${word} mit Versionsdateien und CHANGELOG`),
       step.tag && h('span', null, h('strong', null, 'Gesetzt: '), `${step.tag} auf ${short(step.commit)}`),
       rule && h('span', null, h('strong', null, `${serviceOf(step.subject)}-Release: `), rule.publishesRelease ? 'die App wartet darauf (bis zu 30 Minuten je Prüfung)' : 'laut Regel keins')),
+    p && decisionBrief([
+      ['Version', `${plan?.lastTag ?? '?'} → ${plan?.tag ?? '?'}`],
+      ['Änderung', `${p.files.length} ${p.files.length === 1 ? 'Datei' : 'Dateien'}: ${p.files.slice(0, 4).map((f) => f.path).join(', ')}${p.files.length > 4 ? ` und ${p.files.length - 4} weitere` : ''}`],
+      ['Ausgangsstand', `${p.baseBranch} ${short(p.baseCommit)} (nach den Merges dieses Auftrags)`],
+      ['Prüfungen der App', failedChecks.length ? h('span', { class: 'red' }, `${failedChecks.length} von ${p.checks.length} nicht bestanden`) : `alle ${p.checks.length} bestanden`],
+      decide && ['Freigeben bewirkt', `Ein neuer Branch ${p.branch} und ein Release-${word} mit genau diesem Stand. Bei grüner CI mergt die App ihn und setzt den Tag ${plan?.tag ?? ''} auf den Merge-Commit, sobald dessen CI grün ist. Hat sich ${p.baseBranch} inzwischen bewegt, stoppt die App.`],
+    ], null),
+    p && h('div', { class: 'brief-summary' }, markdown(p.summary)),
+    decide && decisionBar(
+      button(`Freigeben: Release-${word} erstellen, mergen und taggen`, () => act('approve_step', { id: job.id, step: step.id, fingerprint: p.fingerprint }), { cls: 'primary', iconName: 'check', disabled: !!view.running }),
+      button('Verwerfen', () => act('reject_step', { id: job.id, step: step.id }), { disabled: !!view.running, title: `Kein Release-${word}, kein Tag` }),
+      button('Neu vorbereiten', () => act('redo_step', { id: job.id, step: step.id }), { disabled: !!view.running, title: 'Liest den Stand neu und bereitet die Dateien erneut vor' })),
+    !decide && redoable && decisionBar(
+      button('Neu vorbereiten', () => act('redo_step', { id: job.id, step: step.id }), { disabled: !!view.running }),
+      button('Verwerfen', () => act('reject_step', { id: job.id, step: step.id }), { disabled: !!view.running })),
     step.state === 'waiting' && h('div', { class: 'note orange' }, `${step.detail}. „Erneut prüfen“ oben fragt ${serviceOf(step.subject)} wieder; abhängige Schritte warten so lange.`),
+    p && h('details', { class: 'fold' }, h('summary', null, 'Prüfungen im Einzelnen'), checksView(p.checks)),
+    p && technicalPreview(`${job.id}:${step.id}:tech`, { files: p.files, diff: p.diff }),
   ].filter(Boolean);
 }
 
@@ -2574,7 +2612,14 @@ function jobDialog(keys) {
   const withRule = allowed.filter((r) => r.release);
   const targets = view.targets.filter((t) => t.sources.some((k) => allowed.some((r) => r.key === k)));
   const feedsWebsite = !!view.websiteSources && allowed.some((r) => view.websiteSources.includes(r.key));
-  const o = { prs: true, proof: true, cleanup: false, release: false, targets: new Map(), website: false, model: '', instructions: '' };
+  const o = { prs: true, proof: true, cleanup: false, release: false, bump: 'patch', prepareRelease: true, targets: new Map(), website: false, model: '', instructions: '' };
+  // An example of what the chosen bump makes of the newest tag, from the first repository whose tag is known.
+  const example = () => withRule.map((r) => {
+    // The newest release names the tag; without one, the highest matching tag.
+    const last = (r.facts && (ok(r.facts.release) || ok(r.facts.tag))) || null;
+    const next = last && nextVersion(last, r.release.tagPrefix, o.bump);
+    return next && `${r.repo}: ${last} → ${next}`;
+  }).find(Boolean);
   const s = { error: '', busy: false };
   // The words of the services the chosen repositories live on.
   const lab = allowed.some((r) => gitlabHost(r.repo));
@@ -2595,9 +2640,15 @@ function jobDialog(keys) {
           option('prs', `${pick('Pull Requests', 'Merge Requests')} prüfen und übernehmen`, `Claude bewertet jeden offenen ${pick('PR', 'MR')} auf den Default-Branch (Risikoklasse, Release-Notes, Versions-Pins, zusammengehörige Abhängigkeiten, Nutzung im Code); das kostet Claude-Nutzung. Gemergt wird nur, was ${service} mergebar mit grüner CI meldet und Claude grün oder gelb einstuft. Überflüssige ${pick('PRs', 'MRs')} werden mit Begründung geschlossen, ${pick('Dependabot-PRs', 'Renovate-MRs')} mit Konflikt neu aufgebaut.`),
           o.prs && h('div', { class: 'sub-option' }, option('proof', 'Mit Nachweisen prüfen', `Statt zu vermuten, baut und testet Claude jeden ${pick('PR', 'MR')} in einer Wegwerf-Kopie und schreibt bei Bedarf einen kurzen Test. In der Sandbox von Claude Code: schreiben nur dort, Netz nur zu Paket-Registries, Zugangsdaten gesperrt. Build-Skripte neuer Abhängigkeiten laufen dabei auf diesem Mac. Dauert länger; ohne lokale Kopie wird nur gelesen; gepusht wird nichts.`)),
           option('cleanup', 'Gemergte Branches aufräumen', `Branches, deren Commits auf ${service} vollständig im Default-Branch sind oder deren ${pick('PR', 'MR')} gemergt wurde, auf ${service} und in der lokalen Kopie. Geschützte, ausgecheckte und Branches offener ${pick('PRs', 'MRs')} bleiben.`),
-          option('release', 'Release: nächste Patch-Version taggen', withRule.length
+          option('release', 'Release: nächste Version taggen', withRule.length
             ? `Nur für Repositories mit Release-Regel (${withRule.map((r) => r.repo).join(', ')}), nur auf grüner CI genau des Ziel-Commits; danach wartet die App bei Bedarf auf das veröffentlichte ${service}-Release.`
-            : 'Keins der Repositories hat eine Release-Regel; einrichten unter Repository → Verwaltung.', !withRule.length)),
+            : 'Keins der Repositories hat eine Release-Regel; einrichten unter Repository → Verwaltung.', !withRule.length),
+          o.release && h('div', { class: 'sub-option' },
+            h('div', { class: 'field-row' }, h('label', { for: 'job-bump' }, 'Version'),
+              h('select', { id: 'job-bump', 'aria-describedby': 'job-bump-note', onchange: (e) => { o.bump = e.target.value; render(); } },
+                Object.entries(BUMP_TEXT).map(([value, text]) => h('option', { value, selected: o.bump === value }, `${text}: ${BUMP_NOTE[value]}`)))),
+            h('div', { class: 'note', id: 'job-bump-note' }, example() ?? 'Die Version zählt vom höchsten Tag der Release-Regel aus weiter.'),
+            option('prepareRelease', 'Vorher Versionsdateien und CHANGELOG anpassen', `Vor dem Tag bringt die App Cargo.toml, package.json, tauri.conf.json, Chart.yaml und ähnliche Dateien sowie das CHANGELOG.md auf die neue Version, aber nur dort, wo genau die Version des letzten Tags steht. Du siehst den Diff und gibst ihn eigens frei; dann ein Release-${pick('PR', 'MR')}, Merge bei grüner CI und der Tag auf dem Merge-Commit. Ohne passende Datei folgt der Tag direkt.`))),
         (targets.length > 0 || feedsWebsite) && h('fieldset', null, h('legend', null, 'Zugeordnete Inhalte'),
           targets.map((t) => h('div', { class: 'target-choice' },
             h('label', { class: 'check-line' },
@@ -2621,7 +2672,8 @@ function jobDialog(keys) {
           s.busy = true; s.error = ''; render();
           try {
             const options = {
-              prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, website: o.website, model: o.model, instructions: o.instructions,
+              prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, bump: o.bump, prepareRelease: o.release && o.prepareRelease,
+              website: o.website, model: o.model, instructions: o.instructions,
               targets: [...o.targets].map(([id, basis]) => ({ id, basis })),
             };
             const id = await invoke('start_job', { input: { repos: allowed.map((r) => r.key), options } });

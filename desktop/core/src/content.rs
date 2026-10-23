@@ -704,6 +704,33 @@ impl Proposal {
         proposal
     }
 
+    /// A proposal that belongs to no content target (the release preparation); `label` takes the
+    /// place of the target's fingerprint, so the approval still binds to exactly this change.
+    #[allow(clippy::too_many_arguments)]
+    pub fn standalone(label: &str, prepared: &Prepared, sources: Vec<SourceRev>, changes: Changes, checks: Vec<CheckResult>, summary: String, branch: String) -> Self {
+        let mut proposal = Proposal {
+            base_branch: prepared.base_branch.clone(),
+            base_commit: prepared.base_commit.clone(),
+            sources,
+            files: changes.files,
+            diff: changes.diff,
+            stat: changes.stat,
+            checks,
+            summary,
+            cost_usd: None,
+            branch,
+            target: label.to_owned(),
+            fingerprint: String::new(),
+        };
+        proposal.fingerprint = proposal.digest();
+        proposal
+    }
+
+    /// The fingerprint still matches the content (nothing in the stored job was changed).
+    pub fn intact(&self) -> bool {
+        self.digest() == self.fingerprint
+    }
+
     fn digest(&self) -> String {
         let files: Vec<(&str, &str, &str)> = self.files.iter().map(|f| (f.path.as_str(), f.sha256.as_str(), f.mode.as_str())).collect();
         let key = json!([self.target, self.base_branch, self.base_commit, self.sources, files, self.branch]);
@@ -928,6 +955,32 @@ pub fn pull_request_state(repo: &str, number: u64) -> Result<PrState> {
     } else {
         PrState::Open
     })
+}
+
+/// The commit a merged pull request (merge request) left on its target branch and that commit's
+/// parents; `None` while it is not merged.
+pub fn merge_commit(repo: &str, number: u64) -> Result<Option<(String, Vec<String>)>> {
+    let (sha, parents) = if let Some(p) = crate::gitlab::project(repo) {
+        let mr = crate::gitlab::get(&p.host, &format!("{}/merge_requests/{number}", p.api()))?.with_context(|| format!("MR !{number} nicht gefunden"))?;
+        if mr["state"].as_str() != Some("merged") {
+            return Ok(None);
+        }
+        // A fast-forward merge leaves the merge request's own head.
+        let sha = ["merge_commit_sha", "squash_commit_sha", "sha"].iter().find_map(|k| mr[*k].as_str()).context("MR ohne Commit")?.to_owned();
+        let commit = crate::gitlab::get(&p.host, &format!("{}/repository/commits/{sha}", p.api()))?.context("Merge-Commit nicht gefunden")?;
+        let parents = commit["parent_ids"].as_array().into_iter().flatten().filter_map(|s| s.as_str().map(str::to_owned)).collect();
+        (sha, parents)
+    } else {
+        let pr = get(&format!("repos/{repo}/pulls/{number}"))?.with_context(|| format!("PR #{number} nicht gefunden"))?;
+        if pr["merged"].as_bool() != Some(true) {
+            return Ok(None);
+        }
+        let sha = pr["merge_commit_sha"].as_str().context("PR ohne Merge-Commit")?.to_owned();
+        let commit = get(&format!("repos/{repo}/git/commits/{sha}"))?.context("Merge-Commit nicht gefunden")?;
+        let parents = commit["parents"].as_array().into_iter().flatten().filter_map(|p| p["sha"].as_str().map(str::to_owned)).collect();
+        (sha, parents)
+    };
+    Ok(Some((sha, parents)))
 }
 
 /// Merges a delivered docs pull request once the CI of exactly its commit passed and GitHub reports

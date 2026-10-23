@@ -109,7 +109,7 @@ impl ManagedRepo {
     }
 }
 
-/// The release line the app may continue: tags `<prefix>x.y.z`, the next patch only.
+/// The release line the app may continue: tags `<prefix>x.y.z`, the next patch, minor or major version as each job chooses.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseRule {

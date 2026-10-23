@@ -6,7 +6,7 @@
 
 Desktop-App, die sich um die Repositories auf GitHub und GitLab kümmert, die du auswählst: Claude Code
 erledigt die Arbeit, du triffst die Entscheidungen. Sie liest den Zustand, prüft und mergt Pull bzw. Merge Requests, räumt
-gemergte Branches auf, taggt Patch-Releases und wartet auf das veröffentlichte Release, hält eine README,
+gemergte Branches auf, taggt Releases (Patch, Minor oder Major) und wartet auf das veröffentlichte Release, hält eine README,
 weitere Dokumentation oder ein Wiki aktuell und aktualisiert und veröffentlicht, wenn vorhanden,
 als letzten Schritt eine statische Website. Alles, was auf GitHub, GitLab, in einem Wiki oder auf einer Website
 etwas ändert, zeigt die App vorher als konkreten Vorschlag und führt es erst nach deiner Freigabe aus.
@@ -48,7 +48,7 @@ eine Website-Konfiguration. Im Abschnitt **Verwaltung** des Repositorys:
 
 - **Lokale Kopie** (optional): nur fürs Aufräumen lokaler Branches und für Claudes Blick in den Code bei
   der PR-Prüfung. Status und PR-Pflege gehen auch ohne.
-- **Release-Regel**: ob die App die nächste Patch-Version taggen darf, mit welchem Tag-Präfix (`v` für
+- **Release-Regel**: ob die App die nächste Version taggen darf, mit welchem Tag-Präfix (`v` für
   `v1.2.3`, leer für `1.2.3`), und ob ein Workflow des Repositorys zu jedem Tag ein GitHub-Release
   veröffentlicht. Ohne Regel taggt die App nie; sie errät keine Versionierung.
 
@@ -137,9 +137,11 @@ besteht aus den Tätigkeiten, die du wählst, jede optional:
 - **Pull Requests**: Claude bewertet jeden offenen PR auf den Default-Branch, die App mergt, schließt
   oder bittet Dependabot um einen Rebase (Regeln unten).
 - **Aufräumen**: gemergte Branches auf GitHub und in der lokalen Kopie löschen.
-- **Release**: die nächste Patch-Version taggen, wo eine Release-Regel besteht, sobald die CI genau
-  dieses Commits grün ist, und, wenn die Regel es sagt, auf das veröffentlichte GitHub-Release warten.
-  PR-Pflege bedeutet nicht mehr automatisch einen Tag.
+- **Release**: die nächste Version taggen, wo eine Release-Regel besteht, sobald die CI genau dieses
+  Commits grün ist, und, wenn die Regel es sagt, auf das veröffentlichte GitHub-Release warten. Je
+  Auftrag wählst du **Patch**, **Minor** oder **Major** (`1.2.3` → `1.2.4`, `1.3.0`, `2.0.0`) und ob
+  vorher die Versionsdateien und das CHANGELOG auf die neue Version gebracht werden (Release-Vorbereitung,
+  unten). PR-Pflege bedeutet nicht mehr automatisch einen Tag.
 - **Inhaltsziele**, die die gewählten Repositories speisen: README/Dokumentation oder Wiki, jeweils mit
   der für diesen Auftrag gewählten Basis (neuestes Release oder aktueller Stand des Default-Branches).
 - **Website** (wenn die gewählten Repositories sie speisen): aktualisieren, veröffentlichen und prüfen
@@ -216,6 +218,29 @@ nach deiner Freigabe. Eine Reparatur, die Update-, Signatur- oder Zugangsdaten-C
 `update.rs`, `verify.rs`), steht nur zur Wahl und wird nie von selbst eingeplant. Ein Abbruch mitten in der
 Reparatur wird beim Fortsetzen erkannt: Ist der PR schon offen, gilt sie als erledigt.
 
+**Release-Vorbereitung (Versionsdateien und CHANGELOG):** Mit dieser Option klont der Release-Schritt
+zuerst den Default-Branch in den Arbeitsordner der App, genau auf dem Commit, den die Merges dieses
+Auftrags hinterlassen haben, und bringt das Repository auf die neue Version, ohne Claude und ohne zu raten:
+
+- `Cargo.toml` (`[package]`, `[workspace.package]`), die eigenen Pakete in `Cargo.lock`, `package.json`,
+  `package-lock.json` (oberste Ebene und Wurzelpaket), `tauri.conf.json`, `pyproject.toml` (`[project]`,
+  `[tool.poetry]`), `Chart.yaml` (`version`, `appVersion`) und `VERSION`/`version.txt`, wo immer sie
+  liegen (nicht in `node_modules`, `vendor`, `target`, `dist`, `build`, `.venv`), aber nur dort, wo genau
+  die Version des letzten Tags steht;
+- eine README im Wurzelordner nur in Zeilen, die das Repository nennen (etwa `MyApp-1.2.3.pkg` in einem Repository namens MyApp),
+  und dort nur die Version als Ganzes (nicht `11.2.3` oder `1.2.31`);
+- `CHANGELOG.md` im Wurzelordner: Ein gefüllter Abschnitt „Unreleased“ wird zur Version, darüber ein leerer
+  neuer; sonst ein neuer Abschnitt `## [x.y.z] - Datum` über dem neuesten, mit den Commits seit dem letzten
+  Tag entlang des Default-Branches (ein Merge mit dem Titel seines PRs, Release-Commits ausgelassen). Ein
+  CHANGELOG, das die Version schon hat, bleibt unverändert; ohne `CHANGELOG.md` wird keins angelegt.
+
+Das Ergebnis kommt als eigene Entscheidung mit Diff und den Prüfungen der App. Freigegeben öffnet die App
+einen PR vom Branch `openreleasepilot/release-<tag>` (genau die freigegebenen Dateien auf diesem Commit,
+über die API), mergt ihn bei grüner CI, solange sich der Default-Branch nicht bewegt hat, und taggt den
+Merge-Commit, sobald auch dessen CI grün ist; ein Merge auf etwas anderes heißt: kein Tag. Ohne passende
+Datei folgt der Tag direkt. **Verwerfen** heißt: kein Release-PR und kein Tag; **Neu vorbereiten** liest
+den Stand neu.
+
 Direkt vor jedem Schreiben prüft die App erneut:
 
 - **Merge:** noch offen und kein Entwurf, gleicher Head-Commit, gleicher Zielbranch und gleiches
@@ -227,7 +252,7 @@ Direkt vor jedem Schreiben prüft die App erneut:
 - **Rebase:** noch offen, wirklich von Dependabot, gleicher Head, weiterhin Konflikt oder Rückstand; dann
   `@dependabot rebase`. Ein Dependabot-PR, den ein Merge desselben Auftrags in einen Konflikt gebracht
   hat, bekommt das statt des Merges, wie der Plan es sagt.
-- **Tag:** die nächste Patch-Version des höchsten `x.y.z`-Tags mit dem Präfix der Regel, nur wenn jeder
+- **Tag:** die nächste Version (wie gewählt: Patch, Minor oder Major) des höchsten `x.y.z`-Tags mit dem Präfix der Regel, nur wenn jeder
   geplante Merge des Repositorys gelungen ist, der Default-Branch genau dort steht, wo die Merges dieses
   Auftrags ihn hinterlassen haben, die Release-Linie unverändert ist, es Commits seit dem letzten Tag gibt
   und die CI genau dieses Commits erfolgreich war (die App wartet bis zu 30 Minuten, danach wartet der

@@ -2,7 +2,7 @@
 //! the same rules), three separate choices: pull requests (merge what
 //! GitHub reports mergeable with green checks and Claude judges safe, close superfluous ones, ask
 //! Dependabot to rebase conflicting ones), cleanup (delete branches whose commits are all in the
-//! default branch, on GitHub and in the local clone) and release (tag the next patch version once the
+//! default branch, on GitHub and in the local clone) and release (tag the next patch, minor or major version once the
 //! CI of exactly that commit is green, then wait for the published release). A release needs a
 //! release rule of the repository; the app never guesses one.
 //!
@@ -476,14 +476,14 @@ pub fn apply_review(plan: &mut Plan, verdicts: &[Verdict]) -> Vec<String> {
     problems
 }
 
-/// Completes the preview after the review: the tag (only with `release`) and the head branches of
-/// the merges.
-pub fn finish(plan: &mut Plan, cleanup: bool, release: bool) {
+/// Completes the preview after the review: the tag of the next `bump` version (only with
+/// `release`) and the head branches of the merges.
+pub fn finish(plan: &mut Plan, cleanup: bool, release: Option<Bump>) {
     if plan.error.is_some() {
         return;
     }
-    if release {
-        if let Err(e) = plan_tag(plan) {
+    if let Some(bump) = release {
+        if let Err(e) = plan_tag(plan, bump) {
             plan.tag = None;
             plan.tag_note = Some(format!("{e:#}"));
         }
@@ -502,7 +502,7 @@ pub fn finish(plan: &mut Plan, cleanup: bool, release: bool) {
     }
 }
 
-fn plan_tag(plan: &mut Plan) -> Result<()> {
+fn plan_tag(plan: &mut Plan, bump: Bump) -> Result<()> {
     if plan.tag_blocked {
         return Ok(());
     }
@@ -514,7 +514,7 @@ fn plan_tag(plan: &mut Plan) -> Result<()> {
         plan.tag_note = Some(format!("noch kein Tag im Format {}x.y.z; das erste Release von Hand taggen", plan.tag_prefix));
         return Ok(());
     };
-    let next = next_patch(&last, &plan.tag_prefix).context("Tag-Version unlesbar")?;
+    let next = next_version(&last, &plan.tag_prefix, bump).context("Tag-Version unlesbar")?;
     plan.last_tag = Some(last.clone());
     if tags.contains(&next) {
         plan.tag_note = Some(format!("{next} gibt es schon"));
@@ -774,42 +774,53 @@ impl Default for CiWait {
     }
 }
 
-/// Sets the planned tag, but only on the commit this run expects (the preview's head plus its own
-/// merges, every planned merge done), with changes since the last tag, the release line unchanged,
-/// and CI of exactly that commit positively passed. Never moves or replaces a tag.
-pub fn tag(plan: &Plan, state: &RunState, runner: &Runner, wait: &CiWait, progress: &dyn Fn(&str)) -> Result<Done> {
-    let Some(tag) = &plan.tag else { return Ok(Done::Skipped("kein Tag geplant".into())) };
-    let Some(last) = &plan.last_tag else { return Ok(Done::Skipped("keine Ausgangsversion".into())) };
+/// The commit the planned tag may go on, or why not (yet): every planned merge done, the default
+/// branch exactly where this run left it, the release line unchanged, changes since the last tag.
+/// The release preparation asks this too, before it proposes anything. Reads only.
+pub fn tag_base(plan: &Plan, state: &RunState) -> Result<Result<String, Done>> {
+    let Some(tag) = &plan.tag else { return Ok(Err(Done::Skipped("kein Tag geplant".into()))) };
+    let Some(last) = &plan.last_tag else { return Ok(Err(Done::Skipped("keine Ausgangsversion".into()))) };
     if version(tag, &plan.tag_prefix).is_none() {
         bail!("{tag} ist keine Version im Format {}x.y.z", plan.tag_prefix);
     }
     if !state.missed.is_empty() {
         let missed: Vec<String> = state.missed.iter().map(|n| format!("#{n}")).collect();
-        return Ok(Done::Skipped(format!("nicht alle geplanten Merges sind gelungen ({}); kein Tag", missed.join(", "))));
+        return Ok(Err(Done::Skipped(format!("nicht alle geplanten Merges sind gelungen ({}); kein Tag", missed.join(", ")))));
     }
     if let Some(foreign) = &state.foreign {
-        return Ok(Done::Skipped(format!("{foreign}; kein Tag ohne neue Vorschau")));
+        return Ok(Err(Done::Skipped(format!("{foreign}; kein Tag ohne neue Vorschau"))));
     }
     let Some(target) = state.expected_head.clone() else {
-        return Ok(Done::Skipped("Stand nach den Merges unbekannt; kein Tag".into()));
+        return Ok(Err(Done::Skipped("Stand nach den Merges unbekannt; kein Tag".into())));
     };
     let current = head(plan)?;
     if current != target {
-        return Ok(Done::Skipped(format!(
+        return Ok(Err(Done::Skipped(format!(
             "{} steht auf {} statt auf {}; die Änderung kam nicht aus diesem Lauf, kein Tag",
             plan.default_branch,
             short(&current),
             short(&target)
-        )));
+        ))));
     }
     if let Some(why) = release_line_changed(plan, last, tag)? {
-        return Ok(Done::Skipped(why));
+        return Ok(Err(Done::Skipped(why)));
     }
-    match repos::commits_since(&plan.repo, last, &target) {
-        Ok(0) => return Ok(Done::Nothing(format!("{} unverändert seit {last}; nichts Neues zu taggen", plan.default_branch))),
-        Err(e) => return Ok(Done::Skipped(format!("Änderungen seit {last} {e:#}; kein Tag"))),
-        Ok(_) => {}
-    }
+    Ok(match repos::commits_since(&plan.repo, last, &target) {
+        Ok(0) => Err(Done::Nothing(format!("{} unverändert seit {last}; nichts Neues zu taggen", plan.default_branch))),
+        Err(e) => Err(Done::Skipped(format!("Änderungen seit {last} {e:#}; kein Tag"))),
+        Ok(_) => Ok(target),
+    })
+}
+
+/// Sets the planned tag, but only on the commit this run expects (the preview's head plus its own
+/// merges, every planned merge done), with changes since the last tag, the release line unchanged,
+/// and CI of exactly that commit positively passed. Never moves or replaces a tag.
+pub fn tag(plan: &Plan, state: &RunState, runner: &Runner, wait: &CiWait, progress: &dyn Fn(&str)) -> Result<Done> {
+    let target = match tag_base(plan, state)? {
+        Ok(target) => target,
+        Err(done) => return Ok(done),
+    };
+    let (Some(tag), Some(last)) = (&plan.tag, &plan.last_tag) else { unreachable!("tag_base checked both") };
     let ci = wait_for_checks(&plan.repo, &target, runner, wait, &|text| progress(text))?;
     let commit = short(&target);
     match ci.state {
@@ -1261,9 +1272,34 @@ pub(crate) fn latest_release_tag(tags: &[String], prefix: &str) -> Option<String
     tags.iter().filter_map(|tag| Some((version(tag, prefix)?, tag))).max_by_key(|(version, _)| *version).map(|(_, tag)| tag.clone())
 }
 
-fn next_patch(tag: &str, prefix: &str) -> Option<String> {
+/// Which part of the version a release raises; chosen per job, patch unless the user says otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Bump {
+    #[default]
+    Patch,
+    Minor,
+    Major,
+}
+
+impl Bump {
+    pub fn name(self) -> &'static str {
+        match self {
+            Bump::Patch => "Patch",
+            Bump::Minor => "Minor",
+            Bump::Major => "Major",
+        }
+    }
+}
+
+/// The version after `tag`: `v1.2.3` → `v1.2.4` (patch), `v1.3.0` (minor), `v2.0.0` (major).
+pub(crate) fn next_version(tag: &str, prefix: &str, bump: Bump) -> Option<String> {
     let (major, minor, patch) = version(tag, prefix)?;
-    Some(format!("{prefix}{major}.{minor}.{}", patch + 1))
+    Some(match bump {
+        Bump::Patch => format!("{prefix}{major}.{minor}.{}", patch + 1),
+        Bump::Minor => format!("{prefix}{major}.{}.0", minor + 1),
+        Bump::Major => format!("{prefix}{}.0.0", major + 1),
+    })
 }
 
 fn short(sha: &str) -> String {
@@ -1280,9 +1316,12 @@ mod tests {
     fn finds_the_latest_release_and_the_next_patch() {
         let tags: Vec<String> = ["0.1.9", "0.1.10", "0.2.0-beta.1", "v9.0.0", "0.1.2"].map(String::from).to_vec();
         assert_eq!(latest_release_tag(&tags, "").as_deref(), Some("0.1.10"));
-        assert_eq!(next_patch("0.1.10", "").as_deref(), Some("0.1.11"));
+        assert_eq!(next_version("0.1.10", "", Bump::Patch).as_deref(), Some("0.1.11"));
         assert_eq!(latest_release_tag(&tags, "v").as_deref(), Some("v9.0.0"));
-        assert_eq!(next_patch("v9.0.0", "v").as_deref(), Some("v9.0.1"));
+        assert_eq!(next_version("v9.0.0", "v", Bump::Patch).as_deref(), Some("v9.0.1"));
+        assert_eq!(next_version("v0.4.8", "v", Bump::Minor).as_deref(), Some("v0.5.0"));
+        assert_eq!(next_version("0.4.8", "", Bump::Major).as_deref(), Some("1.0.0"));
+        assert_eq!(next_version("v1.9.3", "v", Bump::Major).as_deref(), Some("v2.0.0"));
         assert_eq!(latest_release_tag(&["beta".into(), "1.2".into(), "1.2.3.4".into()], ""), None);
     }
 
@@ -1832,7 +1871,7 @@ mod tests {
     #[ignore = "network"]
     fn scans_a_real_repository() {
         let mut plan = scan(&own_target(), true, true);
-        finish(&mut plan, true, true);
+        finish(&mut plan, true, Some(Bump::Patch));
         println!("{}", serde_json::to_string_pretty(&plan).unwrap());
         assert!(plan.error.is_none(), "{:?}", plan.error);
         assert_eq!(plan.default_branch, "main");
@@ -1859,7 +1898,7 @@ mod tests {
         println!("cost {:?}, denials {:?}", outcome.cost_usd, outcome.denials);
         let review: Review = serde_json::from_value(outcome.structured.expect("structured output")).unwrap();
         println!("problems {:?}", apply_review(&mut plan, &review.prs));
-        finish(&mut plan, false, true);
+        finish(&mut plan, false, Some(Bump::Patch));
         for pr in &plan.prs {
             println!("#{} {:?} {:?} {:?}: {}", pr.number, pr.action, pr.risk, pr.bump, pr.reason);
         }
