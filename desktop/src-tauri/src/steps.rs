@@ -1,7 +1,7 @@
 //! The website's four steps and the passes of care jobs (see `jobrun`). Each runs on its own
 //! thread, writes log lines as it goes and ends with a status and a one-line summary.
 
-use crate::{changed, load_site, with_model, Check, ClaudeRun, LogLine, Model, Status, Step, UploadResult};
+use crate::{changed, emit_to_visible, load_site, with_model, Check, ClaudeRun, LogLine, Model, Status, Step, UploadResult};
 use anyhow::{anyhow, bail, Context, Result};
 use openreleasepilot_core::claude::{self, Event, Outdated, ProductRelease, ReleaseCheck};
 use openreleasepilot_core::config::{AuthKind, Config};
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter};
+use tauri::AppHandle;
 
 const MAX_LOG_LINES: usize = 5000;
 
@@ -65,7 +65,7 @@ impl Ctx {
         let line = LogLine { kind, text };
         if let Some(job) = &self.job {
             let _ = jobs::append_log(job, &jobs::LogEntry { kind: kind.to_owned(), text: line.text.clone() });
-            let _ = self.app.emit("log", serde_json::json!({ "step": self.step, "job": job, "line": line }));
+            emit_to_visible(&self.app, "log", serde_json::json!({ "step": self.step, "job": job, "line": line }));
             return;
         }
         with_model(&self.app, |m| {
@@ -76,7 +76,7 @@ impl Ctx {
                 state.log.push(line.clone());
             }
         });
-        let _ = self.app.emit("log", serde_json::json!({ "step": self.step, "line": line }));
+        emit_to_visible(&self.app, "log", serde_json::json!({ "step": self.step, "line": line }));
     }
     pub(crate) fn info(&self, text: impl Into<String>) {
         self.log("info", text)

@@ -3079,6 +3079,13 @@ async function start() {
       showArea(payload.area);
     }
   });
+  // A hidden window gets no events (see emit_to_visible); shown again, it fetches what it missed.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !view) return;
+    refresh();
+    if (selected && skeleton) loadLog(selected);
+    if (jobId && runsUi) loadJobLog(jobId);
+  });
   await refresh();
   // Ages and "veraltet" move on without an event; a fresh view keeps them right. Reads nothing remote.
   setInterval(() => { if (area !== 'website' && document.visibilityState === 'visible') refresh(); }, 30000);

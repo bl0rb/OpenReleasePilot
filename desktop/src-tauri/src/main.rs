@@ -242,8 +242,19 @@ pub fn with_model<T>(app: &AppHandle, f: impl FnOnce(&mut Model) -> T) -> T {
 
 /// Tells the window to fetch a new view.
 pub fn changed(app: &AppHandle) {
-    let _ = app.emit("changed", ());
+    emit_to_visible(app, "changed", ());
     tray::update(app);
+}
+
+/// Sends an event to the open windows only. A window waiting hidden in the tray is left alone:
+/// after an event, WebKit keeps a hidden window on the display link for good, which costs CPU
+/// with nothing to see. The window catches up when it becomes visible again.
+pub fn emit_to_visible(app: &AppHandle, event: &str, payload: impl Serialize + Clone) {
+    for (label, window) in app.webview_windows() {
+        if window.is_visible().unwrap_or(false) {
+            let _ = app.emit_to(label.as_str(), event, payload.clone());
+        }
+    }
 }
 
 /// Brings the main window to the front, also from the menu bar.

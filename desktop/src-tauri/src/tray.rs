@@ -297,15 +297,15 @@ fn clicked(app: &AppHandle, id: &str) {
         }
         "repos" | "runs" => {
             show_window(app);
-            let _ = app.emit("show", serde_json::json!({ "area": id }));
+            let _ = app.emit_to("main", "show", serde_json::json!({ "area": id }));
         }
         _ => {
             if let Some(key) = id.strip_prefix("repo:") {
                 show_window(app);
-                let _ = app.emit("show", serde_json::json!({ "repo": key }));
+                let _ = app.emit_to("main", "show", serde_json::json!({ "repo": key }));
             } else if let Some(job) = id.strip_prefix("job:") {
                 show_window(app);
-                let _ = app.emit("show", serde_json::json!({ "job": job }));
+                let _ = app.emit_to("main", "show", serde_json::json!({ "job": job }));
             }
         }
     }
