@@ -29,32 +29,42 @@ pub fn signed_in() -> Option<bool> {
     TOKEN.get().map(Option::is_some)
 }
 
-fn request(method: &str, path: &str) -> ureq::Request {
+fn request(method: &str, path: &str) -> ureq::http::request::Builder {
     request_with(method, path, token().as_deref())
 }
 
-fn request_with(method: &str, path: &str, token: Option<&str>) -> ureq::Request {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
-    let mut request = agent
-        .request(method, &format!("https://api.github.com/{path}"))
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "OpenReleasePilot");
+fn request_with(method: &str, path: &str, token: Option<&str>) -> ureq::http::request::Builder {
+    let mut request = ureq::http::Request::builder()
+        .method(method)
+        .uri(format!("https://api.github.com/{path}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "OpenReleasePilot");
     if let Some(token) = token {
-        request = request.set("Authorization", &format!("Bearer {token}"));
+        request = request.header("Authorization", format!("Bearer {token}"));
     }
     request
 }
 
+/// Sends a request built by `request_with` (or the GitLab twin). Error statuses are answers, not
+/// errors: the caller reads the status and, where it matters, the body.
+pub(crate) fn run(request: ureq::http::request::Builder, body: Option<String>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
+    match body {
+        Some(body) => agent.run(request.body(body)?),
+        None => agent.run(request.body(())?),
+    }
+}
+
 /// Checks a token against `GET /user` before it is stored; returns the login name.
 pub fn validate_token(token: &str) -> Result<String> {
-    match request_with("GET", "user", Some(token)).call() {
-        Ok(response) => {
-            let json: serde_json::Value = serde_json::from_reader(response.into_reader()).context("Antwort von GitHub unlesbar")?;
+    let response = run(request_with("GET", "user", Some(token)), None).map_err(|e| anyhow::anyhow!("GitHub nicht erreichbar: {e}"))?;
+    match response.status().as_u16() {
+        401 => bail!("Token abgelehnt"),
+        code if code >= 400 => bail!("GitHub antwortet mit HTTP {code}"),
+        _ => {
+            let json: serde_json::Value = serde_json::from_reader(response.into_body().into_reader()).context("Antwort von GitHub unlesbar")?;
             json["login"].as_str().map(str::to_owned).context("Antwort von GitHub ohne Anmeldename")
         }
-        Err(ureq::Error::Status(401, _)) => bail!("Token abgelehnt"),
-        Err(ureq::Error::Status(code, _)) => bail!("GitHub antwortet mit HTTP {code}"),
-        Err(e) => bail!("GitHub nicht erreichbar: {e}"),
     }
 }
 
@@ -77,21 +87,22 @@ pub(crate) fn get(path: &str) -> Result<Option<serde_json::Value>> {
     if let Some(answer) = mock::get(path) {
         return answer;
     }
-    let response = match request("GET", path).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(ureq::Error::Status(code @ (403 | 429), response)) => {
+    let response = run(request("GET", path), None).context("GitHub nicht erreichbar")?;
+    match response.status().as_u16() {
+        404 => return Ok(None),
+        code @ (403 | 429) => {
             // A 403 is a rate limit only when GitHub says so; otherwise access is denied.
-            let limited = code == 429 || response.header("x-ratelimit-remaining") == Some("0");
-            let reason = serde_json::from_str(&response.into_string().unwrap_or_default()).map(|json| message(&json)).unwrap_or_default();
+            let limited = code == 429 || response.headers().get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()) == Some("0");
+            let reason = serde_json::from_str(&response.into_body().read_to_string().unwrap_or_default()).map(|json| message(&json)).unwrap_or_default();
             if limited || reason.to_lowercase().contains("rate limit") {
                 bail!("GitHub-Limit erreicht{}", if token().is_none() { " (mit `gh auth login` oder einem eigenen Token gilt ein höheres Limit)" } else { "" });
             }
             return Err(Forbidden(reason).into());
         }
-        Err(e) => return Err(e).context("GitHub nicht erreichbar"),
-    };
-    Ok(Some(serde_json::from_reader(response.into_reader()).context("Antwort von GitHub unlesbar")?))
+        code if code >= 400 => return Err(ureq::Error::StatusCode(code)).context("GitHub nicht erreichbar"),
+        _ => {}
+    }
+    Ok(Some(serde_json::from_reader(response.into_body().into_reader()).context("Antwort von GitHub unlesbar")?))
 }
 
 /// HTTP status of a GET whose answer is only its status, e.g. 204 for "on" and 404 for "off".
@@ -100,11 +111,7 @@ pub(crate) fn probe(path: &str) -> Result<u16> {
     if let Some(answer) = mock::probe(path) {
         return answer;
     }
-    match request("GET", path).call() {
-        Ok(response) => Ok(response.status()),
-        Err(ureq::Error::Status(code, _)) => Ok(code),
-        Err(e) => Err(e).context("GitHub nicht erreichbar"),
-    }
+    Ok(run(request("GET", path), None).context("GitHub nicht erreichbar")?.status().as_u16())
 }
 
 /// A list endpoint read page by page; `complete` is false when `max_pages` cut it off.
@@ -141,15 +148,12 @@ pub(crate) fn send(method: &str, path: &str, body: Option<&serde_json::Value>) -
     }
     let request = request(method, path);
     let result = match body {
-        Some(body) => request.set("Content-Type", "application/json").send_string(&body.to_string()),
-        None => request.call(),
+        Some(body) => run(request.header("Content-Type", "application/json"), Some(body.to_string())),
+        None => run(request, None),
     };
-    let response = match result {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-        Err(e) => return Err(e).context("GitHub nicht erreichbar"),
-    };
-    let status = response.status();
-    let text = response.into_string().unwrap_or_default();
+    let response = result.context("GitHub nicht erreichbar")?;
+    let status = response.status().as_u16();
+    let text = response.into_body().read_to_string().unwrap_or_default();
     Ok((status, serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)))
 }
 
