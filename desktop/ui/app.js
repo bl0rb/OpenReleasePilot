@@ -182,6 +182,10 @@ function ago(secs) {
 
 const short = (sha) => (sha ?? '').slice(0, 7);
 const repoName = (key) => view.repositories.find((r) => r.key === key)?.repo ?? key;
+/** The bump a job gives one repository: its own, else the job's. */
+const bumpOf = (job, key) => job.options.bumps?.[key] ?? job.options.bump ?? 'patch';
+/** The managed repositories whose release `key` publishes (their "Veröffentlicht durch"). */
+const releasedThrough = (key) => view.repositories.filter((r) => r.releasedBy === key);
 
 async function call(command, args) {
   try {
@@ -1216,7 +1220,9 @@ function relations(r) {
     targets.length && `Inhalte: ${targets.join(', ')}`,
     r.products.length && `Website: ${r.products.map((p) => `${p.name}${p.enabled ? '' : ' (abgewählt)'}`).join(', ')}`,
     r.website && 'Website-Repository',
-    r.release ? `Release-Regel: Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, mit ${serviceOf(r.repo)}-Release` : ''}` : 'keine Release-Regel',
+    r.releasedBy ? `Release kommt aus ${repoName(r.releasedBy)}`
+      : r.release ? `Release-Regel: Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, mit ${serviceOf(r.repo)}-Release` : ''}` : 'keine Release-Regel',
+    releasedThrough(r.key).length > 0 && `veröffentlicht ${releasedThrough(r.key).map((f) => f.repo).join(', ')}`,
   ].filter(Boolean).join(' · ');
 }
 
@@ -1361,7 +1367,10 @@ function statusFacts(r, branch) {
       ok(f?.ci)?.state === 'failed' ? 'red' : ok(f?.ci)?.state === 'passed' ? 'green' : ''),
     row('Release', f ? releaseText(f) : '–'),
     row(sinceLabel, !since ? '–' : ok(since) ? String(since.value.commits) : since.state === 'failed' ? since.value : `nicht bestimmbar${since.value ? `: ${since.value}` : ''}`),
-    row('Release-Regel', r.release ? `Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, danach wartet die App auf das ${serviceOf(r.repo)}-Release` : ''}` : 'keine: die App setzt keine Tags', r.release ? '' : 'muted'),
+    r.releasedBy
+      ? row('Release', `kommt aus ${repoName(r.releasedBy)}: die App taggt hier nie, sie wartet auf das Release, das ein Tag dort hier veröffentlicht`)
+      : row('Release-Regel', r.release ? `Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, danach wartet die App auf das ${serviceOf(r.repo)}-Release` : ''}` : 'keine: die App setzt keine Tags', r.release ? '' : 'muted'),
+    releasedThrough(r.key).length > 0 && row('Veröffentlicht', `${releasedThrough(r.key).map((f) => f.repo).join(', ')}: ein Tag hier bringt dort das Release mit`),
     row('Lokale Kopie', localText(r.local), ['found', 'notConfigured'].includes(r.local.state) ? '' : 'orange'),
     r.products.length > 0 && row('Website', [...r.products.map((p) => `${p.name}: dokumentiert ${p.documented}${p.enabled ? '' : ', nicht ausgewählt'}`)].join(' · ')),
     r.website && row('Rolle', 'zugleich das Repository der Website'),
@@ -1603,13 +1612,13 @@ function contentSection(r) {
 const manageDrafts = new Map();
 
 function manageSection(r) {
-  const saved = { enabled: r.enabled, localPath: r.local.path ?? '', release: !!r.release, prefix: r.release?.tagPrefix ?? (r.products[0]?.tagPrefix ?? ''), publishes: r.release?.publishesRelease ?? false };
+  const saved = { enabled: r.enabled, localPath: r.local.path ?? '', release: !!r.release, prefix: r.release?.tagPrefix ?? (r.products[0]?.tagPrefix ?? ''), publishes: r.release?.publishesRelease ?? false, releasedBy: r.releasedBy ?? '' };
   const s = manageDrafts.get(r.key) ?? { ...saved };
   manageDrafts.set(r.key, s);
   const locked = !!r.job;
   // "Speichern" only matters once something differs from what is saved.
   const changed = () => s.enabled !== saved.enabled || s.localPath.trim() !== saved.localPath || s.release !== saved.release
-    || (s.release && (s.prefix.trim() !== saved.prefix || s.publishes !== saved.publishes));
+    || (s.release && (s.prefix.trim() !== saved.prefix || s.publishes !== saved.publishes)) || s.releasedBy !== saved.releasedBy;
   const saveButton = button('Speichern', () => save(), { cls: 'primary', id: 'manage-save' });
   const state = h('span', { class: 'muted small', role: 'status' });
   const update = () => {
@@ -1617,13 +1626,33 @@ function manageSection(r) {
     saveButton.disabled = locked || !s.dirty;
     state.textContent = s.dirty ? 'Ungespeicherte Änderungen' : '';
   };
-  const prefixInput = h('input', { type: 'text', id: 'manage-prefix', value: s.prefix, placeholder: 'leer für 1.2.3, „v“ für v1.2.3', spellcheck: 'false', disabled: !s.release || locked, oninput: (e) => { s.prefix = e.target.value; update(); } });
-  const publishes = h('input', { type: 'checkbox', id: 'manage-publishes', checked: s.publishes, disabled: !s.release || locked, onchange: (e) => { s.publishes = e.target.checked; update(); } });
+  const prefixInput = h('input', { type: 'text', id: 'manage-prefix', value: s.prefix, placeholder: 'leer für 1.2.3, „v“ für v1.2.3', spellcheck: 'false', disabled: !s.release || !!s.releasedBy || locked, oninput: (e) => { s.prefix = e.target.value; update(); } });
+  const publishes = h('input', { type: 'checkbox', id: 'manage-publishes', checked: s.publishes, disabled: !s.release || !!s.releasedBy || locked, onchange: (e) => { s.publishes = e.target.checked; update(); } });
+  // Repositories whose tag may publish this one: managed, with a release rule, not released by another.
+  const sources = view.repositories.filter((o) => o.key !== r.key && o.release && !o.releasedBy && !gitlabHost(o.repo));
+  const followers = releasedThrough(r.key);
+  const releaseBox = h('input', {
+    type: 'checkbox', id: 'manage-release', checked: s.release && !s.releasedBy, disabled: locked || !!s.releasedBy,
+    onchange: (e) => { s.release = e.target.checked; prefixInput.disabled = !s.release; publishes.disabled = !s.release; update(); },
+  });
+  const sourceSelect = h('select', {
+    id: 'manage-released-by', 'aria-describedby': 'manage-released-by-note', disabled: locked || followers.length > 0 || !!gitlabHost(r.repo),
+    onchange: (e) => {
+      s.releasedBy = e.target.value;
+      releaseBox.disabled = locked || !!s.releasedBy;
+      releaseBox.checked = s.release && !s.releasedBy;
+      prefixInput.disabled = !s.release || !!s.releasedBy;
+      publishes.disabled = !s.release || !!s.releasedBy;
+      update();
+    },
+  }, h('option', { value: '', selected: !s.releasedBy }, 'niemand: eigene Release-Regel oder keine'),
+  sources.map((o) => h('option', { value: o.key, selected: s.releasedBy === o.key }, o.repo)),
+  s.releasedBy && !sources.some((o) => o.key === s.releasedBy) && h('option', { value: s.releasedBy, selected: true }, repoName(s.releasedBy)));
   const localInput = h('input', { type: 'text', id: 'manage-local', value: s.localPath, placeholder: 'kein lokaler Klon', spellcheck: 'false', disabled: locked, oninput: (e) => { s.localPath = e.target.value; update(); } });
   const save = async () => {
     const ok = await act('update_repository', {
       key: r.key,
-      settings: { enabled: s.enabled, localPath: s.localPath, release: s.release ? { tagPrefix: s.prefix.trim(), publishesRelease: s.publishes } : null },
+      settings: { enabled: s.enabled, localPath: s.localPath, release: s.release && !s.releasedBy ? { tagPrefix: s.prefix.trim(), publishesRelease: s.publishes } : null, releasedBy: s.releasedBy },
     });
     if (ok) {
       manageDrafts.delete(r.key);
@@ -1643,10 +1672,11 @@ function manageSection(r) {
           if (path) { s.localPath = path; localInput.value = path; update(); }
         }, { id: 'manage-clone', disabled: locked, title: `Nach ${view.workspaceDisplay} klonen` }))),
     h('div', { class: 'note' }, 'Optional. Nur fürs Aufräumen lokaler Branches und für Claudes Prüfung im Code.'),
-    h('label', { class: 'check-line top' }, h('input', {
-      type: 'checkbox', id: 'manage-release', checked: s.release, disabled: locked,
-      onchange: (e) => { s.release = e.target.checked; prefixInput.disabled = !s.release; publishes.disabled = !s.release; update(); },
-    }), h('span', null, h('strong', null, 'Release-Regel: die App darf die nächste Version taggen'),
+    h('div', { class: 'field-row' }, h('label', { for: 'manage-released-by' }, 'Veröffentlicht durch'), sourceSelect),
+    h('div', { class: 'note', id: 'manage-released-by-note' }, followers.length > 0
+      ? `Dieses Repository veröffentlicht ${followers.map((f) => f.repo).join(', ')}; es kann darum nicht selbst durch ein anderes veröffentlicht werden.`
+      : 'Für ein Repository, dessen Release ein anderes mit demselben Tag erzeugt (z. B. ein öffentlicher Export aus einem privaten Repository): die App taggt hier nie, wartet nach dem Tag dort auf das Release hier und nimmt README, Wiki und Website dieses Repositorys in dieselbe Kette. README und Doku pflegst du dann im Quell-Repository, weil der Export die Dateien hier ersetzt.'),
+    h('label', { class: 'check-line top' }, releaseBox, h('span', null, h('strong', null, 'Release-Regel: die App darf die nächste Version taggen'),
       h('div', { class: 'note' }, 'Die App errät keine Versionierung. Getaggt wird nur auf grüner CI genau des Ziel-Commits.'))),
     h('div', { class: 'field-row' }, h('label', { for: 'manage-prefix' }, 'Tag-Präfix'), prefixInput),
     h('label', { class: 'check-line' }, publishes, gitlabHost(r.repo)
@@ -1857,7 +1887,7 @@ function stepBlock(job, step, running) {
   const decide = step.state === 'needsApproval';
   const open = stepOpen.get(key) ?? (decide || ['failed', 'blocked', 'partial', 'running', 'waiting'].includes(step.state) || job.steps.length === 1);
   const body = {
-    care: careBlock, release: releaseBlock, docs: contentBlock, wiki: contentBlock, website: websiteBlock,
+    care: careBlock, release: releaseBlock, follow: followBlock, docs: contentBlock, wiki: contentBlock, website: websiteBlock,
   }[step.kind](job, step, running);
   const stopped = ['failed', 'blocked'].includes(step.state) && step.detail;
   return h('details', { class: `run step-block ${decide ? 'decide' : ''}`, open, ontoggle: (e) => stepOpen.set(key, e.target.open) },
@@ -2023,7 +2053,7 @@ function planRepo(job, p, decide, marks, single) {
         group('Reparieren lassen', repairs.map(prLine)),
         group('Schließen', of('close').map(prLine)),
         group('Rebase anstoßen', of('rebase').map(prLine)),
-        group('Tag', of('tag').map((item) => line(item, [h('strong', null, item.reference), h('span', { class: 'muted small' }, `${BUMP_TEXT[job.options.bump ?? 'patch']} nach ${p.lastTag ?? '?'}`), h('span', { class: 'spacer' }), job.options.prepareRelease && badge('accent', 'mit Release-PR'), decide && badge('', 'bedingt')],
+        group('Tag', of('tag').map((item) => line(item, [h('strong', null, item.reference), h('span', { class: 'muted small' }, `${BUMP_TEXT[bumpOf(job, p.key)]} nach ${p.lastTag ?? '?'}`), h('span', { class: 'spacer' }), job.options.prepareRelease && badge('accent', 'mit Release-PR'), decide && badge('', 'bedingt')],
           decide && h('div', { class: 'item-check' }, job.options.prepareRelease
             ? `Im Release-Schritt: nur wenn alle geplanten Merges gelingen und ${p.defaultBranch} sich sonst nicht bewegt. Zuerst bringt die App die Versionsdateien und das CHANGELOG auf ${item.reference} und zeigt dir den Diff zur eigenen Freigabe; danach Release-PR, Merge bei grüner CI und der Tag auf dem Merge-Commit, sobald dessen CI grün ist (je bis zu 30 Minuten).`
             : `Im Release-Schritt: nur wenn alle geplanten Merges gelingen, ${p.defaultBranch} sich sonst nicht bewegt und die CI genau dieses Commits grün ist (bis zu 30 Minuten). Direkt vor dem Schreiben prüft die App die Release-Linie erneut.`)))),
@@ -2041,6 +2071,19 @@ function planRepo(job, p, decide, marks, single) {
       !p.error && !items.length && !keep.length && h('div', { class: 'note' }, 'Nichts zu tun.')));
 }
 
+/** Waiting for the release another repository's tag publishes here; writes nothing. */
+function followBlock(job, step) {
+  const upstream = step.after.map((id) => job.steps.find((s) => s.id === id)).find((s) => s?.kind === 'release');
+  return [
+    waitsFor(job, step),
+    h('div', { class: 'facts' },
+      h('span', null, h('strong', null, 'Repository: '), repoName(step.subject)),
+      upstream && h('span', null, h('strong', null, 'Veröffentlicht durch: '), repoName(upstream.subject)),
+      h('span', null, h('strong', null, 'Tag: '), upstream?.tag ? `${upstream.tag} (aus ${repoName(upstream.subject)})` : 'erst nach dem Tag dort'),
+      h('span', null, h('strong', null, 'Die App: '), 'taggt hier nicht, wartet auf das veröffentlichte Release (bis zu 30 Minuten je Prüfung) und meldet einen fehlgeschlagenen Export- oder Release-Workflow')),
+  ];
+}
+
 function releaseBlock(job, step) {
   const plan = job.plan?.plans.find((p) => p.key === step.subject);
   const rule = view.repositories.find((r) => r.key === step.subject)?.release;
@@ -2053,7 +2096,7 @@ function releaseBlock(job, step) {
     waitsFor(job, step),
     h('div', { class: 'facts' },
       h('span', null, h('strong', null, 'Repository: '), repoName(step.subject)),
-      plan?.tag && h('span', null, h('strong', null, 'Geplant: '), `${plan.tag} (${BUMP_TEXT[job.options.bump ?? 'patch']} nach ${plan.lastTag})`),
+      plan?.tag && h('span', null, h('strong', null, 'Geplant: '), `${plan.tag} (${BUMP_TEXT[bumpOf(job, step.subject)]} nach ${plan.lastTag})`),
       job.options.prepareRelease && h('span', null, h('strong', null, 'Vorher: '), step.prepared ? (step.pr ? `Release-${word} gemergt` : 'nichts an den Versionsdateien zu ändern') : `Release-${word} mit Versionsdateien und CHANGELOG`),
       step.tag && h('span', null, h('strong', null, 'Gesetzt: '), `${step.tag} auf ${short(step.commit)}`),
       rule && h('span', null, h('strong', null, `${serviceOf(step.subject)}-Release: `), rule.publishesRelease ? 'die App wartet darauf (bis zu 30 Minuten je Prüfung)' : 'laut Regel keins')),
@@ -2607,26 +2650,37 @@ function targetDialog(target, source) {
 /** A care job for exactly these repositories: what to do, which targets, then start. */
 function jobDialog(keys) {
   const repos = keys.map((k) => view.repositories.find((r) => r.key === k)).filter(Boolean);
-  const allowed = repos.filter((r) => !r.capabilities.care && !r.job);
+  const all = repos.filter((r) => !r.capabilities.care && !r.job);
   const excluded = repos.filter((r) => r.capabilities.care || r.job);
-  const withRule = allowed.filter((r) => r.release);
-  const targets = view.targets.filter((t) => t.sources.some((k) => allowed.some((r) => r.key === k)));
-  const feedsWebsite = !!view.websiteSources && allowed.some((r) => view.websiteSources.includes(r.key));
-  const o = { prs: true, proof: true, cleanup: false, release: false, bump: 'patch', prepareRelease: true, targets: new Map(), website: false, model: '', instructions: '' };
+  const withRule = all.filter((r) => r.release);
+  const followers = withRule.flatMap((u) => releasedThrough(u.key).filter((f) => f.enabled).map((f) => ({ follower: f, upstream: u })));
+  const o = { prs: true, proof: true, cleanup: false, release: false, bump: 'patch', bumps: {}, prepareRelease: true, targets: new Map(), website: false, model: '', instructions: '' };
+  // With a release, a repository whose release a chosen one publishes comes along by itself, not as a care target.
+  const cared = () => all.filter((r) => !(o.release && followers.some((f) => f.follower.key === r.key)));
+  // What the chain reaches: the cared-for repositories and, with a release, those their tag publishes.
+  const reach = () => [...cared().map((r) => r.key), ...(o.release ? followers.map((f) => f.follower.key) : [])];
+  const targetsNow = () => view.targets.filter((t) => t.sources.some((k) => reach().includes(k)));
+  const feedsNow = () => !!view.websiteSources && reach().some((k) => view.websiteSources.includes(k));
   // An example of what the chosen bump makes of the newest tag, from the first repository whose tag is known.
   const example = () => withRule.map((r) => {
     // The newest release names the tag; without one, the highest matching tag.
     const last = (r.facts && (ok(r.facts.release) || ok(r.facts.tag))) || null;
-    const next = last && nextVersion(last, r.release.tagPrefix, o.bump);
+    const next = last && nextVersion(last, r.release.tagPrefix, o.bumps[r.key] ?? o.bump);
     return next && `${r.repo}: ${last} → ${next}`;
   }).find(Boolean);
   const s = { error: '', busy: false };
   // The words of the services the chosen repositories live on.
-  const lab = allowed.some((r) => gitlabHost(r.repo));
-  const hub = allowed.some((r) => !gitlabHost(r.repo));
+  const lab = all.some((r) => gitlabHost(r.repo));
+  const hub = all.some((r) => !gitlabHost(r.repo));
   const pick = (github, gitlab) => (lab && hub ? `${github} bzw. ${gitlab}` : lab ? gitlab : github);
   const service = pick('GitHub', 'GitLab');
   openDialog('Pflegeauftrag', (close, render) => {
+    const allowed = cared();
+    const targets = targetsNow();
+    const feedsWebsite = feedsNow();
+    // A target or the website the chain no longer reaches (release turned off) is not chosen.
+    for (const id of [...o.targets.keys()]) if (!targets.some((t) => t.id === id)) o.targets.delete(id);
+    if (!feedsWebsite) o.website = false;
     const nothing = !o.prs && !o.cleanup && !o.release && !o.targets.size && !o.website;
     const option = (key, title, note, disabled) => h('label', { class: 'check-line top' },
       h('input', { type: 'checkbox', id: `job-opt-${key}`, checked: o[key], disabled, 'aria-describedby': `job-opt-${key}-note`, onchange: (e) => { o[key] = e.target.checked; render(); } }),
@@ -2648,6 +2702,12 @@ function jobDialog(keys) {
               h('select', { id: 'job-bump', 'aria-describedby': 'job-bump-note', onchange: (e) => { o.bump = e.target.value; render(); } },
                 Object.entries(BUMP_TEXT).map(([value, text]) => h('option', { value, selected: o.bump === value }, `${text}: ${BUMP_NOTE[value]}`)))),
             h('div', { class: 'note', id: 'job-bump-note' }, example() ?? 'Die Version zählt vom höchsten Tag der Release-Regel aus weiter.'),
+            withRule.length > 1 && h('div', { class: 'field-col' }, h('div', { class: 'note' }, 'Je Repository abweichend:'),
+              withRule.map((r) => h('div', { class: 'field-row' }, h('label', { for: domId('job-bump', r.key), class: 'mono' }, r.repo),
+                h('select', { id: domId('job-bump', r.key), onchange: (e) => { if (e.target.value) o.bumps[r.key] = e.target.value; else delete o.bumps[r.key]; render(); } },
+                  h('option', { value: '', selected: !o.bumps[r.key] }, `wie oben (${BUMP_TEXT[o.bump]})`),
+                  Object.entries(BUMP_TEXT).map(([value, text]) => h('option', { value, selected: o.bumps[r.key] === value }, text)))))),
+            followers.length > 0 && h('div', { class: 'note' }, `Kommt mit: ${followers.map((f) => `${f.follower.repo} (Release aus ${f.upstream.repo})`).join(', ')}. Die App taggt dort nicht, sie wartet nach dem Tag auf das Release und meldet einen fehlgeschlagenen Export.`),
             option('prepareRelease', 'Vorher Versionsdateien und CHANGELOG anpassen', `Vor dem Tag bringt die App Cargo.toml, package.json, tauri.conf.json, Chart.yaml und ähnliche Dateien sowie das CHANGELOG.md auf die neue Version, aber nur dort, wo genau die Version des letzten Tags steht. Du siehst den Diff und gibst ihn eigens frei; dann ein Release-${pick('PR', 'MR')}, Merge bei grüner CI und der Tag auf dem Merge-Commit. Ohne passende Datei folgt der Tag direkt.`))),
         (targets.length > 0 || feedsWebsite) && h('fieldset', null, h('legend', null, 'Zugeordnete Inhalte'),
           targets.map((t) => h('div', { class: 'target-choice' },
@@ -2672,12 +2732,12 @@ function jobDialog(keys) {
           s.busy = true; s.error = ''; render();
           try {
             const options = {
-              prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, bump: o.bump, prepareRelease: o.release && o.prepareRelease,
+              prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, bump: o.bump, bumps: o.release ? o.bumps : {}, prepareRelease: o.release && o.prepareRelease,
               website: o.website, model: o.model, instructions: o.instructions,
               targets: [...o.targets].map(([id, basis]) => ({ id, basis })),
             };
             const id = await invoke('start_job', { input: { repos: allowed.map((r) => r.key), options } });
-            for (const r of allowed) selection.delete(r.key);
+            for (const r of all) selection.delete(r.key);
             close();
             jobTab = 'log';
             openJob(id);

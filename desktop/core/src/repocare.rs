@@ -910,26 +910,12 @@ pub fn wait_for_release(repo: &str, tag: &str, commit: &str, runner: &Runner, wa
         if now != commit {
             return Ok(ReleaseWait::Failed(format!("{tag} zeigt inzwischen auf {} statt auf {}", short(&now), short(commit))));
         }
-        if let Some(release) = get(&format!("repos/{repo}/releases/tags/{}", encode_ref(tag)))? {
-            if release["draft"].as_bool() != Some(true) {
-                return Ok(ReleaseWait::Published { url: release["html_url"].as_str().unwrap_or_default().to_owned() });
-            }
+        if let Some(url) = published_release(repo, tag)? {
+            return Ok(ReleaseWait::Published { url });
         }
         // A failed release workflow means no release; waiting longer would not change that.
-        if let Ok(Some(runs)) = get(&format!("repos/{repo}/actions/runs?head_sha={commit}&event=push&per_page=30")) {
-            let failed = runs["workflow_runs"].as_array().into_iter().flatten().find(|run| {
-                run["head_branch"].as_str() == Some(tag)
-                    && run["status"].as_str() == Some("completed")
-                    && matches!(run["conclusion"].as_str(), Some("failure" | "cancelled" | "timed_out" | "startup_failure"))
-            });
-            if let Some(run) = failed {
-                return Ok(ReleaseWait::WorkflowFailed(format!(
-                    "Workflow „{}“ für {tag} endete mit {}: {}",
-                    run["name"].as_str().unwrap_or("?"),
-                    run["conclusion"].as_str().unwrap_or("?"),
-                    run["html_url"].as_str().unwrap_or_default()
-                )));
-            }
+        if let Some(why) = failed_tag_run(repo, &format!("head_sha={commit}&event=push&per_page=30"), tag) {
+            return Ok(ReleaseWait::WorkflowFailed(why));
         }
         if start.elapsed() >= wait.timeout {
             return Ok(ReleaseWait::Pending(format!("nach {} Minuten noch kein veröffentlichtes Release {tag}", wait.timeout.as_secs() / 60)));
@@ -938,14 +924,78 @@ pub fn wait_for_release(repo: &str, tag: &str, commit: &str, runner: &Runner, wa
             progress(&format!("warte auf das Release {tag} …"));
             reported = true;
         }
-        let mut slept = Duration::ZERO;
-        while slept < wait.poll {
-            runner.check()?;
-            let step = Duration::from_secs(1).min(wait.poll - slept);
-            thread::sleep(step);
-            slept += step;
-        }
+        pause(runner, wait)?;
     }
+}
+
+/// Waits for the release `tag` in `repo` that another repository's tag publishes there (its
+/// `released_by`, e.g. by exporting to it), so the commit it lands on is not known beforehand.
+/// A failed run for the tag in `upstream` at `upstream_commit` (the tag push or a run it
+/// triggered, such as the export) or in `repo` means it will not come by waiting. GitHub only.
+pub fn wait_for_follow_release(repo: &str, tag: &str, upstream: &str, upstream_commit: &str, runner: &Runner, wait: &CiWait, progress: &dyn Fn(&str)) -> Result<ReleaseWait> {
+    if crate::gitlab::project(repo).is_some() || crate::gitlab::project(upstream).is_some() {
+        return Ok(ReleaseWait::Failed("Veröffentlichen durch ein anderes Repository gibt es nur auf GitHub".into()));
+    }
+    let start = Instant::now();
+    let mut reported = false;
+    loop {
+        runner.check()?;
+        if let Some(url) = published_release(repo, tag)? {
+            return Ok(ReleaseWait::Published { url });
+        }
+        // Runs of the same commit for a branch (e.g. main's CI) say nothing about the tag.
+        if let Some(why) = failed_tag_run(upstream, &format!("head_sha={upstream_commit}&per_page=50"), tag) {
+            return Ok(ReleaseWait::WorkflowFailed(format!("in {upstream}: {why}")));
+        }
+        if let Some(why) = failed_tag_run(repo, &format!("branch={}&event=push&per_page=30", encode_ref(tag)), tag) {
+            return Ok(ReleaseWait::WorkflowFailed(format!("in {repo}: {why}")));
+        }
+        if start.elapsed() >= wait.timeout {
+            return Ok(ReleaseWait::Pending(format!("nach {} Minuten noch kein veröffentlichtes Release {tag} in {repo}", wait.timeout.as_secs() / 60)));
+        }
+        if !reported {
+            progress(&format!("warte auf das Release {tag}, das {upstream} hier veröffentlicht …"));
+            reported = true;
+        }
+        pause(runner, wait)?;
+    }
+}
+
+/// The page of the published (not draft) GitHub release of `tag`, if there is one.
+fn published_release(repo: &str, tag: &str) -> Result<Option<String>> {
+    Ok(get(&format!("repos/{repo}/releases/tags/{}", encode_ref(tag)))?
+        .filter(|release| release["draft"].as_bool() != Some(true))
+        .map(|release| release["html_url"].as_str().unwrap_or_default().to_owned()))
+}
+
+/// A finished, unsuccessful workflow run of `repo` (filtered by `query`) for `tag`: its push or a
+/// run it triggered, which carries the tag as its branch too. Unreadable runs count as none.
+fn failed_tag_run(repo: &str, query: &str, tag: &str) -> Option<String> {
+    let Ok(Some(runs)) = get(&format!("repos/{repo}/actions/runs?{query}")) else { return None };
+    let run = runs["workflow_runs"].as_array().into_iter().flatten().find(|run| {
+        run["head_branch"].as_str() == Some(tag)
+            && matches!(run["event"].as_str(), Some("push" | "workflow_run" | "workflow_dispatch"))
+            && run["status"].as_str() == Some("completed")
+            && matches!(run["conclusion"].as_str(), Some("failure" | "cancelled" | "timed_out" | "startup_failure"))
+    })?;
+    Some(format!(
+        "Workflow „{}“ für {tag} endete mit {}: {}",
+        run["name"].as_str().unwrap_or("?"),
+        run["conclusion"].as_str().unwrap_or("?"),
+        run["html_url"].as_str().unwrap_or_default()
+    ))
+}
+
+/// Sleeps `wait.poll`, a second at a time, so that stopping the runner is noticed quickly.
+fn pause(runner: &Runner, wait: &CiWait) -> Result<()> {
+    let mut slept = Duration::ZERO;
+    while slept < wait.poll {
+        runner.check()?;
+        let step = Duration::from_secs(1).min(wait.poll - slept);
+        thread::sleep(step);
+        slept += step;
+    }
+    Ok(())
 }
 
 /// Waits until the CI of `sha` has a result: passed, failed, unknown, no checks after
@@ -967,13 +1017,7 @@ pub fn wait_for_checks(repo: &str, sha: &str, runner: &Runner, wait: &CiWait, pr
             progress(&format!("warte auf die CI von {} …", short(sha)));
             reported = true;
         }
-        let mut slept = Duration::ZERO;
-        while slept < wait.poll {
-            runner.check()?;
-            let step = Duration::from_secs(1).min(wait.poll - slept);
-            thread::sleep(step);
-            slept += step;
-        }
+        pause(runner, wait)?;
     }
 }
 
@@ -1703,6 +1747,7 @@ mod tests {
             enabled: true,
             products: Vec::new(),
             release: Some(ReleaseRule { tag_prefix: String::new(), publishes_release: false }),
+            released_by: None,
             conflicts: Vec::new(),
             local: LocalCopy::Found { path: dir.display().to_string() },
             website: false,
@@ -1852,12 +1897,36 @@ mod tests {
         mock::install(wait("m2").into_iter().chain([("repos/o/app/releases/tags/1.0.1".to_owned(), None), runs(json!([]))]));
         assert!(matches!(wait_for_release("o/app", "1.0.1", "m2", &runner, &quick(), &|_| {}).unwrap(), ReleaseWait::Pending(_)), "a bounded wait");
 
-        let failed = json!([{ "head_branch": "1.0.1", "status": "completed", "conclusion": "failure", "name": "Release", "html_url": "u" }]);
+        let failed = json!([{ "head_branch": "1.0.1", "event": "push", "status": "completed", "conclusion": "failure", "name": "Release", "html_url": "u" }]);
         mock::install(wait("m2").into_iter().chain([("repos/o/app/releases/tags/1.0.1".to_owned(), None), runs(failed)]));
         assert!(matches!(wait_for_release("o/app", "1.0.1", "m2", &runner, &patient, &|_| {}).unwrap(), ReleaseWait::WorkflowFailed(why) if why.contains("Release")));
 
         mock::install(wait("elsewhere"));
         assert!(matches!(wait_for_release("o/app", "1.0.1", "m2", &runner, &patient, &|_| {}).unwrap(), ReleaseWait::Failed(why) if why.contains("zeigt inzwischen")));
+        assert!(mock::writes().is_empty());
+    }
+
+    #[test]
+    fn a_followed_release_is_blocked_only_by_runs_for_the_tag() {
+        let runner = Runner::default();
+        let world = |upstream: Value| {
+            vec![
+                ("repos/o/core/releases/tags/v1.1.0".to_owned(), None),
+                ("repos/o/ee/actions/runs?head_sha=e1&per_page=50".to_owned(), Some(json!({ "workflow_runs": upstream }))),
+                ("repos/o/core/actions/runs?branch=v1.1.0&event=push&per_page=30".to_owned(), Some(json!({ "workflow_runs": [] }))),
+            ]
+        };
+        let run = |branch: &str, event: &str, conclusion: &str| json!({ "head_branch": branch, "event": event, "status": "completed", "conclusion": conclusion, "name": "Export", "html_url": "u" });
+
+        mock::install(world(json!([run("main", "push", "cancelled"), run("main", "push", "failure")])));
+        assert!(matches!(wait_for_follow_release("o/core", "v1.1.0", "o/ee", "e1", &runner, &quick(), &|_| {}).unwrap(), ReleaseWait::Pending(_)), "main's CI on the same commit is not the export");
+
+        mock::install(world(json!([run("v1.1.0", "workflow_run", "failure")])));
+        assert!(matches!(wait_for_follow_release("o/core", "v1.1.0", "o/ee", "e1", &runner, &quick(), &|_| {}).unwrap(), ReleaseWait::WorkflowFailed(why) if why.contains("in o/ee") && why.contains("Export")));
+
+        mock::install(world(json!([])));
+        mock::sequence("repos/o/core/releases/tags/v1.1.0", vec![Some(json!({ "draft": false, "html_url": "https://r" }))]);
+        assert_eq!(wait_for_follow_release("o/core", "v1.1.0", "o/ee", "e1", &runner, &quick(), &|_| {}).unwrap(), ReleaseWait::Published { url: "https://r".into() });
         assert!(mock::writes().is_empty());
     }
 

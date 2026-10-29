@@ -51,6 +51,11 @@ nothing, neither on GitHub nor the local clone nor any website configuration. In
 - **Release rule**: whether the app may tag the next version, with which tag prefix (`v` for
   `v1.2.3`, empty for `1.2.3`), and whether a workflow of the repository publishes a GitHub release for
   each tag. Without a rule the app never tags; it does not guess a versioning scheme.
+- **Veröffentlicht durch** (released by, GitHub only): for a repository whose release another managed
+  repository's tag produces, with the same tag, e.g. a public repository a private one exports to. Such a
+  repository has no release rule of its own: the app never tags it. A job that tags the source repository
+  brings it along (see [Release chains](#release-chains)). One step only: the source has a release rule
+  and is not released by another repository itself.
 
 Which website products name a repository is shown (and where `site.json` disagrees with the release rule,
 also that), but the website's product selection does not decide what the app manages.
@@ -65,7 +70,7 @@ repositories can still be read (GitHub then allows 60 requests per hour; a repos
 | State | When |
 |---|---|
 | **Blockiert** | the default branch's CI failed, or the repository cannot be read (GitHub answers 404 or refuses access; a 404 can also mean private without access) |
-| **Aufmerksamkeit nötig** | open Dependabot pull requests, commits since the last release or tag, a website product documents an older version than the latest release, or (after the detail view read them) pull requests with conflicts or failed CI |
+| **Aufmerksamkeit nötig** | open Dependabot pull requests, commits since the last release or tag, a website product documents an older version than the latest release, the repository it is released by has a newer version than its own newest release (a failed or running export), or (after the detail view read them) pull requests with conflicts or failed CI |
 | **Unbekannt** | nothing of the above, but required facts are missing, incomplete or old: CI still running, no checks found, unclear result, query failed |
 | **In Ordnung** | everything required was read successfully and recently, and nothing needs doing |
 
@@ -138,7 +143,8 @@ activities you pick, each optional:
 - **Cleanup**: delete merged branches on GitHub and in the local clone.
 - **Release**: tag the next version where a release rule exists, once the CI of exactly that commit
   passed, and, if the rule says so, wait for the published GitHub release. Per job you choose **Patch**,
-  **Minor** or **Major** (`1.2.3` → `1.2.4`, `1.3.0`, `2.0.0`) and whether the version files and the
+  **Minor** or **Major** (`1.2.3` → `1.2.4`, `1.3.0`, `2.0.0`), with several repositories also a
+  different one per repository, and whether the version files and the
   CHANGELOG are brought to the new version first (release preparation, below). Pull request care no
   longer implies a tag.
 - **Content targets** fed by the selected repositories: README/documentation or wiki, each with the
@@ -262,6 +268,26 @@ Right before each write the app checks again:
 
 Every action ends as done, skipped, failed or cancelled, with the reason. Where the GitHub API has no
 precondition (closing, deleting a branch), a short window between the last check and the write remains.
+
+## Release chains
+
+A release often goes on in other repositories: a private repository exports its core to a public one
+that builds its own images and release from the same tag, and the public repository feeds a wiki and the
+website. Set **Veröffentlicht durch** on the public repository, and a job that tags the private one takes
+the whole chain:
+
+1. Care plan and the tag in the source repository, as usual.
+2. **Release `<repository>` (aus `<source>`)**: the app writes nothing there. It waits for the release
+   with the same tag (up to 30 minutes per look). A failed run in the source at the tagged commit (the
+   export, for example) or a failed run for the tag in the repository itself blocks the step with a
+   link to the run; a tag is never moved, so after the fix a new version is needed.
+3. README, wiki and website steps that the published repository feeds wait for that release, not for
+   the source's tag, and build on it.
+
+The published repository is not cared for in that job (its pull requests, if any, in a job of its
+own), and choosing it together with its source is refused. A README or documentation target in it is
+refused too, because the export replaces its files: keep README and docs in the source repository; its
+wiki is a repository of its own and stays a target.
 
 ## Content targets: README, documentation, wiki
 

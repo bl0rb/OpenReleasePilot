@@ -43,6 +43,9 @@ pub struct JobOptions {
     pub release: bool,
     /// Which part of the version the release raises.
     pub bump: Bump,
+    /// Repository key → its own bump, where it differs from `bump`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub bumps: BTreeMap<String, Bump>,
     /// Before the tag: a release pull request that brings the version files and the CHANGELOG to
     /// the new version, approved with its diff (see `release`).
     pub prepare_release: bool,
@@ -60,6 +63,11 @@ impl JobOptions {
     pub fn care(&self) -> bool {
         self.prs || self.cleanup || self.release
     }
+
+    /// The bump for one repository: its own, else the job's.
+    pub fn bump_for(&self, key: &str) -> Bump {
+        self.bumps.get(key).copied().unwrap_or(self.bump)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -74,6 +82,8 @@ pub struct TargetChoice {
 pub enum StepKind {
     Care,
     Release,
+    /// Waits for the release another repository's tag publishes here (`released_by`); writes nothing.
+    Follow,
     Docs,
     Wiki,
     Website,
@@ -144,11 +154,11 @@ pub struct Link {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStep {
-    /// `care`, `release:<repo>`, `target:<id>`, `website`.
+    /// `care`, `release:<repo>`, `follow:<repo>`, `target:<id>`, `website`.
     pub id: String,
     pub kind: StepKind,
     pub label: String,
-    /// Release: the repository key. Docs/wiki: the target id.
+    /// Release and follow: the repository key. Docs/wiki: the target id.
     #[serde(default)]
     pub subject: String,
     /// Steps that must have finished first.
@@ -382,12 +392,29 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
         if releases.is_empty() {
             return Err("Keins der Repositories hat eine Release-Regel; Release abwählen oder eine Regel einrichten".into());
         }
+        // A repository another one's tag publishes joins the chain: its release is waited for,
+        // and what it feeds (README, wiki, website) builds on that release.
+        for (upstream, release_id) in releases.clone() {
+            for follower in scope.config.released_through(&upstream).into_iter().filter(|r| r.enabled) {
+                let key = follower.key();
+                if keys.contains(&key) {
+                    return Err(format!("{} wird durch {upstream} veröffentlicht und kommt von selbst mit; abwählen", follower.repo));
+                }
+                let id = format!("follow:{key}");
+                let source = scope.config.repository(&upstream).map_or(upstream.as_str(), |r| r.repo.as_str());
+                steps.push(JobStep::new(id.clone(), StepKind::Follow, format!("Release {} (aus {source})", follower.repo), key.clone(), vec![release_id.clone()]));
+                releases.push((key, id));
+            }
+        }
     }
     let after_sources = |sources: &[String]| -> Vec<String> {
         let mut after = care.clone();
         after.extend(releases.iter().filter(|(key, _)| sources.contains(key)).map(|(_, id)| id.clone()));
         after
     };
+    // Repositories in the chain: the chosen ones and those their release publishes.
+    let mut chain = keys.clone();
+    chain.extend(releases.iter().filter(|(_, id)| id.starts_with("follow:")).map(|(key, _)| key.clone()));
     let managed_keys: Vec<String> = scope.config.repositories.iter().map(|r| r.key()).collect();
     let mut seen = Vec::new();
     for choice in &options.targets {
@@ -397,7 +424,10 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
         seen.push(choice.id.clone());
         let target = scope.config.content_target(&choice.id).ok_or_else(|| format!("Ziel {} gibt es nicht mehr", choice.id))?;
         content::validate(target, &managed_keys).map_err(|why| format!("{}: {why}", target.name))?;
-        if !target.sources.iter().any(|s| keys.contains(s)) {
+        if let Some(why) = generated_target(target, scope.config) {
+            return Err(format!("{}: {why}", target.name));
+        }
+        if !target.sources.iter().any(|s| chain.contains(s)) {
             return Err(format!("{}: keine seiner Quellen ist ausgewählt", target.name));
         }
         let kind = match target.kind {
@@ -410,7 +440,7 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
     }
     if options.website {
         let sources = scope.website_sources.as_ref().ok_or("Keine Website eingerichtet")?;
-        if !sources.iter().any(|s| keys.contains(s)) {
+        if !sources.iter().any(|s| chain.contains(s)) {
             return Err("Keins der ausgewählten Repositories speist die Website (ausgewählte Produkte in site.json)".into());
         }
         steps.push(JobStep::new("website".into(), StepKind::Website, "Website".into(), String::new(), after_sources(sources)));
@@ -433,10 +463,24 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
     })
 }
 
-/// A new job may not touch what an open job holds: the same repository, target or website.
+/// Why a README/documentation target cannot live in its repository: that repository is published
+/// by another one, whose export replaces its files. The wiki is a repository of its own and stays.
+pub fn generated_target(target: &content::ContentTarget, config: &Config) -> Option<String> {
+    if target.kind != TargetKind::Docs {
+        return None;
+    }
+    let managed = config.repository(&target.repo)?;
+    managed.released_by_key().map(|_| {
+        format!("{} wird durch {} veröffentlicht, das seine Dateien beim Export ersetzt; README und Doku dort pflegen", managed.repo, managed.released_by)
+    })
+}
+
+/// A new job may not touch what an open job holds: the same repository (see `Job::held`), target
+/// or website. `repos` is what the new job holds.
 pub fn overlap(open: &[&Job], repos: &[String], options: &JobOptions) -> Option<String> {
     for job in open {
-        if let Some(repo) = repos.iter().map(|r| r.to_lowercase()).find(|r| job.repos.contains(r)) {
+        let held = job.held();
+        if let Some(repo) = repos.iter().map(|r| r.to_lowercase()).find(|r| held.contains(r)) {
             return Some(format!("{repo} gehört schon zum offenen Auftrag vom {}; erst abschließen oder beenden", job.id));
         }
         if let Some(target) = options.targets.iter().find(|t| job.options.targets.iter().any(|o| o.id == t.id)) {
@@ -452,6 +496,13 @@ pub fn overlap(open: &[&Job], repos: &[String], options: &JobOptions) -> Option<
 // MARK: Progress
 
 impl Job {
+    /// The repositories it holds: those it cares for and those whose release it waits for, which
+    /// another job must not change meanwhile (an export replaces their default branch).
+    pub fn held(&self) -> Vec<String> {
+        let follows = self.steps.iter().filter(|s| s.kind == StepKind::Follow).map(|s| s.subject.clone());
+        self.repos.iter().cloned().chain(follows).collect()
+    }
+
     pub fn step(&self, id: &str) -> Option<&JobStep> {
         self.steps.iter().find(|s| s.id == id)
     }
@@ -515,7 +566,7 @@ impl Job {
         for step in &mut self.steps {
             if step.state == StepState::Running {
                 any = true;
-                step.state = if step.approved.is_some() || (step.kind == StepKind::Care && self.plan.is_some()) || step.kind == StepKind::Release {
+                step.state = if step.approved.is_some() || (step.kind == StepKind::Care && self.plan.is_some()) || matches!(step.kind, StepKind::Release | StepKind::Follow) {
                     StepState::Approved
                 } else {
                     StepState::Pending
@@ -538,7 +589,7 @@ impl Job {
         }
         if running {
             let current = self.steps.iter().find(|s| s.state == StepState::Running);
-            let preparing = current.is_some_and(|s| s.approved.is_none() && !matches!(s.kind, StepKind::Release) && !(s.kind == StepKind::Care && self.plan.is_some()));
+            let preparing = current.is_some_and(|s| s.approved.is_none() && !matches!(s.kind, StepKind::Release | StepKind::Follow) && !(s.kind == StepKind::Care && self.plan.is_some()));
             let label = current.map(|s| s.label.as_str()).unwrap_or("Auftrag");
             return if preparing {
                 status(JobState::Preparing, &format!("{label}: wird vorbereitet"), "")
@@ -1120,6 +1171,78 @@ mod tests {
         let config = config();
         let scope = Scope { config: &config, website_sources: Some(vec!["o/app".into(), "o/lib".into()]) };
         make("j1", 100, &["o/app".into(), "O/App".into(), "o/lib".into()], options, &scope).unwrap()
+    }
+
+    /// o/ee (private, tags) publishes o/core (public export) with the same tag; o/core feeds a
+    /// wiki and the website.
+    fn chain() -> Config {
+        let mut config = Config::default();
+        config.add_repository(ManagedRepo { release: Some(ReleaseRule { tag_prefix: "v".into(), publishes_release: false }), ..ManagedRepo::new("o/ee") });
+        config.add_repository(ManagedRepo { released_by: "o/ee".into(), ..ManagedRepo::new("o/core") });
+        config.add_repository(ManagedRepo { release: Some(ReleaseRule { tag_prefix: "v".into(), publishes_release: true }), ..ManagedRepo::new("o/desktop") });
+        let target = |id: &str, kind, repo: &str| ContentTarget {
+            id: id.into(),
+            kind,
+            name: id.to_uppercase(),
+            sources: vec!["o/core".into()],
+            repo: repo.into(),
+            branch: String::new(),
+            paths: content::default_paths(kind),
+            instructions: String::new(),
+            skill: String::new(),
+            model: String::new(),
+            basis: Basis::Release,
+            check: String::new(),
+            merge_when_green: false,
+        };
+        config.content_targets.push(target("wiki", TargetKind::Wiki, "o/core"));
+        config.content_targets.push(target("readme", TargetKind::Docs, "o/core"));
+        config.content_targets.push(target("eereadme", TargetKind::Docs, "o/ee"));
+        config
+    }
+
+    #[test]
+    fn a_release_brings_the_repository_it_publishes_along() {
+        let config = chain();
+        let scope = Scope { config: &config, website_sources: Some(vec!["o/core".into()]) };
+        let mut options = JobOptions { prs: true, release: true, website: true, ..JobOptions::default() };
+        options.targets = vec![TargetChoice { id: "wiki".into(), basis: Basis::Release }];
+        options.bumps.insert("o/ee".into(), Bump::Minor);
+        let job = make("j1", 100, &["o/ee".into(), "o/desktop".into()], &options, &scope).unwrap();
+        assert_eq!(job.repos, ["o/ee", "o/desktop"], "o/core is waited for, not cared for");
+        let ids: Vec<&str> = job.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["care", "release:o/ee", "release:o/desktop", "follow:o/core", "target:wiki", "website"]);
+        assert_eq!(job.step("follow:o/core").unwrap().after, ["release:o/ee"]);
+        assert_eq!(job.step("follow:o/core").unwrap().kind, StepKind::Follow);
+        assert_eq!(job.step("target:wiki").unwrap().after, ["care", "follow:o/core"], "the wiki builds on the exported release");
+        assert_eq!(job.step("website").unwrap().after, ["care", "follow:o/core"]);
+        assert_eq!((options.bump_for("o/ee"), options.bump_for("o/desktop")), (Bump::Minor, Bump::Patch));
+
+        let without_release = JobOptions { release: false, ..options.clone() };
+        let err = make("j2", 100, &["o/ee".into()], &without_release, &scope).unwrap_err();
+        assert!(err.contains("keine seiner Quellen"), "without a tag nothing reaches o/core: {err}");
+
+        assert_eq!(job.held(), ["o/ee", "o/desktop", "o/core"]);
+        let care = JobOptions { prs: true, ..JobOptions::default() };
+        assert!(overlap(&[&job], &["o/core".into()], &care).unwrap().contains("o/core"), "the export replaces what a second job would merge");
+
+        let both = make("j3", 100, &["o/ee".into(), "o/core".into()], &options, &scope).unwrap_err();
+        assert!(both.contains("kommt von selbst mit"), "{both}");
+
+        let readme = JobOptions { targets: vec![TargetChoice { id: "readme".into(), basis: Basis::Release }], ..options.clone() };
+        let err = make("j4", 100, &["o/ee".into()], &readme, &scope).unwrap_err();
+        assert!(err.contains("beim Export"), "a README in the exported repository would be overwritten: {err}");
+        assert!(generated_target(config.content_target("eereadme").unwrap(), &config).is_none());
+        assert!(generated_target(config.content_target("wiki").unwrap(), &config).is_none(), "the wiki is a repository of its own");
+    }
+
+    #[test]
+    fn older_jobs_without_bumps_per_repository_stay_readable() {
+        let options: JobOptions = serde_json::from_value(serde_json::json!({
+            "prs": true, "proof": false, "cleanup": false, "release": true, "bump": "minor", "prepareRelease": false,
+            "targets": [], "website": false, "model": "", "instructions": "",
+        })).unwrap();
+        assert_eq!(options.bump_for("o/app"), Bump::Minor);
     }
 
     #[test]
