@@ -51,6 +51,11 @@ eine Website-Konfiguration. Im Abschnitt **Verwaltung** des Repositorys:
 - **Release-Regel**: ob die App die nächste Version taggen darf, mit welchem Tag-Präfix (`v` für
   `v1.2.3`, leer für `1.2.3`), und ob ein Workflow des Repositorys zu jedem Tag ein GitHub-Release
   veröffentlicht. Ohne Regel taggt die App nie; sie errät keine Versionierung.
+- **Veröffentlicht durch** (nur GitHub): für ein Repository, dessen Release der Tag eines anderen
+  verwalteten Repositorys erzeugt, mit demselben Tag, etwa ein öffentliches Repository, in das ein
+  privates exportiert. Ein solches Repository hat keine eigene Release-Regel: die App taggt es nie. Ein
+  Auftrag, der das Quell-Repository taggt, nimmt es mit (siehe [Release-Ketten](#release-ketten)). Nur
+  eine Stufe: die Quelle hat eine Release-Regel und wird nicht selbst durch ein anderes veröffentlicht.
 
 Welche Website-Produkte ein Repository nennen, zeigt die App an (und wo `site.json` der Release-Regel
 widerspricht, auch das), aber die Produktauswahl der Website entscheidet nicht, was die App verwaltet.
@@ -66,7 +71,7 @@ erlaubt dann 60 Anfragen pro Stunde; ein Repository braucht etwa acht).
 | Zustand | Wann |
 |---|---|
 | **Blockiert** | die CI des Default-Branches ist fehlgeschlagen, oder das Repository ist nicht lesbar (GitHub antwortet mit 404 oder verweigert den Zugriff; 404 kann auch „privat ohne Zugriff“ heißen) |
-| **Aufmerksamkeit nötig** | offene Dependabot-Pull-Requests, Commits seit dem letzten Release oder Tag, ein Website-Produkt dokumentiert eine ältere Version als das neueste Release, oder (sobald die Detailansicht sie gelesen hat) Pull Requests mit Konflikt oder roter CI |
+| **Aufmerksamkeit nötig** | offene Dependabot-Pull-Requests, Commits seit dem letzten Release oder Tag, ein Website-Produkt dokumentiert eine ältere Version als das neueste Release, das Repository, durch das es veröffentlicht wird, hat eine neuere Version als sein eigenes neuestes Release (ein fehlgeschlagener oder laufender Export), oder (sobald die Detailansicht sie gelesen hat) Pull Requests mit Konflikt oder roter CI |
 | **Unbekannt** | nichts davon, aber nötige Angaben fehlen, sind unvollständig oder alt: CI läuft noch, keine Checks gefunden, unklares Ergebnis, Abfrage fehlgeschlagen |
 | **In Ordnung** | alles Nötige wurde erfolgreich und vor Kurzem gelesen, und es gibt nichts zu tun |
 
@@ -139,7 +144,8 @@ besteht aus den Tätigkeiten, die du wählst, jede optional:
 - **Aufräumen**: gemergte Branches auf GitHub und in der lokalen Kopie löschen.
 - **Release**: die nächste Version taggen, wo eine Release-Regel besteht, sobald die CI genau dieses
   Commits grün ist, und, wenn die Regel es sagt, auf das veröffentlichte GitHub-Release warten. Je
-  Auftrag wählst du **Patch**, **Minor** oder **Major** (`1.2.3` → `1.2.4`, `1.3.0`, `2.0.0`) und ob
+  Auftrag wählst du **Patch**, **Minor** oder **Major** (`1.2.3` → `1.2.4`, `1.3.0`, `2.0.0`), bei
+  mehreren Repositories auch je Repository abweichend, und ob
   vorher die Versionsdateien und das CHANGELOG auf die neue Version gebracht werden (Release-Vorbereitung,
   unten). PR-Pflege bedeutet nicht mehr automatisch einen Tag.
 - **Inhaltsziele**, die die gewählten Repositories speisen: README/Dokumentation oder Wiki, jeweils mit
@@ -272,6 +278,27 @@ Direkt vor jedem Schreiben prüft die App erneut:
 Jede Aktion endet als erledigt, übersprungen, fehlgeschlagen oder abgebrochen, mit Grund. Wo die
 GitHub-API keine Vorbedingung kennt (Schließen, Branch löschen), bleibt ein kurzes Fenster zwischen
 letzter Prüfung und Schreiben.
+
+## Release-Ketten
+
+Ein Release geht oft in anderen Repositories weiter: ein privates Repository exportiert seinen Kern in
+ein öffentliches, das aus demselben Tag eigene Images und ein eigenes Release baut, und das öffentliche
+speist ein Wiki und die Website. Mit **Veröffentlicht durch** am öffentlichen Repository nimmt ein
+Auftrag, der das private taggt, die ganze Kette:
+
+1. Pflegeplan und Tag im Quell-Repository, wie gewohnt.
+2. **Release `<Repository>` (aus `<Quelle>`)**: die App schreibt dort nichts. Sie wartet auf das Release
+   mit demselben Tag (bis zu 30 Minuten je Prüfung). Ein fehlgeschlagener Lauf in der Quelle am getaggten
+   Commit (etwa der Export) oder ein fehlgeschlagener Lauf zum Tag im Repository selbst blockiert den
+   Schritt, mit Link auf den Lauf; ein Tag wird nie verschoben, nach der Korrektur braucht es also eine
+   neue Version.
+3. README-, Wiki- und Website-Schritte, die das veröffentlichte Repository speist, warten auf dieses
+   Release, nicht auf den Tag der Quelle, und bauen darauf auf.
+
+Das veröffentlichte Repository wird in diesem Auftrag nicht gepflegt (seine Pull Requests, falls es
+welche gibt, in einem eigenen Auftrag), und es zusammen mit seiner Quelle zu wählen, lehnt die App ab.
+Ein README- oder Doku-Ziel darin lehnt sie ebenfalls ab, weil der Export dessen Dateien ersetzt: README
+und Doku im Quell-Repository pflegen; das Wiki ist ein eigenes Repository und bleibt ein Ziel.
 
 ## Inhaltsziele: README, Dokumentation, Wiki
 

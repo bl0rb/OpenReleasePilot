@@ -109,7 +109,7 @@ fn summary(app: &AppHandle) -> Summary {
         for target in &targets {
             let status = m.repo_status.get(&target.key);
             summary.reading |= status.is_some_and(|s| s.loading);
-            let health = repos::health(target, status.and_then(|s| s.facts.as_ref()), status.and_then(|s| s.details.as_ref()), now);
+            let health = repos::health_with(target, status.and_then(|s| s.facts.as_ref()), status.and_then(|s| s.details.as_ref()), crate::upstream_of(m, target), now);
             match health.state {
                 HealthState::Blocked => summary.blocked += 1,
                 HealthState::NeedsAttention => summary.attention += 1,

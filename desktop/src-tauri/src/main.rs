@@ -540,7 +540,7 @@ fn get_view(app: AppHandle) -> View {
                     let details = status.and_then(|s| s.details.clone());
                     let key = target.key.clone();
                     RepoView {
-                        health: repos::health(&target, facts.as_ref(), details.as_ref(), now),
+                        health: repos::health_with(&target, facts.as_ref(), details.as_ref(), upstream_of(m, &target), now),
                         capabilities: repos::capabilities(&target, facts.as_ref(), target.forge.signed_in()),
                         loading: status.is_some_and(|s| s.loading),
                         error: status.and_then(|s| s.error.clone()),
@@ -548,7 +548,7 @@ fn get_view(app: AppHandle) -> View {
                         security: status.and_then(|s| s.security.clone()),
                         security_loading: status.is_some_and(|s| s.security_loading),
                         security_error: status.and_then(|s| s.security_error.clone()),
-                        job: open_job(&|j| j.repos.contains(&key)),
+                        job: open_job(&|j| j.held().contains(&key)),
                         targets: m.config.content_targets.iter().filter(|t| t.sources.contains(&key)).map(|t| t.id.clone()).collect(),
                         facts,
                         details,
@@ -1023,6 +1023,13 @@ fn run_step(app: AppHandle, step: Step, instructions: String) -> Result<(), Stri
 
 // MARK: Repositories
 
+/// The repository that publishes `target`'s release, with what was last read of it.
+pub(crate) fn upstream_of<'a>(m: &'a Model, target: &repos::RepoTarget) -> Option<repos::Upstream<'a>> {
+    let key = target.released_by.as_deref()?;
+    let managed = m.config.repository(key)?;
+    Some(repos::Upstream { repo: &managed.repo, facts: m.repo_status.get(key).and_then(|s| s.facts.as_ref()) })
+}
+
 /// Reads the facts of the repositories (all when `keys` is empty), four at a time, each stored as
 /// soon as it arrives. Read only and without Claude; runs beside a step, never under the model lock.
 /// Also looks whether pull requests delivered by content targets were merged meanwhile.
@@ -1259,7 +1266,7 @@ async fn fix_security(app: AppHandle, key: String, fixes: Vec<security::Fix>) ->
 
 /// Whether an open job holds the repository; changing it under the job would invalidate its plan.
 fn held_by_job(m: &Model, key: &str) -> Option<String> {
-    m.jobs.iter().find(|j| j.open() && j.repos.iter().any(|r| r == key)).map(|j| j.id.clone())
+    m.jobs.iter().find(|j| j.open() && j.held().iter().any(|r| r == key)).map(|j| j.id.clone())
 }
 
 #[derive(Serialize)]
@@ -1383,9 +1390,13 @@ struct RepoSettings {
     enabled: bool,
     local_path: String,
     release: Option<ReleaseRule>,
+    /// Key of the managed repository whose release publishes this one; empty = none.
+    #[serde(default)]
+    released_by: String,
 }
 
-/// Changes how a repository is managed: on/off, local clone, release rule. Not while an open job holds it.
+/// Changes how a repository is managed: on/off, local clone, release rule or the repository that
+/// releases it. Not while an open job holds it.
 #[tauri::command]
 fn update_repository(app: AppHandle, key: String, settings: RepoSettings) -> Result<(), String> {
     if let Some(job) = with_model(&app, |m| held_by_job(m, &key)) {
@@ -1397,10 +1408,31 @@ fn update_repository(app: AppHandle, key: String, settings: RepoSettings) -> Res
         }
     }
     save_config(&app, |config| {
+        let released_by = settings.released_by.trim().to_lowercase();
+        if let Some(why) = config.released_by_problem(&key, &released_by, settings.release.as_ref()) {
+            return Err(format!("Veröffentlicht durch: {why}"));
+        }
+        if !released_by.is_empty() {
+            let docs: Vec<String> = config
+                .content_targets
+                .iter()
+                .filter(|t| t.kind == content::TargetKind::Docs && t.repo.eq_ignore_ascii_case(&key))
+                .map(|t| t.name.clone())
+                .collect();
+            if !docs.is_empty() {
+                return Err(format!("{} liegt hier und würde beim Export ersetzt; erst in {released_by} anlegen und hier entfernen", docs.join(", ")));
+            }
+        }
+        let followers: Vec<String> = config.released_through(&key).iter().map(|r| r.repo.clone()).collect();
+        if !followers.is_empty() && (settings.release.is_none() || !settings.enabled) {
+            let what = if settings.enabled { "Release-Regel" } else { "Abschalten" };
+            return Err(format!("{what}: veröffentlicht {}; ohne Tag hier kommt dort nichts an", followers.join(", ")));
+        }
         let repo = config.repositories.iter_mut().find(|r| r.key() == key).ok_or("Repository wird nicht verwaltet")?;
         repo.enabled = settings.enabled;
         repo.local_path = settings.local_path.trim().to_owned();
         repo.release = settings.release;
+        repo.released_by = released_by;
         Ok(())
     })
 }
@@ -1416,6 +1448,10 @@ fn remove_repository(app: AppHandle, key: String) -> Result<(), String> {
         let users: Vec<String> = config.content_targets.iter().filter(|t| t.sources.contains(&key)).map(|t| t.name.clone()).collect();
         if !users.is_empty() {
             return Err(format!("Quelle von {}; dort erst entfernen", users.join(", ")));
+        }
+        let followers: Vec<String> = config.released_through(&key).iter().map(|r| r.repo.clone()).collect();
+        if !followers.is_empty() {
+            return Err(format!("veröffentlicht {}; dort erst „Veröffentlicht durch“ leeren", followers.join(", ")));
         }
         config.repositories.retain(|r| r.key() != key);
         Ok(())
@@ -1446,6 +1482,9 @@ fn save_target(app: AppHandle, target: ContentTarget) -> Result<String, String> 
     save_config(&app, |config| {
         let managed: Vec<String> = config.repositories.iter().map(|r| r.key()).collect();
         content::validate(&target, &managed)?;
+        if let Some(why) = jobs::generated_target(&target, config) {
+            return Err(why);
+        }
         if target.id.is_empty() {
             let next = (1..).find(|n| !config.content_targets.iter().any(|t| t.id == format!("t{n}"))).expect("a free id");
             target.id = format!("t{next}");
@@ -1490,12 +1529,12 @@ fn start_job(app: AppHandle, input: JobInput) -> Result<String, String> {
     let mut created = String::new();
     steps::start_with(&app, |m| {
         let open: Vec<&Job> = m.jobs.iter().filter(|j| j.open()).collect();
-        if let Some(why) = jobs::overlap(&open, &input.repos, &input.options) {
-            return Err(why);
-        }
         let scope = jobs::Scope { config: &m.config, website_sources: website_sources(&m.config, &m.site) };
         let now = steps::now();
         let job = jobs::make(&jobs::new_id(now, next_token()), now, &input.repos, &input.options, &scope)?;
+        if let Some(why) = jobs::overlap(&open, &job.held(), &job.options) {
+            return Err(why);
+        }
         jobs::save(&job).map_err(|e| format!("{e:#}"))?;
         created = job.id.clone();
         m.jobs.insert(0, job);

@@ -66,6 +66,8 @@ pub struct RepoTarget {
     pub products: Vec<ProductLink>,
     /// The release line the app may continue; `None` = no automatic tag.
     pub release: Option<ReleaseRule>,
+    /// Key of the managed repository whose release publishes this one; `None` = none.
+    pub released_by: Option<String>,
     /// Where the configuration disagrees with itself, e.g. site.json and the release rule.
     pub conflicts: Vec<String>,
     pub local: LocalCopy,
@@ -93,7 +95,7 @@ impl RepoTarget {
 
     /// What a plan depends on: a plan is not run once this changed.
     pub fn fingerprint(&self) -> String {
-        format!("{}|{}|{:?}|{:?}", self.key, self.enabled, self.release, self.local)
+        format!("{}|{}|{:?}|{:?}|{:?}", self.key, self.enabled, self.release, self.released_by, self.local)
     }
 }
 
@@ -133,6 +135,7 @@ fn target(managed: &ManagedRepo, config: &Config, site: Option<&Site>, website: 
         github_id: managed.github_id,
         enabled: managed.enabled,
         release: managed.release.clone(),
+        released_by: managed.released_by_key(),
         local: local_copy(&managed.local_path, &managed.repo),
         conflicts,
         products,
@@ -361,6 +364,21 @@ impl Facts {
     pub fn failed_entirely(&self) -> bool {
         matches!(self.access, Fetch::Failed(_)) && !self.unreadable
     }
+
+    /// The newest version it is known to have: its newest release, else its highest tag.
+    /// Not known while the release could not be read: the tag alone may run ahead of it.
+    pub fn version(&self) -> Option<&str> {
+        let Fetch::Ok(release) = &self.release else { return None };
+        let tag = match &self.tag {
+            Fetch::Ok(tag) => tag.as_deref(),
+            _ => None,
+        };
+        match (release.as_deref(), tag) {
+            (Some(release), Some(tag)) if is_newer(tag, release) => Some(tag),
+            (Some(release), _) => Some(release),
+            (None, tag) => tag,
+        }
+    }
 }
 
 /// Reads what the overview needs, about eight GitHub requests. Each part fails on its own.
@@ -556,6 +574,19 @@ pub struct Health {
 
 /// The health of one repository from its facts (and the detail view's pull request data, if read).
 pub fn health(target: &RepoTarget, facts: Option<&Facts>, details: Option<&Details>, now: u64) -> Health {
+    health_with(target, facts, details, None, now)
+}
+
+/// The repository that publishes another one's release, with what was read of it.
+pub struct Upstream<'a> {
+    pub repo: &'a str,
+    pub facts: Option<&'a Facts>,
+}
+
+/// As `health`, and for a repository released by another one: a version the upstream has and
+/// this one has not published yet is half a release (the upstream's export or workflow failed or
+/// still runs).
+pub fn health_with(target: &RepoTarget, facts: Option<&Facts>, details: Option<&Details>, upstream: Option<Upstream>, now: u64) -> Health {
     let (mut blockers, mut attention, mut gaps, mut notes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     match &target.local {
         LocalCopy::NotConfigured => notes.push("keine lokale Kopie eingetragen".to_owned()),
@@ -617,6 +648,11 @@ pub fn health(target: &RepoTarget, facts: Option<&Facts>, details: Option<&Detai
         }
         match &facts.release {
             Fetch::Ok(Some(tag)) => {
+                if let Some(up) = &upstream {
+                    if let Some(newer) = up.facts.and_then(Facts::version).filter(|v| is_newer(v, tag)) {
+                        attention.push(format!("{} hat {newer}, hier ist {tag} das neueste Release: Export oder Workflow in {} prüfen", up.repo, up.repo));
+                    }
+                }
                 for product in &target.products {
                     if is_newer(tag, &product.documented) {
                         let text = format!("Website beschreibt {} {}, neuestes Release {tag}", product.name, product.documented);
@@ -628,7 +664,12 @@ pub fn health(target: &RepoTarget, facts: Option<&Facts>, details: Option<&Detai
                     }
                 }
             }
-            Fetch::Ok(None) => {}
+            Fetch::Ok(None) => {
+                if let Some(newer) = upstream.as_ref().and_then(|up| up.facts).and_then(Facts::version) {
+                    let up = upstream.as_ref().expect("checked").repo;
+                    attention.push(format!("{up} hat {newer}, hier gibt es noch kein Release: Export oder Workflow in {up} prüfen"));
+                }
+            }
             Fetch::Failed(why) => notes.push(format!("Release nicht abfragbar: {why}")),
             Fetch::NotQueried(_) => {}
         }
@@ -827,6 +868,33 @@ mod tests {
         facts.tag = Fetch::NotQueried(String::new());
         facts.since = Fetch::Ok(Since { base_kind: "release", base: "1.0.0".into(), commits: 0 });
         facts
+    }
+
+    #[test]
+    fn a_version_the_upstream_has_and_the_export_not_is_half_a_release() {
+        let mut config = managed(&["o/ee", "o/core"]);
+        config.repositories[1].released_by = "o/ee".into();
+        let core = targets(&config, None, None).remove(1);
+        assert_eq!(core.released_by.as_deref(), Some("o/ee"));
+        let mut ee = clean(1000);
+        ee.release = Fetch::Ok(None);
+        ee.tag = Fetch::Ok(Some("v1.7.11".into()));
+        let mut exported = clean(1000);
+        exported.release = Fetch::Ok(Some("v1.7.10".into()));
+        let up = || Some(Upstream { repo: "o/ee", facts: Some(&ee) });
+        let mut old_release = clean(1000);
+        old_release.release = Fetch::Ok(Some("v1.0.0".into()));
+        old_release.tag = Fetch::Ok(Some("v1.7.11".into()));
+        assert_eq!(old_release.version(), Some("v1.7.11"), "a newer tag without a release counts");
+        let h = health_with(&core, Some(&exported), None, up(), 1000);
+        assert_eq!(h.state, HealthState::NeedsAttention);
+        assert!(h.reasons[0].contains("o/ee hat v1.7.11") && h.reasons[0].contains("v1.7.10"), "{:?}", h.reasons);
+
+        exported.release = Fetch::Ok(Some("v1.7.11".into()));
+        assert_eq!(health_with(&core, Some(&exported), None, up(), 1000).state, HealthState::Healthy, "arrived");
+        exported.release = Fetch::Ok(None);
+        assert!(health_with(&core, Some(&exported), None, up(), 1000).reasons[0].contains("noch kein Release"));
+        assert_eq!(health_with(&core, Some(&clean(1000)), None, Some(Upstream { repo: "o/ee", facts: None }), 1000).state, HealthState::Healthy, "unread upstream: no claim");
     }
 
     fn pr(number: u64, dependabot: bool) -> PrBrief {

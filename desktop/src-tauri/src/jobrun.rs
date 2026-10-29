@@ -83,6 +83,7 @@ pub fn pass(ctx: &Ctx, id: &str) -> Result<(Status, String)> {
             StepKind::Care if approved => care_run(ctx, &mut job, i),
             StepKind::Care => care_scan(ctx, &mut job, i),
             StepKind::Release => release(ctx, &mut job, i),
+            StepKind::Follow => follow(ctx, &mut job, i),
             StepKind::Docs | StepKind::Wiki if approved => content_publish(ctx, &mut job, i),
             StepKind::Docs | StepKind::Wiki => content_prepare(ctx, &mut job, i),
             StepKind::Website if approved => website_publish(ctx, &mut job, i),
@@ -217,7 +218,7 @@ fn resolve_interrupted(ctx: &Ctx, job: &mut Job) -> Result<()> {
                 }
             }
             // An upload compares with what is on the server; doing it again is safe.
-            StepKind::Website | StepKind::Care => job.steps[i].writing = None,
+            StepKind::Website | StepKind::Care | StepKind::Follow => job.steps[i].writing = None,
         }
     }
     Ok(())
@@ -290,10 +291,11 @@ fn care_scan(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
                 ctx.log(kind, format!("  {} {}: {what} – {}{proof}", repocare::request_ref(&plan.repo, pr.number), pr.title, pr.reason));
             }
         }
-        repocare::finish(plan, options.cleanup, options.release.then_some(options.bump));
+        let bump = options.bump_for(&plan.key);
+        repocare::finish(plan, options.cleanup, options.release.then_some(bump));
         if options.release {
             match (&plan.tag, &plan.tag_note) {
-                (Some(tag), _) => ctx.ok(format!("  Tag {tag} geplant ({} nach {})", options.bump.name(), plan.last_tag.as_deref().unwrap_or("?"))),
+                (Some(tag), _) => ctx.ok(format!("  Tag {tag} geplant ({} nach {})", bump.name(), plan.last_tag.as_deref().unwrap_or("?"))),
                 (None, Some(note)) => ctx.info(format!("  kein Tag: {note}")),
                 _ => {}
             }
@@ -754,6 +756,48 @@ fn release(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
     Ok(())
 }
 
+/// The release that the upstream's tag publishes in this repository (its `released_by`), e.g. by
+/// exporting to it: waited for, never written. Without a new tag upstream there is nothing to wait for.
+fn follow(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
+    let key = job.steps[i].subject.clone();
+    let config = ctx.config();
+    let Some(managed) = config.repository(&key).cloned() else {
+        job.steps[i].set(StepState::Failed, "wird nicht mehr verwaltet", now());
+        return Ok(());
+    };
+    let Some(upstream) = job.steps[i].after.iter().filter_map(|id| job.step(id)).find(|s| s.kind == StepKind::Release).cloned() else {
+        job.steps[i].set(StepState::Failed, "Release-Schritt der Quelle fehlt", now());
+        return Ok(());
+    };
+    let source = config.repository(&upstream.subject).map_or(upstream.subject.clone(), |r| r.repo.clone());
+    if managed.released_by_key().as_deref() != Some(upstream.subject.as_str()) {
+        job.steps[i].set(StepState::Blocked, format!("wird nicht mehr durch {source} veröffentlicht; Auftrag neu anlegen"), now());
+        return Ok(());
+    }
+    let (Some(tag), Some(commit)) = (upstream.tag.clone(), upstream.commit.clone()) else {
+        job.steps[i].set(StepState::NothingToDo, format!("kein neuer Tag in {source}, also kein neues Release hier"), now());
+        return Ok(());
+    };
+    let progress = |text: &str| ctx.info(format!("  {}: {text}", managed.repo));
+    match repocare::wait_for_follow_release(&managed.repo, &tag, &source, &commit, &ctx.runner, &CiWait::default(), &progress)? {
+        ReleaseWait::Published { url } => {
+            ctx.ok(format!("  {}: Release {tag} veröffentlicht", managed.repo));
+            let step = &mut job.steps[i];
+            step.links.push(Link { label: format!("Release {tag}"), url });
+            step.tag = Some(tag.clone());
+            step.set(StepState::Done, format!("Release {tag} aus {source} veröffentlicht"), now());
+        }
+        ReleaseWait::Failed(why) => job.steps[i].set(StepState::Failed, why, now()),
+        ReleaseWait::WorkflowFailed(why) => job.steps[i].set(
+            StepState::Blocked,
+            format!("{source} {tag} ist hier nicht angekommen: {why}. Ursache in {source} beheben; ein Tag wird nicht verschoben, es braucht eine neue Version"),
+            now(),
+        ),
+        ReleaseWait::Pending(why) => job.steps[i].set(StepState::Waiting, format!("{why}; Workflows in {source} und hier prüfen, dann erneut prüfen"), now()),
+    }
+    Ok(())
+}
+
 /// Notes what became of the planned tag in the care plan's tag item.
 fn mark_tag(job: &mut Job, key: &str, outcome: ItemOutcome, text: &str) {
     if let Some(item) = job.items.iter_mut().find(|it| it.kind == ItemKind::Tag && it.repo == key) {
@@ -925,7 +969,7 @@ fn release_readers(job: &Job, i: usize) -> Vec<String> {
 fn unreleased_tags(ctx: &Ctx, job: &Job, i: usize) -> Result<Vec<String>> {
     let config = ctx.config();
     let mut missing = Vec::new();
-    for step in job.steps[i].after.iter().filter_map(|id| job.step(id)).filter(|s| s.kind == StepKind::Release) {
+    for step in job.steps[i].after.iter().filter_map(|id| job.step(id)).filter(|s| matches!(s.kind, StepKind::Release | StepKind::Follow)) {
         let (Some(tag), Some(managed)) = (&step.tag, config.repository(&step.subject)) else { continue };
         if !github::has_published_release(&managed.repo, tag)? {
             missing.push(format!("{} {tag}", managed.repo));

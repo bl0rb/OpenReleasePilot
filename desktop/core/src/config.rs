@@ -92,6 +92,11 @@ pub struct ManagedRepo {
     /// How the repository releases; `None` = no automatic tag (never guessed).
     #[serde(default)]
     pub release: Option<ReleaseRule>,
+    /// Key of the managed repository whose release publishes this one (e.g. a public repository
+    /// that a private one exports to with the same tag); empty = none. Such a repository has no
+    /// release rule of its own: the app never tags it, it waits for its release.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub released_by: String,
 }
 
 fn yes() -> bool {
@@ -100,12 +105,18 @@ fn yes() -> bool {
 
 impl ManagedRepo {
     pub fn new(repo: &str) -> Self {
-        Self { repo: repo.trim().to_owned(), github_id: None, enabled: true, local_path: String::new(), release: None }
+        Self { repo: repo.trim().to_owned(), github_id: None, enabled: true, local_path: String::new(), release: None, released_by: String::new() }
     }
 
     /// The identity: `owner/name` in lower case.
     pub fn key(&self) -> String {
         self.repo.trim().to_lowercase()
+    }
+
+    /// The key of the repository whose release publishes this one, in lower case like `key`.
+    pub fn released_by_key(&self) -> Option<String> {
+        let key = self.released_by.trim().to_lowercase();
+        (!key.is_empty()).then_some(key)
     }
 }
 
@@ -175,6 +186,46 @@ impl Config {
     pub fn repository(&self, key: &str) -> Option<&ManagedRepo> {
         let key = key.trim().to_lowercase();
         self.repositories.iter().find(|r| r.key() == key)
+    }
+
+    /// The managed repositories whose release `upstream` publishes, in the order they were added.
+    pub fn released_through(&self, upstream: &str) -> Vec<&ManagedRepo> {
+        let upstream = upstream.trim().to_lowercase();
+        self.repositories.iter().filter(|r| r.released_by_key().as_deref() == Some(upstream.as_str())).collect()
+    }
+
+    /// Why `key` cannot be released by `upstream` with the release rule `release`; `None` when it
+    /// can. One step only: the upstream tags itself, and nothing waits for itself.
+    pub fn released_by_problem(&self, key: &str, upstream: &str, release: Option<&ReleaseRule>) -> Option<String> {
+        let (key, upstream) = (key.trim().to_lowercase(), upstream.trim().to_lowercase());
+        if upstream.is_empty() {
+            return None;
+        }
+        if upstream == key {
+            return Some("ein Repository kann nicht durch sich selbst veröffentlicht werden".into());
+        }
+        if release.is_some() {
+            return Some("mit eigener Release-Regel taggt die App selbst; Release-Regel abwählen".into());
+        }
+        let Some(source) = self.repository(&upstream) else {
+            return Some(format!("{upstream} wird nicht verwaltet"));
+        };
+        if crate::gitlab::project(&source.repo).is_some() || crate::gitlab::project(&key).is_some() {
+            return Some("gibt es nur auf GitHub".into());
+        }
+        if !source.enabled {
+            return Some(format!("{} ist abgeschaltet; ohne Tag dort kommt hier nichts an", source.repo));
+        }
+        if source.release.is_none() {
+            return Some(format!("{} hat keine Release-Regel; ohne Tag dort kommt hier nichts an", source.repo));
+        }
+        if source.released_by_key().is_some() {
+            return Some(format!("{} wird selbst durch {} veröffentlicht; nur eine Stufe", source.repo, source.released_by));
+        }
+        if let Some(other) = self.released_through(&key).first() {
+            return Some(format!("{} wird schon durch dieses Repository veröffentlicht; nur eine Stufe", other.repo));
+        }
+        None
     }
 
     /// Adds a repository unless it is managed already (same `owner/name` or same GitHub id);
@@ -291,5 +342,31 @@ mod tests {
         let back: Config = serde_json::from_value(json).unwrap();
         assert!(back.github_token_saved && back.github_token_storage == Storage::App);
         assert_eq!(back.gitlab_instances, config.gitlab_instances);
+    }
+
+    #[test]
+    fn a_repository_is_released_by_one_other_with_a_release_rule() {
+        let rule = || Some(ReleaseRule { tag_prefix: "v".into(), publishes_release: false });
+        let mut config = Config::default();
+        config.add_repository(ManagedRepo { release: rule(), ..ManagedRepo::new("o/ee") });
+        config.add_repository(ManagedRepo::new("o/core"));
+        config.add_repository(ManagedRepo::new("o/plain"));
+        config.add_repository(ManagedRepo { release: rule(), enabled: false, ..ManagedRepo::new("o/off") });
+        config.add_repository(ManagedRepo { release: rule(), ..ManagedRepo::new("gitlab.example.com/g/lab") });
+        assert!(config.released_by_problem("o/core", "o/off", None).unwrap().contains("abgeschaltet"));
+        assert!(config.released_by_problem("o/core", "gitlab.example.com/g/lab", None).unwrap().contains("nur auf GitHub"));
+        assert_eq!(config.released_by_problem("o/core", "O/EE", None), None);
+        assert_eq!(config.released_by_problem("o/core", "", rule().as_ref()), None, "none at all is always fine");
+        assert!(config.released_by_problem("o/core", "o/core", None).unwrap().contains("durch sich selbst"));
+        assert!(config.released_by_problem("o/core", "o/ee", rule().as_ref()).unwrap().contains("eigener Release-Regel"));
+        assert!(config.released_by_problem("o/core", "o/plain", None).unwrap().contains("keine Release-Regel"));
+        assert!(config.released_by_problem("o/core", "o/gone", None).unwrap().contains("nicht verwaltet"));
+        config.repositories[1].released_by = "O/EE".into();
+        assert_eq!(config.released_through("o/ee").iter().map(|r| r.repo.as_str()).collect::<Vec<_>>(), ["o/core"]);
+        config.repositories[2].release = rule();
+        assert!(config.released_by_problem("o/plain", "o/core", None).unwrap().contains("keine Release-Regel"), "o/core never tags itself");
+        assert!(config.released_by_problem("o/ee", "o/plain", None).unwrap().contains("nur eine Stufe"), "o/ee releases o/core");
+        let json = serde_json::to_value(&config.repositories[2]).unwrap();
+        assert!(json.get("releasedBy").is_none(), "older versions read the file unchanged");
     }
 }
