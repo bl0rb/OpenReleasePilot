@@ -148,24 +148,26 @@ fn resolve_scheme(own: Option<&str>, glab: Option<&str>) -> String {
 
 /// Checks a token against `GET /user` of the instance before it is stored; returns the user name.
 pub fn validate_token(host: &str, scheme: &str, token: &str) -> Result<String> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
-    let url = format!("{scheme}://{host}/api/v4/user");
-    match agent.get(&url).set("User-Agent", "OpenReleasePilot").set("Authorization", &format!("Bearer {token}")).call() {
-        Ok(response) => {
-            let json: Value = serde_json::from_reader(response.into_reader()).with_context(|| format!("Antwort von GitLab {host} unlesbar"))?;
+    let request = ureq::http::Request::builder()
+        .method("GET")
+        .uri(format!("{scheme}://{host}/api/v4/user"))
+        .header("User-Agent", "OpenReleasePilot")
+        .header("Authorization", format!("Bearer {token}"));
+    let response = crate::github::run(request, None).map_err(|e| anyhow::anyhow!("GitLab {host} nicht erreichbar: {e}"))?;
+    match response.status().as_u16() {
+        401 => bail!("Token abgelehnt"),
+        code if code >= 400 => bail!("GitLab {host} antwortet mit HTTP {code}"),
+        _ => {
+            let json: Value = serde_json::from_reader(response.into_body().into_reader()).with_context(|| format!("Antwort von GitLab {host} unlesbar"))?;
             json["username"].as_str().map(str::to_owned).with_context(|| format!("Antwort von GitLab {host} ohne Benutzernamen"))
         }
-        Err(ureq::Error::Status(401, _)) => bail!("Token abgelehnt"),
-        Err(ureq::Error::Status(code, _)) => bail!("GitLab {host} antwortet mit HTTP {code}"),
-        Err(e) => bail!("GitLab {host} nicht erreichbar: {e}"),
     }
 }
 
-fn request(host: &str, method: &str, path: &str) -> ureq::Request {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
-    let mut request = agent.request(method, &format!("{}://{host}/api/v4/{path}", scheme(host))).set("User-Agent", "OpenReleasePilot");
+fn request(host: &str, method: &str, path: &str) -> ureq::http::request::Builder {
+    let mut request = ureq::http::Request::builder().method(method).uri(format!("{}://{host}/api/v4/{path}", scheme(host))).header("User-Agent", "OpenReleasePilot");
     if let Some(token) = token(host) {
-        request = request.set("Authorization", &format!("Bearer {token}"));
+        request = request.header("Authorization", format!("Bearer {token}"));
     }
     request
 }
@@ -176,18 +178,19 @@ pub(crate) fn get(host: &str, path: &str) -> Result<Option<Value>> {
     if let Some(answer) = crate::github::mock::get(&mock::key(host, path)) {
         return answer;
     }
-    let response = match request(host, "GET", path).call() {
-        Ok(response) => response,
-        Err(ureq::Error::Status(404, _)) => return Ok(None),
-        Err(ureq::Error::Status(401, _)) => bail!("GitLab {host}: Anmeldung fehlt oder ist abgelaufen ({})", login_hint(host)),
-        Err(ureq::Error::Status(429, _)) => bail!("GitLab {host}: Limit erreicht, später erneut versuchen"),
-        Err(ureq::Error::Status(403, response)) => {
-            let reason = serde_json::from_str(&response.into_string().unwrap_or_default()).map(|json| message(&json)).unwrap_or_default();
+    let response = crate::github::run(request(host, "GET", path), None).with_context(|| format!("GitLab {host} nicht erreichbar"))?;
+    match response.status().as_u16() {
+        404 => return Ok(None),
+        401 => bail!("GitLab {host}: Anmeldung fehlt oder ist abgelaufen ({})", login_hint(host)),
+        429 => bail!("GitLab {host}: Limit erreicht, später erneut versuchen"),
+        403 => {
+            let reason = serde_json::from_str(&response.into_body().read_to_string().unwrap_or_default()).map(|json| message(&json)).unwrap_or_default();
             return Err(crate::github::Forbidden(reason).into());
         }
-        Err(e) => return Err(e).with_context(|| format!("GitLab {host} nicht erreichbar")),
-    };
-    Ok(Some(serde_json::from_reader(response.into_reader()).with_context(|| format!("Antwort von GitLab {host} unlesbar"))?))
+        code if code >= 400 => return Err(ureq::Error::StatusCode(code)).with_context(|| format!("GitLab {host} nicht erreichbar")),
+        _ => {}
+    }
+    Ok(Some(serde_json::from_reader(response.into_body().into_reader()).with_context(|| format!("Antwort von GitLab {host} unlesbar"))?))
 }
 
 /// GET of a plain-text answer (a raw file); `Ok(None)` for 404.
@@ -196,12 +199,13 @@ pub(crate) fn get_text(host: &str, path: &str) -> Result<Option<String>> {
     if let Some(answer) = crate::github::mock::get(&mock::key(host, path)) {
         return answer.map(|body| body.map(|v| v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())));
     }
-    match request(host, "GET", path).call() {
-        Ok(response) => Ok(Some(response.into_string().with_context(|| format!("Antwort von GitLab {host} unlesbar"))?)),
-        Err(ureq::Error::Status(404, _)) => Ok(None),
-        Err(ureq::Error::Status(401, _)) => bail!("GitLab {host}: Anmeldung fehlt oder ist abgelaufen ({})", login_hint(host)),
-        Err(ureq::Error::Status(403, _)) => bail!("GitLab {host}: Zugriff verweigert"),
-        Err(e) => Err(e).with_context(|| format!("GitLab {host} nicht erreichbar")),
+    let response = crate::github::run(request(host, "GET", path), None).with_context(|| format!("GitLab {host} nicht erreichbar"))?;
+    match response.status().as_u16() {
+        404 => Ok(None),
+        401 => bail!("GitLab {host}: Anmeldung fehlt oder ist abgelaufen ({})", login_hint(host)),
+        403 => bail!("GitLab {host}: Zugriff verweigert"),
+        code if code >= 400 => Err(ureq::Error::StatusCode(code)).with_context(|| format!("GitLab {host} nicht erreichbar")),
+        _ => Ok(Some(response.into_body().read_to_string().with_context(|| format!("Antwort von GitLab {host} unlesbar"))?)),
     }
 }
 
@@ -232,15 +236,12 @@ pub(crate) fn send(host: &str, method: &str, path: &str, body: Option<&Value>) -
     }
     let request = request(host, method, path);
     let result = match body {
-        Some(body) => request.set("Content-Type", "application/json").send_string(&body.to_string()),
-        None => request.call(),
+        Some(body) => crate::github::run(request.header("Content-Type", "application/json"), Some(body.to_string())),
+        None => crate::github::run(request, None),
     };
-    let response = match result {
-        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
-        Err(e) => return Err(e).with_context(|| format!("GitLab {host} nicht erreichbar")),
-    };
-    let status = response.status();
-    let text = response.into_string().unwrap_or_default();
+    let response = result.with_context(|| format!("GitLab {host} nicht erreichbar"))?;
+    let status = response.status().as_u16();
+    let text = response.into_body().read_to_string().unwrap_or_default();
     Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
 }
 
