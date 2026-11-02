@@ -12,7 +12,8 @@ use openreleasepilot_core::jobs::{self, CareItem, ItemKind, ItemOutcome, Job, Jo
 use openreleasepilot_core::repocare::{self, Action, CiWait, Done, Plan, PlanSet, ReleaseWait, RunState};
 use openreleasepilot_core::repos::{self, RepoTarget};
 use openreleasepilot_core::forge::Forge;
-use openreleasepilot_core::{github, proof, release, repair, shell};
+use openreleasepilot_core::memory::{NewNote, NoteKind};
+use openreleasepilot_core::{catalog, github, proof, release, repair, shell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +48,63 @@ fn claude_settings(ctx: &Ctx, chosen: &[&str]) -> (Option<String>, Option<String
     (model, None, config.max_budget_usd)
 }
 
+/// The profile's hints and the memory of a repository, for a Claude prompt (material, see `memory`).
+fn repo_context(ctx: &Ctx, key: &str) -> String {
+    with_model(&ctx.app, |m| claude::repo_context(m.profiles.get(key), &m.memories.get(key).cloned().unwrap_or_default()))
+}
+
+/// Claude's judgement of each pull request it judged, for the memory.
+fn verdict_notes(plan: &Plan) -> Vec<NewNote> {
+    plan.prs
+        .iter()
+        .filter(|pr| pr.reviewed)
+        .map(|pr| {
+            let what = match pr.action {
+                Action::Merge => "mergen",
+                Action::Close => "schließen",
+                Action::Rebase => "Rebase anstoßen",
+                Action::Keep => "offen lassen",
+            };
+            let risk = pr.risk.as_deref().map(|r| format!(" ({r})")).unwrap_or_default();
+            NewNote::new(NoteKind::Verdict, format!("{} {}", repocare::request_ref(&plan.repo, pr.number), pr.title), format!("{what}{risk}: {}", pr.reason))
+        })
+        .collect()
+}
+
+/// What of a repository's care items failed, stopped or was left out, for the memory.
+fn item_notes(job: &Job, key: &str) -> Vec<NewNote> {
+    job.items
+        .iter()
+        .filter(|item| item.repo == key)
+        .filter_map(|item| {
+            let kind = match item.outcome? {
+                ItemOutcome::Failed | ItemOutcome::Skipped => NoteKind::Failure,
+                ItemOutcome::Excluded => NoteKind::Skipped,
+                _ => return None,
+            };
+            let text = if item.outcome == Some(ItemOutcome::Excluded) { "von dir ausgelassen".to_owned() } else { item.detail.clone() };
+            Some(NewNote::new(kind, &item.label, text))
+        })
+        .collect()
+}
+
+/// A step that failed or got stuck goes into the memory of its repositories.
+fn remember_step(ctx: &Ctx, job: &Job, i: usize) {
+    let step = &job.steps[i];
+    if !matches!(step.state, StepState::Failed | StepState::Blocked) {
+        return;
+    }
+    let keys: Vec<String> = match step.kind {
+        StepKind::Release | StepKind::Follow | StepKind::Task => vec![step.subject.clone()],
+        StepKind::Docs | StepKind::Wiki => ctx.config().content_target(&step.subject).map(|t| t.repo.to_lowercase()).into_iter().collect(),
+        StepKind::Care => job.repos.clone(),
+        StepKind::Website => Vec::new(),
+    };
+    for key in keys {
+        crate::remember(&ctx.app, &key, &job.id, &[NewNote::new(NoteKind::Failure, &step.label, &step.detail)]);
+    }
+}
+
 pub fn pass(ctx: &Ctx, id: &str) -> Result<(Status, String)> {
     let mut job = with_model(&ctx.app, |m| m.jobs.iter().find(|j| j.id == id).cloned()).ok_or_else(|| anyhow!("Auftrag {id} nicht gefunden"))?;
     if job.ended.is_some() {
@@ -76,6 +134,8 @@ pub fn pass(ctx: &Ctx, id: &str) -> Result<(Status, String)> {
             StepKind::Follow => follow(ctx, &mut job, i),
             StepKind::Docs | StepKind::Wiki if approved => content_publish(ctx, &mut job, i),
             StepKind::Docs | StepKind::Wiki => content_prepare(ctx, &mut job, i),
+            StepKind::Task if approved => task_publish(ctx, &mut job, i),
+            StepKind::Task => task_prepare(ctx, &mut job, i),
             StepKind::Website => {
                 job.steps[i].set(StepState::Skipped, jobs::WEBSITE_MOVED, now());
                 Ok(())
@@ -97,6 +157,7 @@ pub fn pass(ctx: &Ctx, id: &str) -> Result<(Status, String)> {
             job.steps[i].set(StepState::Failed, "ohne Ergebnis beendet", now());
         }
         save(ctx, &mut job)?;
+        remember_step(ctx, &job, i);
     }
     if ctx.runner.is_cancelled() {
         jobs::end(&mut job, "abgebrochen", now());
@@ -209,8 +270,9 @@ fn resolve_interrupted(ctx: &Ctx, job: &mut Job) -> Result<()> {
                     }
                 }
             }
-            // An upload compares with what is on the server; doing it again is safe.
-            StepKind::Website | StepKind::Care | StepKind::Follow => job.steps[i].writing = None,
+            // An upload compares with what is on the server; doing it again is safe. A task's pull
+            // request is found again from its branch.
+            StepKind::Website | StepKind::Care | StepKind::Follow | StepKind::Task => job.steps[i].writing = None,
         }
     }
     Ok(())
@@ -268,10 +330,12 @@ fn care_scan(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
                         ctx.warn(format!("  {hint}"));
                     }
                     plan.review_note = Some(format!("Claude-Prüfung fehlgeschlagen ({why}); alle PRs bleiben offen und unbewertet."));
-                    plan.review_error = Some(why);
+                    plan.review_error = Some(why.clone());
                     repocare::apply_review(plan, &[]);
+                    crate::remember(&ctx.app, &plan.key, &job.id, &[NewNote::new(NoteKind::Failure, "Claude-Prüfung", why)]);
                 }
             }
+            crate::remember(&ctx.app, &plan.key, &job.id, &verdict_notes(plan));
             for pr in &plan.prs {
                 let (kind, what) = match pr.action {
                     Action::Merge => ("ok", "mergen"),
@@ -430,7 +494,7 @@ fn review(ctx: &Ctx, plan: &mut Plan, model: Option<&str>, effort: Option<&str>,
             dir
         }
     };
-    let prompt = claude::review_prompt(plan, proofs.as_ref());
+    let prompt = claude::review_prompt(plan, proofs.as_ref(), &repo_context(ctx, &plan.key));
     let forge = Forge::of(&plan.repo);
     let args = claude::review_args(&prompt, model, effort, budget, matches!(forge, Forge::Gitlab { .. }), proofs.as_ref());
     let how = if proofs.is_some() { "mit Nachweisen in der Sandbox" } else { "nur lesend" };
@@ -557,6 +621,9 @@ fn care_run(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
         job.steps[i].set(StepState::Cancelled, "abgebrochen; Erledigtes bleibt", now());
         return Ok(());
     }
+    for key in &job.repos {
+        crate::remember(&ctx.app, key, &job.id, &item_notes(job, key));
+    }
     let (mut state, mut summary) = jobs::care_result(&job.items);
     // Carried out what was planned, but pull requests Claude could not judge are still open work.
     if let Some((names, _)) = unreviewed(&set_plans(job)) {
@@ -603,7 +670,7 @@ fn repair_item(ctx: &Ctx, plan: &Plan, item: &CareItem, chosen_model: &str) -> R
         return Ok(Done::Skipped(format!("keine Wegwerf-Kopie: {why}")));
     };
     let (model, effort, budget) = claude_settings(ctx, &[chosen_model]);
-    let prompt = claude::repair_prompt(plan, pr, &dir, &proofs);
+    let prompt = claude::repair_prompt(plan, pr, &dir, &proofs, &repo_context(ctx, &plan.key));
     let args = claude::repair_args(&prompt, model.as_deref(), effort.as_deref(), budget, matches!(Forge::of(&plan.repo), Forge::Gitlab { .. }), &proofs);
     ctx.cmd(format!("  $ claude -p … --model {} (passt den Code für {} an, in der Sandbox)", model.as_deref().unwrap_or("Standard"), item.label));
     let mut outcome = None;
@@ -644,6 +711,71 @@ struct RepairAnswer {
     summary: String,
     #[serde(default)]
     proof: String,
+}
+
+// MARK: Catalog tasks
+
+/// A task of the catalog: the default branch cloned into the job's work folder, profiled anew and
+/// the task's file written there; ends with a proposal to approve, or nothing to do.
+fn task_prepare(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
+    let key = job.steps[i].subject.clone();
+    let task = jobs::task_of(&job.steps[i]).to_owned();
+    let Some(managed) = ctx.config().repository(&key).cloned() else {
+        job.steps[i].set(StepState::Failed, "wird nicht mehr verwaltet", now());
+        return Ok(());
+    };
+    ctx.info(format!("  {} vorbereiten (Arbeitsordner der App, nicht deine lokale Kopie) …", job.steps[i].label));
+    match catalog::prepare(&job.id, &key, &managed.repo, &task, now())? {
+        catalog::Prepared::Nothing(why) => {
+            ctx.info(format!("  {why}"));
+            job.steps[i].set(StepState::NothingToDo, why, now());
+        }
+        catalog::Prepared::Proposal(proposal) => {
+            for check in &proposal.checks {
+                ctx.log(if check.ok { "ok" } else { "warn" }, format!("  Prüfung {}: {}", check.name, check.detail));
+            }
+            let failed: Vec<String> = proposal.checks.iter().filter(|c| !c.ok).map(|c| format!("{}: {}", c.name, c.detail)).collect();
+            let files: Vec<String> = proposal.files.iter().map(|f| f.path.clone()).collect();
+            let step = &mut job.steps[i];
+            step.content = Some(*proposal);
+            if failed.is_empty() {
+                step.set(StepState::NeedsApproval, format!("{} vorbereitet; Freigabe nötig", files.join(", ")), now());
+            } else {
+                step.set(StepState::Failed, format!("Prüfung nicht bestanden: {}", failed.join("; ")), now());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Opens the task's pull request with exactly the approved proposal; the app does not merge it.
+fn task_publish(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
+    let key = job.steps[i].subject.clone();
+    let task = jobs::task_of(&job.steps[i]).to_owned();
+    let proposal = job.steps[i].content.clone().context("Kein Vorschlag vorhanden")?;
+    if job.steps[i].approved.as_deref() != Some(proposal.fingerprint.as_str()) || !proposal.intact() {
+        job.steps[i].set(StepState::Blocked, "Die Freigabe passt nicht zum Vorschlag; neu vorbereiten", now());
+        return Ok(());
+    }
+    let Some(managed) = ctx.config().repository(&key).cloned() else {
+        job.steps[i].set(StepState::Failed, "wird nicht mehr verwaltet", now());
+        return Ok(());
+    };
+    let word = Forge::of(&managed.repo).request();
+    ctx.info(format!("  Branch {} und {word} anlegen …", proposal.branch));
+    job.steps[i].writing = Some(word.to_owned());
+    save(ctx, job)?;
+    let result = catalog::publish(&job.id, &key, &managed.repo, &task, &proposal);
+    job.steps[i].writing = None;
+    let pr = result?;
+    let r = repocare::request_ref(&managed.repo, pr.number);
+    ctx.ok(format!("  {r} erstellt: {}", pr.url));
+    let step = &mut job.steps[i];
+    step.pr = Some(pr.number);
+    step.commit = Some(pr.commit);
+    step.links.push(Link { label: r.clone(), url: pr.url });
+    step.set(StepState::Done, format!("{r} erstellt; mergen tust du"), now());
+    Ok(())
 }
 
 // MARK: Release

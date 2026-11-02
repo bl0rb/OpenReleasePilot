@@ -15,8 +15,12 @@
 //! - `repair`: an update that needs the code adapted gets a repair pull request of its own
 //! - `release`: before a tag, a release pull request with the version files and the CHANGELOG
 //! - `content`: README/documentation and wiki targets: work folder, checks, proposal, publishing
+//! - `profile`: what is in a repository (stack, CI, update bot, tests, CHANGELOG), from its clone, without Claude
+//! - `memory`: what earlier jobs found and decided per repository, as material for Claude's prompts
+//! - `catalog`: the tasks offered per repository from its profile, each with an autonomy level
 //! - `jobs`: care jobs with their steps, approvals and results, stored so they survive a restart
 
+pub mod catalog;
 pub mod claude;
 pub mod config;
 pub mod content;
@@ -27,7 +31,9 @@ pub mod gitlab;
 pub mod jobs;
 pub mod localrepo;
 pub mod manifest;
+pub mod memory;
 pub mod paths;
+pub mod profile;
 pub mod proof;
 pub mod release;
 pub mod repair;

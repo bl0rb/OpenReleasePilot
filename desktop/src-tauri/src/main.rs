@@ -12,7 +12,9 @@ use openreleasepilot_core::content::{self, ContentTarget, TargetState};
 use openreleasepilot_core::jobs::{self, Job, JobOptions};
 use openreleasepilot_core::update::{self, ReleaseInfo};
 use openreleasepilot_core::forge::{self, Forge};
-use openreleasepilot_core::{github, gitlab, localrepo, repos, security, site};
+use openreleasepilot_core::memory::{self, Memory, NewNote, NoteKind};
+use openreleasepilot_core::profile::{self, Profile};
+use openreleasepilot_core::{catalog, github, gitlab, localrepo, repos, security, site};
 use openreleasepilot_core::paths::{self, abbreviate_home, expand_home};
 use openreleasepilot_core::tokens;
 use openreleasepilot_core::shell::Runner;
@@ -102,6 +104,9 @@ pub struct Model {
     pub jobs_unreadable: Vec<String>,
     /// Content target id → what it was last brought to.
     pub content_states: BTreeMap<String, TargetState>,
+    /// Repository key → its profile and its memory, both from the data folder (see `profile`, `memory`).
+    pub profiles: BTreeMap<String, Profile>,
+    pub memories: BTreeMap<String, Memory>,
     /// Newer version of the app itself, found by the update check.
     pub available_update: Option<ReleaseInfo>,
     pub checking_update: bool,
@@ -121,6 +126,9 @@ impl Model {
             }
         }
         jobs::prune(&mut jobs);
+        let keys: Vec<String> = config.repositories.iter().map(|r| r.key()).collect();
+        let profiles = keys.iter().filter_map(|k| profile::load(k).map(|p| (k.clone(), p))).collect();
+        let memories = keys.iter().map(|k| (k.clone(), memory::load(k))).filter(|(_, m)| !m.notes.is_empty()).collect();
         Self {
             config,
             steps: BTreeMap::from([(Step::Jobs, StepState::default())]),
@@ -131,6 +139,8 @@ impl Model {
             job_running: None,
             jobs_unreadable,
             content_states: content::load_states(),
+            profiles,
+            memories,
             available_update: None,
             checking_update: false,
             installing_update: false,
@@ -296,6 +306,12 @@ struct RepoView {
     job: Option<JobRef>,
     /// Ids of the content targets it feeds.
     targets: Vec<String>,
+    /// What is in it, from its clone; `None` without a clone or before the first reading.
+    profile: Option<Profile>,
+    /// Notes of earlier jobs, oldest first.
+    memory: Vec<memory::Note>,
+    /// The tasks the catalog offers for it.
+    offers: Vec<catalog::Offer>,
 }
 
 #[derive(Serialize, Clone)]
@@ -421,6 +437,9 @@ fn get_view(app: AppHandle) -> View {
                         security_error: status.and_then(|s| s.security_error.clone()),
                         job: open_job(&|j| j.held().contains(&key)),
                         targets: m.config.content_targets.iter().filter(|t| t.sources.contains(&key)).map(|t| t.id.clone()).collect(),
+                        offers: catalog::offers(&target, m.profiles.get(&key), facts.as_ref()),
+                        profile: m.profiles.get(&key).cloned(),
+                        memory: m.memories.get(&key).map(|m| m.notes.clone()).unwrap_or_default(),
                         facts,
                         details,
                         target,
@@ -781,7 +800,14 @@ pub fn refresh_status(app: &AppHandle, keys: &[String]) {
                         continue;
                     }
                     let facts = repos::fetch_facts(&target, steps::now());
+                    // The clone's profile is read anew only when its commit changed; local and fast.
+                    let profile = profile::refresh(&target, steps::now());
                     with_model(&app, |m| {
+                        match profile {
+                            Ok(Some(profile)) => _ = m.profiles.insert(target.key.clone(), profile),
+                            Ok(None) => _ = m.profiles.remove(&target.key),
+                            Err(_) => {}
+                        }
                         let Some(status) = m.repo_status.get_mut(&target.key).filter(|s| s.token == token) else { return };
                         status.loading = false;
                         match &facts.access {
@@ -1137,7 +1163,8 @@ fn update_repository(app: AppHandle, key: String, settings: RepoSettings) -> Res
     })
 }
 
-/// Takes a repository out of the managed list. Deletes nothing: not on GitHub, not the clone.
+/// Takes a repository out of the managed list, with the app's own profile and memory of it.
+/// Deletes nothing else: not on GitHub, not the clone.
 #[tauri::command]
 fn remove_repository(app: AppHandle, key: String) -> Result<(), String> {
     if let Some(job) = with_model(&app, |m| held_by_job(m, &key)) {
@@ -1155,9 +1182,44 @@ fn remove_repository(app: AppHandle, key: String) -> Result<(), String> {
         config.repositories.retain(|r| r.key() != key);
         Ok(())
     })?;
-    with_model(&app, |m| m.repo_status.remove(&key));
+    with_model(&app, |m| {
+        m.repo_status.remove(&key);
+        m.profiles.remove(&key);
+        m.memories.remove(&key);
+    });
+    profile::remove(&key);
+    memory::forget_all(&key);
     changed(&app);
     Ok(())
+}
+
+/// Notes of a job pass for a repository's memory, stored and shown; a note that cannot be
+/// stored is only missing from the memory, the job goes on.
+pub fn remember(app: &AppHandle, key: &str, job: &str, notes: &[NewNote]) {
+    if notes.is_empty() {
+        return;
+    }
+    if let Ok(memory) = memory::record(key, job, steps::now(), notes) {
+        with_model(app, |m| m.memories.insert(key.to_owned(), memory));
+        changed(app);
+    }
+}
+
+/// Deletes one note of a repository's memory.
+#[tauri::command]
+fn forget_note(app: AppHandle, key: String, kind: NoteKind, subject: String, at: u64) -> Result<(), String> {
+    let memory = memory::forget(&key, kind, &subject, at).map_err(|e| format!("{e:#}"))?;
+    with_model(&app, |m| m.memories.insert(key, memory));
+    changed(&app);
+    Ok(())
+}
+
+/// Deletes the whole memory of a repository.
+#[tauri::command]
+fn forget_memory(app: AppHandle, key: String) {
+    memory::forget_all(&key);
+    with_model(&app, |m| m.memories.remove(&key));
+    changed(&app);
 }
 
 // MARK: Content targets
@@ -1222,13 +1284,13 @@ struct JobInput {
 /// Starts a care job for exactly these repositories and choices; its first pass begins at once.
 #[tauri::command]
 fn start_job(app: AppHandle, input: JobInput) -> Result<String, String> {
-    if input.options.prs || input.options.cleanup || input.options.release {
+    if input.options.prs || input.options.cleanup || input.options.release || !input.options.tasks.is_empty() {
         jobrun::require_logins(&input.repos).map_err(|e| format!("{e:#}"))?;
     }
     let mut created = String::new();
     steps::start_with(&app, |m| {
         let open: Vec<&Job> = m.jobs.iter().filter(|j| j.open()).collect();
-        let scope = jobs::Scope { config: &m.config };
+        let scope = jobs::Scope { config: &m.config, profiles: &m.profiles };
         let now = steps::now();
         let job = jobs::make(&jobs::new_id(now, next_token()), now, &input.repos, &input.options, &scope)?;
         if let Some(why) = jobs::overlap(&open, &job.held(), &job.options) {
@@ -1295,7 +1357,13 @@ fn approve_step(app: AppHandle, id: String, step: String, fingerprint: String) -
 
 #[tauri::command]
 fn reject_step(app: AppHandle, id: String, step: String) -> Result<(), String> {
-    decide(&app, &id, |job, now| jobs::reject_step(job, &step, now))
+    decide(&app, &id, |job, now| jobs::reject_step(job, &step, now))?;
+    // A rejected proposal of a repository is remembered, so the next job knows it was not wanted.
+    let rejected = with_model(&app, |m| m.jobs.iter().find(|j| j.id == id).and_then(|j| j.step(&step)).cloned());
+    if let Some(s) = rejected.filter(|s| matches!(s.kind, jobs::StepKind::Release | jobs::StepKind::Task)) {
+        remember(&app, &s.subject, &id, &[NewNote::new(NoteKind::Skipped, &s.label, "Vorschlag von dir verworfen")]);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1445,6 +1513,8 @@ fn main() {
             save_target,
             remove_target,
             start_job,
+            forget_note,
+            forget_memory,
             continue_job,
             approve_plan,
             reject_plan,

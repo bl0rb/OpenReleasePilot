@@ -1951,7 +1951,7 @@ mod tests {
     fn reviews_a_real_repository() {
         let mut plan = scan(&own_target(), true, false);
         assert!(plan.error.is_none(), "{:?}", plan.error);
-        let args = crate::claude::review_args(&crate::claude::review_prompt(&plan, None), Some("haiku"), None, Some(1.0), false, None);
+        let args = crate::claude::review_args(&crate::claude::review_prompt(&plan, None, ""), Some("haiku"), None, Some(1.0), false, None);
         let mut outcome = None;
         crate::shell::stream("claude", &args, &std::env::temp_dir(), &HashMap::new(), &Runner::default(), |line| {
             match crate::claude::parse(line) {
@@ -1990,7 +1990,7 @@ mod tests {
             assert_eq!(output("git", &["rev-parse", "HEAD"], dir).unwrap(), pr.head_sha);
         }
         if std::env::var("ORP_PROOF_CLAUDE").is_ok() {
-            let args = crate::claude::review_args(&crate::claude::review_prompt(&plan, Some(&proofs)), Some("haiku"), None, Some(1.0), false, Some(&proofs));
+            let args = crate::claude::review_args(&crate::claude::review_prompt(&plan, Some(&proofs), ""), Some("haiku"), None, Some(1.0), false, Some(&proofs));
             let mut outcome = None;
             crate::shell::stream("claude", &args, &proofs.root, &proofs.env(), &Runner::default(), |line| match crate::claude::parse(line) {
                 crate::claude::Event::Line(text) => println!("{text}"),
@@ -2032,7 +2032,7 @@ mod tests {
         let proofs = crate::proof::Proofs::prepare_only(&plan, &[number]).unwrap();
         let (_, dir) = proofs.trees.first().cloned().expect("a worktree");
         let model = std::env::var("ORP_REPAIR_MODEL").unwrap_or_else(|_| "sonnet".into());
-        let prompt = crate::claude::repair_prompt(&plan, &pr, &dir, &proofs);
+        let prompt = crate::claude::repair_prompt(&plan, &pr, &dir, &proofs, "");
         let args = crate::claude::repair_args(&prompt, Some(&model), None, Some(3.0), false, &proofs);
         let mut outcome = None;
         crate::shell::stream("claude", &args, &proofs.root, &proofs.env(), &Runner::default(), |line| match crate::claude::parse(line) {

@@ -698,6 +698,7 @@ function repoDetail(r) {
     h('section', { class: 'panel section' }, prSection(r, branch)),
     h('section', { class: 'panel section' }, contentSection(r)),
     !urgent && security,
+    fold(r.key, 'analysis', analysisSummary(r), analysisSection(r)),
     fold(r.key, 'tech', 'Technische Details', statusFacts(r, branch)),
     fold(r.key, 'manage', 'Verwaltung', manageSection(r), manageDrafts.get(r.key)?.dirty));
 }
@@ -1010,6 +1011,67 @@ function contentSection(r) {
 // Unsaved edits of the management form, per repository; a re-render (new view) keeps them.
 const manageDrafts = new Map();
 
+// MARK: Repositories: analysis and memory
+
+// How far a task of the catalog goes on its own (catalog.rs).
+const AUTONOMY = { propose: ['', 'nur vorschlagen'], approve: ['accent', 'mit Freigabe'], auto: ['green', 'automatisch'] };
+const NOTE_KIND = { verdict: ['accent', 'Bewertung'], failure: ['red', 'Fehlschlag'], skipped: ['', 'Ausgelassen'] };
+const autonomyBadge = (level) => badge(AUTONOMY[level]?.[0] ?? '', AUTONOMY[level]?.[1] ?? level, 'Wie weit die App diese Aufgabe allein ausführt');
+/** The catalog's offer `id` for a repository, if any. */
+const offerOf = (r, id) => r.offers?.find((o) => o.id === id);
+
+function analysisSummary(r) {
+  const p = r.profile;
+  const notes = r.memory.length ? ` · ${r.memory.length} ${r.memory.length === 1 ? 'Notiz' : 'Notizen'}` : '';
+  if (!p) return `Analyse und Gedächtnis${notes}`;
+  const stacks = p.stacks.map((s) => s.kind[0].toUpperCase() + s.kind.slice(1)).join(', ');
+  return `Analyse und Gedächtnis · ${stacks || 'kein Stack erkannt'}${notes}`;
+}
+
+function analysisSection(r) {
+  const p = r.profile;
+  const row = (label, value, cls = '') => [h('span', { class: 'label' }, label), h('span', { class: `detail-text selectable ${cls}` }, value)];
+  const list = (items, none) => (items.length ? items.join(', ') : none);
+  const updates = p && (p.dependabot ? `Dependabot (${p.dependabot}${p.dependabotEcosystems.length ? `: ${p.dependabotEcosystems.join(', ')}` : ''})`
+    : p.renovate ? `Renovate (${p.renovate})` : 'keine Konfiguration erkannt');
+  const facts = p
+    ? h('div', { class: 'fact-grid' },
+      row('Stand', `${short(p.commit)} (${p.rev}), gelesen ${ago(p.readAt)}`),
+      row('Stack', list(p.stacks.map((s) => `${s.kind[0].toUpperCase()}${s.kind.slice(1)} (${s.manifests.join(', ')})`), 'nichts erkannt'), p.stacks.length ? '' : 'muted'),
+      row('CI', list(p.ci, 'keine Konfiguration erkannt'), p.ci.length ? '' : 'orange'),
+      row('Abhängigkeits-Updates', updates, p.dependabot || p.renovate ? '' : 'orange'),
+      row('Tests', list(p.tests, 'keine erkannt'), p.tests.length ? '' : 'muted'),
+      row('CHANGELOG', p.changelog ?? 'keins im Wurzelordner', p.changelog ? '' : 'muted'),
+      row('Versionsdateien', list(p.versionFiles, 'keine erkannt'), p.versionFiles.length ? '' : 'muted'),
+      row('Hinweise für Agenten', list([...p.agentDocs, ...p.skills.map((s) => `Skill ${s}`)], 'keine (CLAUDE.md, AGENTS.md, .claude/skills)'), p.agentDocs.length || p.skills.length ? '' : 'muted'),
+      p.site && row('Website-Projekt', 'site.json vorhanden; veröffentlicht wird mit OpenSitePilot'))
+    : h('div', { class: 'note' }, r.local.state === 'found'
+      ? 'Noch keine Analyse: „Status aktualisieren“ liest die lokale Kopie (nur lesend, ohne Claude, ohne Netz).'
+      : 'Keine Analyse: sie liest die lokale Kopie, und es gibt keine. Die Aufträge laufen mit den bisherigen Standardwerten.');
+  const offers = r.offers.filter((o) => o.blocked || o.autonomy === 'propose' || o.id === 'dependabot-config');
+  return [
+    h('p', { class: 'note' }, 'Liegt nur im Datenordner der App, nie im Repository. Die Analyse liest den zuletzt geholten Default-Branch der lokalen Kopie; das Gedächtnis füllen die Aufträge und geben es Claude als Material mit, nicht als Anweisung.'),
+    facts,
+    offers.length > 0 && h('div', { class: 'finding' }, h('strong', { class: 'small' }, 'Aufgaben aus der Analyse'),
+      h('div', { class: 'item-list' }, offers.map((o) => h('div', { class: 'item' },
+        h('div', { class: 'item-line' }, autonomyBadge(o.autonomy), h('strong', { class: 'item-title' }, o.title)),
+        h('div', { class: `item-reason selectable ${o.blocked ? 'orange' : ''}` }, o.blocked ?? o.why))))),
+    h('div', { class: 'finding' },
+      h('div', { class: 'item-line' }, h('strong', { class: 'small' }, `Gedächtnis (${r.memory.length})`), h('span', { class: 'spacer' }),
+        r.memory.length > 0 && button('Alles löschen …', () => confirmDialog('Gedächtnis löschen', `Alle ${r.memory.length} Notizen zu ${r.repo} löschen? Im Repository ändert sich nichts.`, 'Löschen',
+          () => act('forget_memory', { key: r.key }), { danger: true }), { cls: 'link', id: domId('memory-clear', r.key) })),
+      r.memory.length === 0
+        ? h('div', { class: 'note' }, 'Noch nichts gemerkt. Aufträge merken sich hier Claudes Bewertungen, Fehlschläge und was du ausgelassen oder verworfen hast.')
+        : h('div', { class: 'item-list' }, [...r.memory].reverse().map((n) => h('div', { class: 'item' },
+          h('div', { class: 'item-line' },
+            badge(NOTE_KIND[n.kind]?.[0] ?? '', NOTE_KIND[n.kind]?.[1] ?? n.kind), h('strong', { class: 'item-title', title: n.subject }, n.subject),
+            n.count > 1 && badge('orange', `${n.count}×`, `in ${n.count} Aufträgen`), h('span', { class: 'spacer' }),
+            h('span', { class: 'muted small' }, ago(n.at)),
+            iconButton('Notiz löschen', () => act('forget_note', { key: r.key, kind: n.kind, subject: n.subject, at: n.at }), 'trash')),
+          h('div', { class: 'item-reason selectable' }, n.text))))),
+  ].filter(Boolean);
+}
+
 function manageSection(r) {
   const saved = { enabled: r.enabled, localPath: r.local.path ?? '', release: !!r.release, prefix: r.release?.tagPrefix ?? '', publishes: r.release?.publishesRelease ?? false, releasedBy: r.releasedBy ?? '' };
   const s = manageDrafts.get(r.key) ?? { ...saved };
@@ -1285,7 +1347,7 @@ function stepBlock(job, step, running) {
   const decide = step.state === 'needsApproval';
   const open = stepOpen.get(key) ?? (decide || ['failed', 'blocked', 'partial', 'running', 'waiting'].includes(step.state) || job.steps.length === 1);
   const body = {
-    care: careBlock, release: releaseBlock, follow: followBlock, docs: contentBlock, wiki: contentBlock, website: websiteBlock,
+    care: careBlock, release: releaseBlock, follow: followBlock, docs: contentBlock, wiki: contentBlock, website: websiteBlock, task: taskBlock,
   }[step.kind](job, step, running);
   const stopped = ['failed', 'blocked'].includes(step.state) && step.detail;
   return h('details', { class: `run step-block ${decide ? 'decide' : ''}`, open, ontoggle: (e) => stepOpen.set(key, e.target.open) },
@@ -1610,6 +1672,37 @@ function contentBlock(job, step) {
   ].filter(Boolean);
 }
 
+/** A task of the catalog (e.g. a Dependabot configuration): the app's own file, shown with its diff, approved, then a pull request the user merges. */
+function taskBlock(job, step) {
+  const p = step.content;
+  const decide = step.state === 'needsApproval';
+  const word = requestWord(step.subject);
+  const redoable = ['needsApproval', 'blocked', 'failed', 'nothingToDo'].includes(step.state) && !step.pr && !step.writing;
+  const failedChecks = p?.checks.filter((c) => !c.ok) ?? [];
+  return [
+    waitsFor(job, step),
+    !p && h('div', { class: 'facts' }, h('span', null, h('strong', null, 'Repository: '), repoName(step.subject)),
+      h('span', null, h('strong', null, 'Freigabe: '), autonomyBadge('approve'))),
+    p && decisionBrief([
+      ['Repository', repoName(step.subject)],
+      ['Änderung', `${p.files.length} ${p.files.length === 1 ? 'Datei' : 'Dateien'}: ${p.files.map((f) => f.path).join(', ')}`],
+      ['Ausgangsstand', `${p.baseBranch} ${short(p.baseCommit)}`],
+      ['Prüfungen der App', failedChecks.length ? h('span', { class: 'red' }, `${failedChecks.length} von ${p.checks.length} nicht bestanden`) : `alle ${p.checks.length} bestanden`],
+      decide && ['Freigeben bewirkt', `Ein neuer Branch ${p.branch} und ein ${word} mit genau diesem Stand. Gemergt wird nicht automatisch; das tust du auf ${serviceOf(step.subject)}. Hat jemand die Datei inzwischen angelegt, stoppt die App.`],
+    ], null),
+    p && h('div', { class: 'brief-summary' }, markdown(p.summary)),
+    decide && decisionBar(
+      button(`Freigeben: ${word} erstellen`, () => act('approve_step', { id: job.id, step: step.id, fingerprint: p.fingerprint }), { cls: 'primary', iconName: 'check', disabled: !!view.running }),
+      button('Verwerfen', () => act('reject_step', { id: job.id, step: step.id }), { disabled: !!view.running, title: 'Kein PR; der nächste Auftrag weiß, dass du es nicht wolltest' }),
+      button('Neu vorbereiten', () => act('redo_step', { id: job.id, step: step.id }), { disabled: !!view.running, title: 'Liest den Default-Branch neu und erzeugt die Datei erneut (ohne Claude)' })),
+    !decide && redoable && decisionBar(
+      button('Neu vorbereiten', () => act('redo_step', { id: job.id, step: step.id }), { disabled: !!view.running }),
+      step.state !== 'nothingToDo' && button('Verwerfen', () => act('reject_step', { id: job.id, step: step.id }), { disabled: !!view.running })),
+    p && h('details', { class: 'fold' }, h('summary', null, 'Prüfungen im Einzelnen'), checksView(p.checks)),
+    p && technicalPreview(`${job.id}:${step.id}:tech`, { files: p.files, diff: p.diff }),
+  ].filter(Boolean);
+}
+
 /** A website step of a job from before OpenSitePilot; it is not run here any more. */
 function websiteBlock(job, step) {
   return [h('div', { class: 'note' }, step.detail || 'Die Website aktualisiert und veröffentlicht jetzt OpenSitePilot.')];
@@ -1888,8 +1981,26 @@ function jobDialog(keys) {
   const all = repos.filter((r) => !r.capabilities.care && !r.job);
   const excluded = repos.filter((r) => r.capabilities.care || r.job);
   const withRule = all.filter((r) => r.release);
+  // Repositories the analysis keeps from a tag (no CI): they stay in the job, but get no tag.
+  const untaggable = withRule.filter((r) => offerOf(r, 'release')?.blocked);
   const followers = withRule.flatMap((u) => releasedThrough(u.key).filter((f) => f.enabled).map((f) => ({ follower: f, upstream: u })));
-  const o = { prs: true, proof: true, cleanup: false, release: false, bump: 'patch', bumps: {}, prepareRelease: true, targets: new Map(), model: '', instructions: '' };
+  // The analysis sets the defaults where it knows something; otherwise they stay as before.
+  const defaultOn = (id, list, fallback) => {
+    const offers = list.map((r) => offerOf(r, id)).filter((x) => x && !x.blocked);
+    return offers.length ? offers.some((x) => x.defaultOn) : fallback;
+  };
+  const o = {
+    prs: defaultOn('review-prs', all, true), proof: defaultOn('proof', all, true), cleanup: false, release: false, bump: 'patch', bumps: {},
+    prepareRelease: defaultOn('prepare-release', withRule, true), targets: new Map(), tasks: new Set(), model: '', instructions: '',
+  };
+  // Catalog tasks that are steps of their own, and hints the app only gives.
+  const tasks = [...new Set(all.flatMap((r) => r.offers.filter((x) => x.id === 'dependabot-config').map((x) => x.id)))].map((id) => {
+    const offered = all.map((r) => ({ r, x: offerOf(r, id) })).filter((e) => e.x);
+    return { id, title: offered[0].x.title, autonomy: offered[0].x.autonomy, ok: offered.filter((e) => !e.x.blocked), blocked: offered.filter((e) => e.x.blocked) };
+  });
+  const hints = all.flatMap((r) => r.offers.filter((x) => x.autonomy === 'propose').map((x) => ({ r, x })));
+  // The analysis' reason for a default, shown under the option when one repository is chosen.
+  const why = (id) => (all.length === 1 && offerOf(all[0], id) && !offerOf(all[0], id).blocked ? ` Analyse: ${offerOf(all[0], id).why}` : '');
   // With a release, a repository whose release a chosen one publishes comes along by itself, not as a care target.
   const cared = () => all.filter((r) => !(o.release && followers.some((f) => f.follower.key === r.key)));
   // What the chain reaches: the cared-for repositories and, with a release, those their tag publishes.
@@ -1913,7 +2024,7 @@ function jobDialog(keys) {
     const targets = targetsNow();
     // A target the chain no longer reaches (release turned off) is not chosen.
     for (const id of [...o.targets.keys()]) if (!targets.some((t) => t.id === id)) o.targets.delete(id);
-    const nothing = !o.prs && !o.cleanup && !o.release && !o.targets.size;
+    const nothing = !o.prs && !o.cleanup && !o.release && !o.targets.size && !o.tasks.size;
     const option = (key, title, note, disabled) => h('label', { class: 'check-line top' },
       h('input', { type: 'checkbox', id: `job-opt-${key}`, checked: o[key], disabled, 'aria-describedby': `job-opt-${key}-note`, onchange: (e) => { o[key] = e.target.checked; render(); } }),
       h('span', null, h('strong', null, title), h('div', { class: 'note', id: `job-opt-${key}-note` }, note)));
@@ -1923,12 +2034,13 @@ function jobDialog(keys) {
         allowed.length > 1 && h('ul', { class: 'plain-list' }, allowed.map((r) => h('li', { class: 'mono' }, r.repo))),
         excluded.length > 0 && h('div', { class: 'note orange' }, `Ausgenommen: ${excluded.map((r) => `${r.repo} (${r.capabilities.care ?? 'gehört zu einem offenen Auftrag'})`).join(', ')}`),
         h('fieldset', null, h('legend', null, 'Repository-Pflege'),
-          option('prs', `${pick('Pull Requests', 'Merge Requests')} prüfen und übernehmen`, `Claude bewertet jeden offenen ${pick('PR', 'MR')} auf den Default-Branch (Risikoklasse, Release-Notes, Versions-Pins, zusammengehörige Abhängigkeiten, Nutzung im Code); das kostet Claude-Nutzung. Gemergt wird nur, was ${service} mergebar mit grüner CI meldet und Claude grün oder gelb einstuft. Überflüssige ${pick('PRs', 'MRs')} werden mit Begründung geschlossen, ${pick('Dependabot-PRs', 'Renovate-MRs')} mit Konflikt neu aufgebaut.`),
-          o.prs && h('div', { class: 'sub-option' }, option('proof', 'Mit Nachweisen prüfen', `Statt zu vermuten, baut und testet Claude jeden ${pick('PR', 'MR')} in einer Wegwerf-Kopie und schreibt bei Bedarf einen kurzen Test. In der Sandbox von Claude Code: schreiben nur dort, Netz nur zu Paket-Registries, Zugangsdaten gesperrt. Build-Skripte neuer Abhängigkeiten laufen dabei auf diesem Mac. Dauert länger; ohne lokale Kopie wird nur gelesen; gepusht wird nichts.`)),
+          option('prs', `${pick('Pull Requests', 'Merge Requests')} prüfen und übernehmen`, `Claude bewertet jeden offenen ${pick('PR', 'MR')} auf den Default-Branch (Risikoklasse, Release-Notes, Versions-Pins, zusammengehörige Abhängigkeiten, Nutzung im Code); das kostet Claude-Nutzung. Gemergt wird nur, was ${service} mergebar mit grüner CI meldet und Claude grün oder gelb einstuft. Überflüssige ${pick('PRs', 'MRs')} werden mit Begründung geschlossen, ${pick('Dependabot-PRs', 'Renovate-MRs')} mit Konflikt neu aufgebaut.${why('review-prs')}`),
+          o.prs && h('div', { class: 'sub-option' }, option('proof', 'Mit Nachweisen prüfen', `Statt zu vermuten, baut und testet Claude jeden ${pick('PR', 'MR')} in einer Wegwerf-Kopie und schreibt bei Bedarf einen kurzen Test. In der Sandbox von Claude Code: schreiben nur dort, Netz nur zu Paket-Registries, Zugangsdaten gesperrt. Build-Skripte neuer Abhängigkeiten laufen dabei auf diesem Mac. Dauert länger; ohne lokale Kopie wird nur gelesen; gepusht wird nichts.${why('proof')}`)),
           option('cleanup', 'Gemergte Branches aufräumen', `Branches, deren Commits auf ${service} vollständig im Default-Branch sind oder deren ${pick('PR', 'MR')} gemergt wurde, auf ${service} und in der lokalen Kopie. Geschützte, ausgecheckte und Branches offener ${pick('PRs', 'MRs')} bleiben.`),
           option('release', 'Release: nächste Version taggen', withRule.length
-            ? `Nur für Repositories mit Release-Regel (${withRule.map((r) => r.repo).join(', ')}), nur auf grüner CI genau des Ziel-Commits; danach wartet die App bei Bedarf auf das veröffentlichte ${service}-Release.`
-            : 'Keins der Repositories hat eine Release-Regel; einrichten unter Repository → Verwaltung.', !withRule.length),
+            ? `Nur für Repositories mit Release-Regel (${withRule.filter((r) => !untaggable.includes(r)).map((r) => r.repo).join(', ') || 'keins ohne Hindernis'}), nur auf grüner CI genau des Ziel-Commits; danach wartet die App bei Bedarf auf das veröffentlichte ${service}-Release.`
+            : 'Keins der Repositories hat eine Release-Regel; einrichten unter Repository → Verwaltung.', !withRule.length || untaggable.length === withRule.length),
+          untaggable.length > 0 && h('div', { class: 'note orange' }, `Kein Tag für ${untaggable.map((r) => `${r.repo} (${offerOf(r, 'release').blocked})`).join(', ')}`),
           o.release && h('div', { class: 'sub-option' },
             h('div', { class: 'field-row' }, h('label', { for: 'job-bump' }, 'Version'),
               h('select', { id: 'job-bump', 'aria-describedby': 'job-bump-note', onchange: (e) => { o.bump = e.target.value; render(); } },
@@ -1940,7 +2052,16 @@ function jobDialog(keys) {
                   h('option', { value: '', selected: !o.bumps[r.key] }, `wie oben (${BUMP_TEXT[o.bump]})`),
                   Object.entries(BUMP_TEXT).map(([value, text]) => h('option', { value, selected: o.bumps[r.key] === value }, text)))))),
             followers.length > 0 && h('div', { class: 'note' }, `Kommt mit: ${followers.map((f) => `${f.follower.repo} (Release aus ${f.upstream.repo})`).join(', ')}. Die App taggt dort nicht, sie wartet nach dem Tag auf das Release und meldet einen fehlgeschlagenen Export.`),
-            option('prepareRelease', 'Vorher Versionsdateien und CHANGELOG anpassen', `Vor dem Tag bringt die App Cargo.toml, package.json, tauri.conf.json, Chart.yaml und ähnliche Dateien sowie das CHANGELOG.md auf die neue Version, aber nur dort, wo genau die Version des letzten Tags steht. Du siehst den Diff und gibst ihn eigens frei; dann ein Release-${pick('PR', 'MR')}, Merge bei grüner CI und der Tag auf dem Merge-Commit. Ohne passende Datei folgt der Tag direkt.`))),
+            option('prepareRelease', 'Vorher Versionsdateien und CHANGELOG anpassen', `Vor dem Tag bringt die App Cargo.toml, package.json, tauri.conf.json, Chart.yaml und ähnliche Dateien sowie das CHANGELOG.md auf die neue Version, aber nur dort, wo genau die Version des letzten Tags steht. Du siehst den Diff und gibst ihn eigens frei; dann ein Release-${pick('PR', 'MR')}, Merge bei grüner CI und der Tag auf dem Merge-Commit. Ohne passende Datei folgt der Tag direkt.${why('prepare-release')}`))),
+        (tasks.length > 0 || hints.length > 0) && h('fieldset', null, h('legend', null, 'Aus der Analyse'),
+          tasks.map((t) => h('div', null,
+            h('label', { class: 'check-line top' },
+              h('input', { type: 'checkbox', id: domId('job-task', t.id), checked: o.tasks.has(t.id), disabled: !t.ok.length, 'aria-describedby': domId('job-task-note', t.id),
+                onchange: (e) => { e.target.checked ? o.tasks.add(t.id) : o.tasks.delete(t.id); render(); } }),
+              h('span', null, h('strong', null, t.title), ' ', autonomyBadge(t.autonomy),
+                h('div', { class: 'note', id: domId('job-task-note', t.id) }, t.ok.length === 1 && all.length === 1 ? t.ok[0].x.why : `${t.ok.map((e) => e.r.repo).join(', ')}: ${t.ok[0]?.x.why ?? ''}`),
+                t.blocked.length > 0 && h('div', { class: 'note orange' }, t.blocked.map((e) => `${e.r.repo}: ${e.x.blocked}`).join(' · ')))))),
+          hints.map(({ r, x }) => h('div', { class: 'note' }, autonomyBadge(x.autonomy), ' ', h('strong', null, all.length > 1 ? `${r.repo}: ${x.title}` : x.title), ` – ${x.why}`))),
         targets.length > 0 && h('fieldset', null, h('legend', null, 'Zugeordnete Inhalte'),
           targets.map((t) => h('div', { class: 'target-choice' },
             h('label', { class: 'check-line' },
@@ -1964,7 +2085,7 @@ function jobDialog(keys) {
           try {
             const options = {
               prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, bump: o.bump, bumps: o.release ? o.bumps : {}, prepareRelease: o.release && o.prepareRelease,
-              model: o.model, instructions: o.instructions,
+              model: o.model, instructions: o.instructions, tasks: [...o.tasks],
               targets: [...o.targets].map(([id, basis]) => ({ id, basis })),
             };
             const id = await invoke('start_job', { input: { repos: allowed.map((r) => r.key), options } });

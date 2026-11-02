@@ -7,15 +7,19 @@
 //!   shown with its diff, approved, merged once green), then the planned tag once the CI of its
 //!   commit passed, then (if the release rule says so) the wait for the published GitHub release.
 //! - `target:<id>`: a README/documentation or wiki change, prepared, shown, approved, published.
+//! - `task:<repo>:<task>`: a task of the catalog that the profile offered (e.g. a Dependabot
+//!   configuration), prepared in the work folder, shown, approved, delivered as a pull request.
 //! - `website`: the website's update of jobs from before OpenSitePilot; only read, never run again.
 //!
 //! Each job is a file of its own, written atomically after every change, so a restart forgets no
 //! result and starts nothing by itself. A write that had begun when the app stopped is marked
 //! (`writing`) and resolved from the remote state before anything else happens.
 
+use crate::catalog;
 use crate::config::Config;
 use crate::content::{self, Basis, Proposal, TargetKind};
 use crate::paths;
+use crate::profile::Profile;
 use crate::repocare::{Action, Bump, PlanSet, RunState};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -58,6 +62,10 @@ pub struct JobOptions {
     pub model: String,
     /// Extra instruction for the content runs.
     pub instructions: String,
+    /// Tasks of the catalog that are steps of their own (`catalog::STEP_TASKS`), for each chosen
+    /// repository the profile offers them for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<String>,
 }
 
 impl JobOptions {
@@ -88,6 +96,8 @@ pub enum StepKind {
     Docs,
     Wiki,
     Website,
+    /// A task of the catalog (`catalog`); `subject` is the repository key, the id says the task.
+    Task,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -155,7 +165,7 @@ pub struct Link {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JobStep {
-    /// `care`, `release:<repo>`, `follow:<repo>`, `target:<id>`, `website`.
+    /// `care`, `release:<repo>`, `follow:<repo>`, `target:<id>`, `task:<repo>:<task>`, `website`.
     pub id: String,
     pub kind: StepKind,
     pub label: String,
@@ -355,9 +365,16 @@ pub struct Status {
 pub const WEBSITE_MOVED: &str =
     "Die Website aktualisiert und veröffentlicht jetzt OpenSitePilot; ein vorbereiteter Commit liegt unveröffentlicht im Website-Projekt";
 
-/// What a job can be made of: the repositories with their release rules and the targets.
+/// What a job can be made of: the repositories with their release rules and the targets, and the
+/// profiles of the repositories (by key) that decide which catalog tasks are offered.
 pub struct Scope<'a> {
     pub config: &'a Config,
+    pub profiles: &'a BTreeMap<String, Profile>,
+}
+
+/// The task id of a `task:<repo>:<task>` step.
+pub fn task_of(step: &JobStep) -> &str {
+    step.id.rsplit(':').next().unwrap_or_default()
 }
 
 /// The steps for the options and each target once; dependencies point backwards only, so nothing
@@ -442,6 +459,29 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
         let mut step = JobStep::new(format!("target:{}", target.id), kind, format!("{}: {}", target.kind_name(), target.name), target.id.clone(), after_sources(&target.sources));
         step.basis = Some(choice.basis);
         steps.push(step);
+    }
+    let mut tasks: Vec<&str> = Vec::new();
+    for task in options.tasks.iter().map(|t| t.trim()).filter(|t| !t.is_empty()) {
+        if tasks.contains(&task) {
+            continue;
+        }
+        tasks.push(task);
+        let Some(&task) = catalog::STEP_TASKS.iter().find(|t| **t == task) else {
+            return Err(format!("Unbekannte Aufgabe {task}"));
+        };
+        let mut offered = 0;
+        for key in &keys {
+            let managed = scope.config.repository(key).expect("checked above");
+            let Some(offer) = catalog::dependabot_offer(&managed.repo, managed.released_by_key().as_deref(), scope.profiles.get(key)) else { continue };
+            if offer.blocked.is_some() {
+                continue;
+            }
+            offered += 1;
+            steps.push(JobStep::new(format!("task:{key}:{task}"), StepKind::Task, format!("{}: {}", offer.title, managed.repo), key.clone(), care.clone()));
+        }
+        if offered == 0 {
+            return Err(format!("Aufgabe {task}: für keins der Repositories angeboten (Analyse aktualisieren?)"));
+        }
     }
     if steps.is_empty() {
         return Err("Keine Tätigkeit gewählt".into());
@@ -900,8 +940,8 @@ pub fn redo_step(job: &mut Job, step_id: &str, now: u64) -> Result<(), String> {
     }
     let step = job.step_mut(step_id).ok_or("Schritt nicht gefunden")?;
     let release_prep = step.kind == StepKind::Release && step.content.is_some() && !step.prepared && step.tag.is_none();
-    if !matches!(step.kind, StepKind::Docs | StepKind::Wiki) && !release_prep {
-        return Err("Nur Pflegeplan, Release-Vorbereitung und Inhaltsschritte lassen sich neu vorbereiten".into());
+    if !matches!(step.kind, StepKind::Docs | StepKind::Wiki | StepKind::Task) && !release_prep {
+        return Err("Nur Pflegeplan, Release-Vorbereitung, Inhaltsschritte und Aufgaben lassen sich neu vorbereiten".into());
     }
     if !matches!(step.state, StepState::NeedsApproval | StepState::Blocked | StepState::Failed | StepState::NothingToDo) {
         return Err("Dieser Schritt lässt sich jetzt nicht neu vorbereiten".into());
@@ -1164,7 +1204,7 @@ mod tests {
 
     fn job(options: &JobOptions) -> Job {
         let config = config();
-        let scope = Scope { config: &config };
+        let scope = Scope { config: &config, profiles: &Default::default() };
         make("j1", 100, &["o/app".into(), "O/App".into(), "o/lib".into()], options, &scope).unwrap()
     }
 
@@ -1198,7 +1238,7 @@ mod tests {
     #[test]
     fn a_release_brings_the_repository_it_publishes_along() {
         let config = chain();
-        let scope = Scope { config: &config };
+        let scope = Scope { config: &config, profiles: &Default::default() };
         let mut options = JobOptions { prs: true, release: true, ..JobOptions::default() };
         options.targets = vec![TargetChoice { id: "wiki".into(), basis: Basis::Release }];
         options.bumps.insert("o/ee".into(), Bump::Minor);
@@ -1251,7 +1291,7 @@ mod tests {
         }
 
         let config = config();
-        let scope = Scope { config: &config };
+        let scope = Scope { config: &config, profiles: &Default::default() };
         let only_docs = JobOptions { targets: vec![TargetChoice { id: "t1".into(), basis: Basis::Commit }], ..JobOptions::default() };
         let docs = make("j2", 100, &["o/app".into()], &only_docs, &scope).unwrap();
         assert_eq!(docs.steps.len(), 1, "a README without care or release");
@@ -1567,5 +1607,40 @@ mod tests {
         assert_eq!(status.state, JobState::Cancelled);
         assert!(status.reason.contains("nichts zurückgenommen"));
         assert_eq!(job.next_runnable(), None);
+    }
+
+    #[test]
+    fn a_catalog_task_becomes_a_step_only_where_the_profile_offers_it() {
+        use crate::profile::{Stack, StackKind};
+        let config = config();
+        let rust = Profile { stacks: vec![Stack { kind: StackKind::Rust, manifests: vec!["Cargo.toml".into()] }], ..Profile::default() };
+        let configured = Profile { dependabot: Some(".github/dependabot.yml".into()), ..rust.clone() };
+        let profiles: BTreeMap<String, Profile> = [("o/app".to_owned(), rust), ("o/lib".to_owned(), configured)].into();
+        let scope = Scope { config: &config, profiles: &profiles };
+        let options = JobOptions { tasks: vec!["dependabot-config".into(), "dependabot-config".into()], ..JobOptions::default() };
+        let job = make("j", 1, &["o/app".into(), "o/lib".into()], &options, &scope).unwrap();
+        let ids: Vec<&str> = job.steps.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["task:o/app:dependabot-config"], "o/lib has Dependabot already; each task once");
+        assert_eq!((job.steps[0].kind, job.steps[0].subject.as_str(), task_of(&job.steps[0])), (StepKind::Task, "o/app", "dependabot-config"));
+        assert!(make("j", 1, &["o/lib".into()], &options, &scope).unwrap_err().contains("für keins der Repositories"));
+        let unknown = JobOptions { tasks: vec!["rm-rf".into()], ..JobOptions::default() };
+        assert!(make("j", 1, &["o/app".into()], &unknown, &scope).unwrap_err().contains("Unbekannte Aufgabe"));
+        let no_profile = Scope { config: &config, profiles: &Default::default() };
+        assert!(make("j", 1, &["o/app".into()], &options, &no_profile).is_err(), "never offered without a profile");
+    }
+
+    #[test]
+    fn a_task_step_can_be_prepared_again_until_it_published() {
+        let config = config();
+        let profiles: BTreeMap<String, Profile> =
+            [("o/app".to_owned(), Profile { ci: vec![".github/workflows/ci.yml".into()], ..Profile::default() })].into();
+        let options = JobOptions { tasks: vec!["dependabot-config".into()], ..JobOptions::default() };
+        let mut job = make("j", 1, &["o/app".into()], &options, &Scope { config: &config, profiles: &profiles }).unwrap();
+        job.steps[0].state = StepState::NeedsApproval;
+        redo_step(&mut job, "task:o/app:dependabot-config", 2).unwrap();
+        assert_eq!(job.steps[0].state, StepState::Pending);
+        job.steps[0].state = StepState::Failed;
+        job.steps[0].pr = Some(4);
+        assert!(redo_step(&mut job, "task:o/app:dependabot-config", 3).is_err());
     }
 }

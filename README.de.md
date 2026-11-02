@@ -156,6 +156,8 @@ besteht aus den Tätigkeiten, die du wählst, jede optional:
   unten). PR-Pflege bedeutet nicht mehr automatisch einen Tag.
 - **Inhaltsziele**, die die gewählten Repositories speisen: README/Dokumentation oder Wiki, jeweils mit
   der für diesen Auftrag gewählten Basis (neuestes Release oder aktueller Stand des Default-Branches).
+- **Aufgaben aus der Analyse**, z. B. eine Dependabot-Konfiguration als Vorschlags-PR (siehe
+  [Analyse, Gedächtnis und Aufgaben](#analyse-gedächtnis-und-aufgaben)).
 
 Die App macht daraus Schritte und führt sie so weit aus, wie es ohne dich geht: lesen, Claudes
 Bewertung, Inhalte in ihrem eigenen Arbeitsordner vorbereiten. Bevor sich außerhalb etwas ändert, hält
@@ -191,6 +193,37 @@ Neue Aufträge können die Website nicht mehr enthalten. Ältere offene Aufträg
 bleiben lesbar; der Schritt wird übersprungen, mit dem Hinweis, dass jetzt OpenSitePilot die Website
 aktualisiert und veröffentlicht. Ein dafür schon vorbereiteter lokaler Commit bleibt unveröffentlicht im
 Website-Projekt stehen.
+
+## Analyse, Gedächtnis und Aufgaben
+
+Was die App über ein Repository weiß, liegt nur in ihrem Datenordner
+(`~/Library/Application Support/OpenReleasePilot/repos/`), nie im Repository. Zu sehen und zu löschen
+unter Repository → **Analyse und Gedächtnis**.
+
+- **Analyse**: Bei **Status aktualisieren** liest die App die lokale Kopie, ohne Claude und ohne Netz:
+  den zuletzt geholten Default-Branch (`origin/HEAD`, sonst `HEAD`), nur Committetes. Erkannt werden
+  Stack (Cargo, npm, Python, Go, Docker), CI-Konfiguration, Dependabot oder Renovate, Tests, CHANGELOG,
+  Versionsdateien (dieselben wie bei der Release-Vorbereitung), `CLAUDE.md`/`AGENTS.md`, eigene Skills
+  unter `.claude/skills` und `site.json`. Gespeichert mit dem Commit, den sie beschreibt; neu gelesen
+  nur, wenn sich der Commit ändert. Ohne lokale Kopie gibt es keine Analyse, und die Aufträge behalten
+  ihre bisherigen Standardwerte.
+- **Gedächtnis**: Aufträge merken sich je Repository Claudes Bewertungen der PRs, Fehlschläge (mit
+  Zähler, wenn sie in mehreren Aufträgen wiederkehren) und was du ausgelassen oder verworfen hast;
+  höchstens 60 Notizen, die ältesten fallen weg. Claude bekommt sie bei der PR-Bewertung und bei
+  Reparaturen als Material mit, ausdrücklich nicht als Anweisung, ebenso den Hinweis auf
+  `CLAUDE.md` und Skills des Repositorys.
+- **Aufgaben**: Aus der Analyse bietet der Pflegedialog Aufgaben an, jede mit ihrer Stufe:
+  **nur vorschlagen** (ein Hinweis, die App tut nichts), **mit Freigabe** (Vorschlag, dann deine
+  Freigabe) oder **automatisch** (nur Lesendes oder Umkehrbares, z. B. Nachweise in der Wegwerf-Kopie).
+
+| Aufgabe | Stufe | Wann |
+|---|---|---|
+| PRs prüfen und übernehmen | mit Freigabe | vorausgewählt, wenn PRs offen sind |
+| Mit Nachweisen prüfen | automatisch | vorausgewählt mit lokaler Kopie und erkannten Tests |
+| Release taggen | mit Freigabe | gesperrt mit Begründung, wenn weder CI-Konfiguration noch Checks erkannt sind |
+| Versionsdateien und CHANGELOG anpassen | mit Freigabe | vorausgewählt, wenn CHANGELOG.md oder Versionsdateien da sind |
+| Dependabot-Konfiguration vorschlagen | mit Freigabe | GitHub, Abhängigkeiten erkannt, weder Dependabot noch Renovate: die App schreibt `.github/dependabot.yml` (wöchentlich, je Manifest-Ordner) im Arbeitsordner, zeigt den Diff und eröffnet nach Freigabe einen PR; mergen tust du |
+| CI einrichten | nur vorschlagen | keine CI erkannt |
 
 ## Regeln der Repository-Pflege
 
@@ -437,6 +470,10 @@ einmal einen Hinweis, dass die Website jetzt in OpenSitePilot liegt, mit einem K
 
 ## Geändert gegenüber früheren Versionen
 
+- Neu: Analyse der lokalen Kopie, Gedächtnis je Repository und Aufgaben daraus im Pflegedialog
+  (siehe [Analyse, Gedächtnis und Aufgaben](#analyse-gedächtnis-und-aufgaben)). Ohne CI ist **Release**
+  schon im Dialog gesperrt, nicht erst beim Tag. Ein Repository aus der Verwaltung zu entfernen löscht
+  auch seine Analyse und sein Gedächtnis.
 - Seit 0.5.0: Die Website ist in eine eigene App gewandert, **OpenSitePilot**, die im selben Release
   erscheint (siehe [OpenSitePilot](#opensitepilot-website)). OpenReleasePilot pflegt nur noch
   Repositories und Inhaltsziele (README, Dokumentation, Wiki): kein Bereich Website, kein Website-Schritt

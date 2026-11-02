@@ -152,15 +152,28 @@ fn tracked(dir: &Path) -> Result<Vec<String>> {
     Ok(list
         .split('\0')
         .filter(|path| !path.is_empty())
-        .filter(|path| {
-            let lower = path.to_lowercase();
-            let mut parts: Vec<&str> = lower.split('/').collect();
-            let name = parts.pop().unwrap_or_default();
-            let readme = parts.is_empty() && name.starts_with("readme") && name.ends_with(".md");
-            (VERSION_FILES.contains(&name) || readme) && !parts.iter().any(|p| SKIPPED_DIRS.contains(p))
-        })
+        .filter(|path| is_version_file(path) || is_root_readme(path))
         .map(str::to_owned)
         .collect())
+}
+
+/// A file whose version the preparation updates (`Cargo.toml`, `package.json`, …), outside folders
+/// with other people's code or build output. The repository profile shows the same list.
+pub fn is_version_file(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    let mut parts: Vec<&str> = lower.split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    VERSION_FILES.contains(&name) && !in_skipped_dir(&parts)
+}
+
+/// Whether one of the folders is one with other people's code or build output.
+pub fn in_skipped_dir(parts: &[&str]) -> bool {
+    parts.iter().any(|p| SKIPPED_DIRS.contains(&p.to_lowercase().as_str()))
+}
+
+fn is_root_readme(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    !lower.contains('/') && lower.starts_with("readme") && lower.ends_with(".md")
 }
 
 /// The root CHANGELOG, whatever its case.
