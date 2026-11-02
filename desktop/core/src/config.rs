@@ -1,4 +1,5 @@
-//! The app's own settings. Never contains secrets: the SFTP password lives in the keychain (`secrets`).
+//! The apps' own settings: `Config` of OpenReleasePilot, `SiteConfig` of OpenSitePilot, each in the
+//! data folder of its app. Never contains secrets: the SFTP password lives in the keychain (`secrets`).
 
 use crate::paths;
 use anyhow::{Context, Result};
@@ -152,19 +153,18 @@ pub struct Config {
     pub repositories: Vec<ManagedRepo>,
     /// README/documentation and wiki targets fed by those repositories.
     pub content_targets: Vec<crate::content::ContentTarget>,
-    /// Claude model for reviews and content work without a choice in the job; empty = the
-    /// website's setting, else Claude Code's default.
+    /// Claude model for reviews and content work without a choice in the job; empty = Claude
+    /// Code's default.
     pub claude_model: String,
-    /// Cost limit per Claude run of a care job; `None` = the website's setting, if any.
+    /// Cost limit per Claude run of a care job; `None` = none.
     pub max_budget_usd: Option<f64>,
-    /// Local clone of the website repository (contains `.openreleasepilot/site.json`); optional.
-    pub project_dir: String,
-    /// Folder that holds the local clones (website and products); empty = the project's parent.
+    /// Folder that holds the local clones; empty = `~/Documents/Code` or the home folder.
     pub workspace_dir: String,
+    /// Website settings of versions before OpenSitePilot: no longer used here, kept unchanged so
+    /// that OpenSitePilot can take them over whenever it is first started.
+    pub project_dir: String,
     pub sftp: SftpConfig,
-    /// Task id → choice.
     pub tasks: std::collections::BTreeMap<String, TaskChoice>,
-    /// Product ids (site.json) the user turned off: Precheck and Update leave them alone.
     pub skipped_products: std::collections::BTreeSet<String>,
     /// No look for a new version of the app at start (e.g. when IT distributes it).
     pub no_update_check: bool,
@@ -178,10 +178,6 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn product_enabled(&self, id: &str) -> bool {
-        !self.skipped_products.contains(id)
-    }
-
     /// The managed repository with this key (`owner/name`, any case).
     pub fn repository(&self, key: &str) -> Option<&ManagedRepo> {
         let key = key.trim().to_lowercase();
@@ -244,38 +240,134 @@ impl Config {
 
     /// Where clones are searched and created.
     pub fn workspace(&self) -> PathBuf {
-        if !self.workspace_dir.trim().is_empty() {
-            return paths::expand_home(self.workspace_dir.trim());
-        }
-        if !self.project_dir.trim().is_empty() {
-            if let Some(parent) = paths::expand_home(self.project_dir.trim()).parent() {
-                return parent.to_path_buf();
+        workspace(&self.workspace_dir, "")
+    }
+
+    /// Clones used to be looked for next to the website project when no folder was set; keeps
+    /// that folder now that the website settings belong to OpenSitePilot.
+    fn settle(mut self) -> Self {
+        if self.workspace_dir.trim().is_empty() {
+            if let Some(parent) = project_parent(&self.project_dir) {
+                self.workspace_dir = paths::abbreviate_home(&parent);
             }
         }
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        let code = home.join("Documents").join("Code");
-        if code.is_dir() {
-            code
-        } else {
-            home
+        self
+    }
+}
+
+fn project_parent(project_dir: &str) -> Option<PathBuf> {
+    let project = project_dir.trim();
+    (!project.is_empty()).then(|| paths::expand_home(project).parent().map(PathBuf::from)).flatten()
+}
+
+/// The folder set, else the project's parent, else `~/Documents/Code` if it exists, else home.
+fn workspace(workspace_dir: &str, project_dir: &str) -> PathBuf {
+    if !workspace_dir.trim().is_empty() {
+        return paths::expand_home(workspace_dir.trim());
+    }
+    if let Some(parent) = project_parent(project_dir) {
+        return parent;
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let code = home.join("Documents").join("Code");
+    if code.is_dir() {
+        code
+    } else {
+        home
+    }
+}
+
+/// The settings of OpenSitePilot: the website project, its upload target and the choices for it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SiteConfig {
+    /// Local clone of the website repository (contains `.openreleasepilot/site.json`).
+    pub project_dir: String,
+    /// Folder that holds the local clones of the products; empty = the project's parent.
+    pub workspace_dir: String,
+    pub sftp: SftpConfig,
+    /// Task id → choice.
+    pub tasks: std::collections::BTreeMap<String, TaskChoice>,
+    /// Product ids (site.json) the user turned off: Precheck and Update leave them alone.
+    pub skipped_products: std::collections::BTreeSet<String>,
+    /// No look for a new version of the app at start (e.g. when IT distributes it).
+    pub no_update_check: bool,
+}
+
+impl SiteConfig {
+    pub fn product_enabled(&self, id: &str) -> bool {
+        !self.skipped_products.contains(id)
+    }
+
+    /// Where clones are searched and created.
+    pub fn workspace(&self) -> PathBuf {
+        workspace(&self.workspace_dir, &self.project_dir)
+    }
+
+    /// The website settings OpenReleasePilot kept before OpenSitePilot existed.
+    pub fn from_release_pilot(old: &Config) -> Self {
+        Self {
+            project_dir: old.project_dir.clone(),
+            workspace_dir: old.workspace_dir.clone(),
+            sftp: old.sftp.clone(),
+            tasks: old.tasks.clone(),
+            skipped_products: old.skipped_products.clone(),
+            no_update_check: old.no_update_check,
         }
     }
 }
 
+fn read<T: serde::de::DeserializeOwned + Default>(file: &std::path::Path) -> T {
+    fs::read_to_string(file).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+}
+
+fn write<T: Serialize>(file: &std::path::Path, value: &T) -> Result<()> {
+    fs::create_dir_all(file.parent().expect("config file has a parent")).context("App-Datenordner anlegen")?;
+    let tmp = file.with_extension("json.tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(value)?).context("Einstellungen schreiben")?;
+    fs::rename(&tmp, file).context("Einstellungen speichern")?;
+    Ok(())
+}
+
 pub fn load() -> Config {
-    fs::read_to_string(paths::config_file())
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_default()
+    read::<Config>(&paths::config_file()).settle()
 }
 
 pub fn save(config: &Config) -> Result<()> {
+    write(&paths::config_file(), config)
+}
+
+/// OpenSitePilot's settings. On its first start (no settings file yet) it takes over the website
+/// settings and the upload manifests OpenReleasePilot kept, so the next upload stays incremental.
+pub fn load_site() -> SiteConfig {
     let file = paths::config_file();
-    fs::create_dir_all(file.parent().expect("config file has a parent")).context("App-Datenordner anlegen")?;
-    let tmp = file.with_extension("json.tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(config)?).context("Einstellungen schreiben")?;
-    fs::rename(&tmp, &file).context("Einstellungen speichern")?;
-    Ok(())
+    if file.exists() {
+        return read(&file);
+    }
+    let old_dir = paths::data_dir_of(paths::APP_NAME);
+    let old: Config = read(&old_dir.join("config.json"));
+    let site = SiteConfig::from_release_pilot(&old);
+    if !site.project_dir.trim().is_empty() || !site.sftp.host.trim().is_empty() {
+        copy_dir(&old_dir.join("uploads"), &paths::uploads_dir());
+        let _ = save_site(&site);
+    }
+    site
+}
+
+pub fn save_site(config: &SiteConfig) -> Result<()> {
+    write(&paths::config_file(), config)
+}
+
+/// Copies the files of `from` that `to` does not have yet; best effort.
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(from) else { return };
+    let _ = fs::create_dir_all(to);
+    for entry in entries.flatten() {
+        let target = to.join(entry.file_name());
+        if entry.path().is_file() && !target.exists() {
+            let _ = fs::copy(entry.path(), target);
+        }
+    }
 }
 
 /// The cost limit as typed: empty = none; otherwise a finite positive amount, with a decimal point
@@ -306,6 +398,26 @@ mod tests {
         for bad in ["-5", "0", "0,00", "abc", "1.000,50", "inf", "NaN", "1,5,0"] {
             assert!(parse_budget(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_website_settings_move_to_opensitepilot_and_clones_stay_where_they_were() {
+        let old: Config = serde_json::from_str(
+            r#"{"projectDir":"/code/site","sftp":{"host":"h","user":"u","remoteDir":"/www","secretSaved":true},
+                "tasks":{"texts":{"enabled":false}},"skippedProducts":["beta"],"repositories":[{"repo":"o/a"}]}"#,
+        )
+        .unwrap();
+        let site = SiteConfig::from_release_pilot(&old);
+        assert_eq!(site.project_dir, "/code/site");
+        assert!(site.sftp.is_complete());
+        assert_eq!(site.tasks["texts"].enabled, Some(false));
+        assert!(!site.product_enabled("beta"));
+        assert_eq!(site.workspace(), PathBuf::from("/code"), "products next to the project");
+
+        let settled = old.settle();
+        assert_eq!(settled.workspace(), PathBuf::from("/code"), "the repository app keeps looking there");
+        let json = serde_json::to_value(&settled).unwrap();
+        assert_eq!(json["sftp"]["host"], "h", "kept, so OpenSitePilot can still take it over");
     }
 
     #[test]

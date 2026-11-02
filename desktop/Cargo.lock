@@ -2491,7 +2491,6 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
- "ureq",
  "window-vibrancy",
 ]
 
@@ -2512,6 +2511,22 @@ dependencies = [
  "ssh2",
  "ureq",
  "walkdir",
+]
+
+[[package]]
+name = "opensitepilot"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "openreleasepilot-core",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-opener",
+ "ureq",
+ "window-vibrancy",
 ]
 
 [[package]]

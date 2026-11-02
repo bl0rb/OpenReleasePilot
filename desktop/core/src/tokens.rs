@@ -6,7 +6,7 @@
 //! from a cache.
 
 use crate::config::{self, Config, GitlabInstance};
-use crate::paths::APP_NAME;
+use crate::paths::app_name;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -62,7 +62,7 @@ pub fn gitlab_account(host: &str) -> String {
 }
 
 fn entry(account: &str) -> Result<keyring::Entry> {
-    keyring::Entry::new(APP_NAME, account).context("Schlüsselbund nicht verfügbar")
+    keyring::Entry::new(app_name(), account).context("Schlüsselbund nicht verfügbar")
 }
 
 /// The app's token file, next to the config file.

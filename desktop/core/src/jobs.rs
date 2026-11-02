@@ -7,7 +7,7 @@
 //!   shown with its diff, approved, merged once green), then the planned tag once the CI of its
 //!   commit passed, then (if the release rule says so) the wait for the published GitHub release.
 //! - `target:<id>`: a README/documentation or wiki change, prepared, shown, approved, published.
-//! - `website`: the website's update, shown as its commit, approved, uploaded and verified.
+//! - `website`: the website's update of jobs from before OpenSitePilot; only read, never run again.
 //!
 //! Each job is a file of its own, written atomically after every change, so a restart forgets no
 //! result and starts nothing by itself. A write that had begun when the app stopped is marked
@@ -51,11 +51,12 @@ pub struct JobOptions {
     pub prepare_release: bool,
     /// Content targets, each with the basis chosen for this job.
     pub targets: Vec<TargetChoice>,
-    /// Update, publish and verify the website as the last step.
+    /// Jobs from before OpenSitePilot updated and published the website as the last step; read
+    /// only, a new job never does.
     pub website: bool,
     /// Model alias for Claude's runs; empty = the app's default.
     pub model: String,
-    /// Extra instruction for the content and website runs.
+    /// Extra instruction for the content runs.
     pub instructions: String,
 }
 
@@ -350,16 +351,17 @@ pub struct Status {
 
 // MARK: Making a job
 
-/// What a job can be made of: the repositories with their release rules, the targets, and which
-/// repositories feed the website.
+/// What a website step of an older job says now.
+pub const WEBSITE_MOVED: &str =
+    "Die Website aktualisiert und veröffentlicht jetzt OpenSitePilot; ein vorbereiteter Commit liegt unveröffentlicht im Website-Projekt";
+
+/// What a job can be made of: the repositories with their release rules and the targets.
 pub struct Scope<'a> {
     pub config: &'a Config,
-    /// Keys of repositories the website's selected products come from; `None` without a website.
-    pub website_sources: Option<Vec<String>>,
 }
 
-/// The steps for the options, each target and the website once; dependencies point backwards only,
-/// so nothing can wait for itself.
+/// The steps for the options and each target once; dependencies point backwards only, so nothing
+/// can wait for itself.
 pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &Scope) -> Result<Job, String> {
     let mut keys: Vec<String> = Vec::new();
     for key in repos.iter().map(|k| k.trim().to_lowercase()) {
@@ -373,6 +375,9 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
     }
     if keys.is_empty() {
         return Err("Kein Repository gewählt".into());
+    }
+    if options.website {
+        return Err("Die Website aktualisiert und veröffentlicht jetzt OpenSitePilot".into());
     }
     let mut steps = Vec::new();
     if options.care() {
@@ -393,7 +398,7 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
             return Err("Keins der Repositories hat eine Release-Regel; Release abwählen oder eine Regel einrichten".into());
         }
         // A repository another one's tag publishes joins the chain: its release is waited for,
-        // and what it feeds (README, wiki, website) builds on that release.
+        // and what it feeds (README, wiki) builds on that release.
         for (upstream, release_id) in releases.clone() {
             for follower in scope.config.released_through(&upstream).into_iter().filter(|r| r.enabled) {
                 let key = follower.key();
@@ -438,13 +443,6 @@ pub fn make(id: &str, now: u64, repos: &[String], options: &JobOptions, scope: &
         step.basis = Some(choice.basis);
         steps.push(step);
     }
-    if options.website {
-        let sources = scope.website_sources.as_ref().ok_or("Keine Website eingerichtet")?;
-        if !sources.iter().any(|s| chain.contains(s)) {
-            return Err("Keins der ausgewählten Repositories speist die Website (ausgewählte Produkte in site.json)".into());
-        }
-        steps.push(JobStep::new("website".into(), StepKind::Website, "Website".into(), String::new(), after_sources(sources)));
-    }
     if steps.is_empty() {
         return Err("Keine Tätigkeit gewählt".into());
     }
@@ -475,8 +473,8 @@ pub fn generated_target(target: &content::ContentTarget, config: &Config) -> Opt
     })
 }
 
-/// A new job may not touch what an open job holds: the same repository (see `Job::held`), target
-/// or website. `repos` is what the new job holds.
+/// A new job may not touch what an open job holds: the same repository (see `Job::held`) or
+/// target. `repos` is what the new job holds.
 pub fn overlap(open: &[&Job], repos: &[String], options: &JobOptions) -> Option<String> {
     for job in open {
         let held = job.held();
@@ -485,9 +483,6 @@ pub fn overlap(open: &[&Job], repos: &[String], options: &JobOptions) -> Option<
         }
         if let Some(target) = options.targets.iter().find(|t| job.options.targets.iter().any(|o| o.id == t.id)) {
             return Some(format!("Ziel {} gehört schon zu einem offenen Auftrag", target.id));
-        }
-        if options.website && job.options.website {
-            return Some("Die Website gehört schon zu einem offenen Auftrag".into());
         }
     }
     None
@@ -836,17 +831,18 @@ pub fn reject_plan(job: &mut Job, plan_id: u64, now: u64) -> Result<(), String> 
     Ok(())
 }
 
-/// Approves the proposal of a docs, wiki or website step, bound to its fingerprint: a proposal
-/// that changed since the window showed it is not approved.
+/// Approves the proposal of a docs or wiki step, bound to its fingerprint: a proposal that changed
+/// since the window showed it is not approved.
 pub fn approve_step(job: &mut Job, step_id: &str, fingerprint: &str, now: u64) -> Result<(), String> {
     let step = job.step_mut(step_id).ok_or("Schritt nicht gefunden")?;
     if step.state != StepState::NeedsApproval {
         return Err("Dieser Schritt wartet nicht auf eine Freigabe".into());
     }
-    let current = match (&step.content, &step.website) {
-        (Some(p), _) => p.fingerprint.clone(),
-        (None, Some(w)) => w.commit.clone(),
-        _ => return Err("Kein Vorschlag vorhanden".into()),
+    if step.kind == StepKind::Website {
+        return Err(WEBSITE_MOVED.into());
+    }
+    let Some(current) = step.content.as_ref().map(|p| p.fingerprint.clone()) else {
+        return Err("Kein Vorschlag vorhanden".into());
     };
     if current != fingerprint {
         return Err("Der Vorschlag hat sich geändert; bitte erneut ansehen".into());
@@ -904,8 +900,8 @@ pub fn redo_step(job: &mut Job, step_id: &str, now: u64) -> Result<(), String> {
     }
     let step = job.step_mut(step_id).ok_or("Schritt nicht gefunden")?;
     let release_prep = step.kind == StepKind::Release && step.content.is_some() && !step.prepared && step.tag.is_none();
-    if !matches!(step.kind, StepKind::Docs | StepKind::Wiki | StepKind::Website) && !release_prep {
-        return Err("Nur Pflegeplan, Release-Vorbereitung, Inhalts- und Website-Schritte lassen sich neu vorbereiten".into());
+    if !matches!(step.kind, StepKind::Docs | StepKind::Wiki) && !release_prep {
+        return Err("Nur Pflegeplan, Release-Vorbereitung und Inhaltsschritte lassen sich neu vorbereiten".into());
     }
     if !matches!(step.state, StepState::NeedsApproval | StepState::Blocked | StepState::Failed | StepState::NothingToDo) {
         return Err("Dieser Schritt lässt sich jetzt nicht neu vorbereiten".into());
@@ -1162,19 +1158,17 @@ mod tests {
             cleanup: true,
             release: true,
             targets: vec![TargetChoice { id: "t1".into(), basis: Basis::Release }, TargetChoice { id: "t2".into(), basis: Basis::Commit }, TargetChoice { id: "t1".into(), basis: Basis::Commit }],
-            website: true,
             ..JobOptions::default()
         }
     }
 
     fn job(options: &JobOptions) -> Job {
         let config = config();
-        let scope = Scope { config: &config, website_sources: Some(vec!["o/app".into(), "o/lib".into()]) };
+        let scope = Scope { config: &config };
         make("j1", 100, &["o/app".into(), "O/App".into(), "o/lib".into()], options, &scope).unwrap()
     }
 
-    /// o/ee (private, tags) publishes o/core (public export) with the same tag; o/core feeds a
-    /// wiki and the website.
+    /// o/ee (private, tags) publishes o/core (public export) with the same tag; o/core feeds a wiki.
     fn chain() -> Config {
         let mut config = Config::default();
         config.add_repository(ManagedRepo { release: Some(ReleaseRule { tag_prefix: "v".into(), publishes_release: false }), ..ManagedRepo::new("o/ee") });
@@ -1204,18 +1198,17 @@ mod tests {
     #[test]
     fn a_release_brings_the_repository_it_publishes_along() {
         let config = chain();
-        let scope = Scope { config: &config, website_sources: Some(vec!["o/core".into()]) };
-        let mut options = JobOptions { prs: true, release: true, website: true, ..JobOptions::default() };
+        let scope = Scope { config: &config };
+        let mut options = JobOptions { prs: true, release: true, ..JobOptions::default() };
         options.targets = vec![TargetChoice { id: "wiki".into(), basis: Basis::Release }];
         options.bumps.insert("o/ee".into(), Bump::Minor);
         let job = make("j1", 100, &["o/ee".into(), "o/desktop".into()], &options, &scope).unwrap();
         assert_eq!(job.repos, ["o/ee", "o/desktop"], "o/core is waited for, not cared for");
         let ids: Vec<&str> = job.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["care", "release:o/ee", "release:o/desktop", "follow:o/core", "target:wiki", "website"]);
+        assert_eq!(ids, ["care", "release:o/ee", "release:o/desktop", "follow:o/core", "target:wiki"]);
         assert_eq!(job.step("follow:o/core").unwrap().after, ["release:o/ee"]);
         assert_eq!(job.step("follow:o/core").unwrap().kind, StepKind::Follow);
         assert_eq!(job.step("target:wiki").unwrap().after, ["care", "follow:o/core"], "the wiki builds on the exported release");
-        assert_eq!(job.step("website").unwrap().after, ["care", "follow:o/core"]);
         assert_eq!((options.bump_for("o/ee"), options.bump_for("o/desktop")), (Bump::Minor, Bump::Patch));
 
         let without_release = JobOptions { release: false, ..options.clone() };
@@ -1246,25 +1239,24 @@ mod tests {
     }
 
     #[test]
-    fn a_job_has_each_repository_target_and_website_once() {
+    fn a_job_has_each_repository_and_target_once() {
         let job = job(&all());
         assert_eq!(job.repos, ["o/app", "o/lib"]);
         let ids: Vec<&str> = job.steps.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, ["care", "release:o/app", "target:t1", "target:t2", "website"], "o/lib has no release rule; t1 once");
+        assert_eq!(ids, ["care", "release:o/app", "target:t1", "target:t2"], "o/lib has no release rule; t1 once");
         assert_eq!(job.step("target:t1").unwrap().after, ["care", "release:o/app"]);
         assert_eq!(job.step("target:t1").unwrap().basis, Some(Basis::Release), "the first choice counts");
-        assert_eq!(job.step("website").unwrap().after, ["care", "release:o/app"]);
         for (i, step) in job.steps.iter().enumerate() {
             assert!(step.after.iter().all(|d| job.steps[..i].iter().any(|s| &s.id == d)), "{} only waits for earlier steps", step.id);
         }
 
         let config = config();
-        let scope = Scope { config: &config, website_sources: None };
+        let scope = Scope { config: &config };
         let only_docs = JobOptions { targets: vec![TargetChoice { id: "t1".into(), basis: Basis::Commit }], ..JobOptions::default() };
         let docs = make("j2", 100, &["o/app".into()], &only_docs, &scope).unwrap();
-        assert_eq!(docs.steps.len(), 1, "a README without care, release or website");
+        assert_eq!(docs.steps.len(), 1, "a README without care or release");
         assert!(docs.steps[0].after.is_empty());
-        assert!(make("j3", 100, &["o/app".into()], &JobOptions { website: true, ..JobOptions::default() }, &scope).is_err(), "no website configured");
+        assert!(make("j3", 100, &["o/app".into()], &JobOptions { website: true, ..JobOptions::default() }, &scope).is_err(), "the website is OpenSitePilot's");
         assert!(make("j4", 100, &["o/lib".into()], &JobOptions { release: true, ..JobOptions::default() }, &scope).is_err(), "no release rule");
         assert!(make("j5", 100, &["o/other".into()], &only_docs, &scope).is_err(), "unmanaged");
         assert!(make("j6", 100, &["o/site".into()], &only_docs, &scope).is_err(), "t1 is not fed by o/site");
@@ -1278,7 +1270,6 @@ mod tests {
         assert!(overlap(&[&open], &["o/site".into()], &options).is_none());
         let docs = JobOptions { targets: vec![TargetChoice { id: "t2".into(), basis: Basis::Commit }], ..JobOptions::default() };
         assert!(overlap(&[&open], &["o/site".into()], &docs).is_some(), "same wiki");
-        assert!(overlap(&[&open], &["o/site".into()], &JobOptions { website: true, ..JobOptions::default() }).is_some(), "same website");
     }
 
     fn plan_set() -> PlanSet {
@@ -1450,6 +1441,19 @@ mod tests {
     }
 
     #[test]
+    fn a_website_step_of_an_older_job_stays_readable_but_is_not_approved_here() {
+        let mut job = job(&JobOptions { prs: true, ..JobOptions::default() });
+        let mut step = JobStep::new("website".into(), StepKind::Website, "Website".into(), String::new(), vec!["care".into()]);
+        step.state = StepState::NeedsApproval;
+        step.website = Some(WebsiteProposal { base: "a".into(), commit: "b".into(), stat: String::new(), diff: String::new(), summary: String::new(), products: Vec::new() });
+        job.steps.push(step);
+        let back: Job = serde_json::from_value(serde_json::to_value(&job).unwrap()).unwrap();
+        assert_eq!(back.step("website").unwrap().kind, StepKind::Website);
+        assert_eq!(approve_step(&mut job, "website", "b", 1).unwrap_err(), WEBSITE_MOVED);
+        assert!(redo_step(&mut job, "website", 1).is_err());
+    }
+
+    #[test]
     fn options_of_older_jobs_read_as_a_patch_without_preparation() {
         let options: JobOptions = serde_json::from_str(r#"{"prs":true,"release":true}"#).unwrap();
         assert_eq!((options.bump, options.prepare_release), (Bump::Patch, false));
@@ -1466,7 +1470,6 @@ mod tests {
         job.propagate(1);
         assert_eq!(job.step("target:t1").unwrap().state, StepState::Skipped, "t1 depends on the release");
         assert_eq!(job.step("target:t2").unwrap().state, StepState::Skipped, "t2 too: o/app is one of its sources");
-        assert_eq!(job.step("website").unwrap().state, StepState::Skipped);
 
         let mut job = self::job(&JobOptions { prs: true, targets: vec![TargetChoice { id: "t2".into(), basis: Basis::Commit }], ..JobOptions::default() });
         job.steps[0].set(StepState::Rejected, "", 1);

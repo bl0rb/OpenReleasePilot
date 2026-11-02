@@ -1289,7 +1289,7 @@ mod tests {
         let t = target(TargetKind::Docs, &["README.md"]);
         config.content_targets.push(t.clone());
         let options = JobOptions { targets: vec![TargetChoice { id: "t1".into(), basis: Basis::Commit }], ..JobOptions::default() };
-        let mut job = jobs::make("j1", 1, &["o/app".into()], &options, &jobs::Scope { config: &config, website_sources: None }).unwrap();
+        let mut job = jobs::make("j1", 1, &["o/app".into()], &options, &jobs::Scope { config: &config }).unwrap();
         assert_eq!(job.next_runnable(), Some(0), "no care, no release, no website: the README alone");
 
         // "Claude" reads the pinned source beside the target and edits the README.

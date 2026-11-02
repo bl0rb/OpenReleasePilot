@@ -1,6 +1,6 @@
 name: Release
 
-# A tag like 0.2.0 builds the installer and publishes it; 0.2.0-beta.1 becomes a pre-release.
+# A tag like 0.2.0 builds both installers and publishes them; 0.2.0-beta.1 becomes a pre-release.
 # The release is only created after tests and build are green (release gate).
 on:
   push:
@@ -44,9 +44,11 @@ jobs:
           sudo apt-get install -y -qq minisign
           KEY="$RUNNER_TEMP/update.key"
           (umask 077 && printf '%s\n' "$MINISIGN_SECRET_KEY" > "$KEY")
-          f="dist/OpenReleasePilot-$GITHUB_REF_NAME.pkg"
-          minisign -S -s "$KEY" -m "$f" -t "$(basename "$f")"
-          minisign -V -p desktop/update-key.pub -m "$f"
+          for app in OpenReleasePilot OpenSitePilot; do
+            f="dist/$app-$GITHUB_REF_NAME.pkg"
+            minisign -S -s "$KEY" -m "$f" -t "$(basename "$f")"
+            minisign -V -p desktop/update-key.pub -m "$f"
+          done
           rm -f "$KEY"
 
       - name: Publish release
@@ -56,6 +58,8 @@ jobs:
         run: |
           PRE=()
           [[ "$GITHUB_REF_NAME" == *-* ]] && PRE=(--prerelease)
-          gh release create "$GITHUB_REF_NAME" "dist/OpenReleasePilot-$GITHUB_REF_NAME.pkg" "dist/OpenReleasePilot-$GITHUB_REF_NAME.pkg.sha256" \
-            "dist/OpenReleasePilot-$GITHUB_REF_NAME.pkg.minisig" \
+          files() { echo "dist/$1-$GITHUB_REF_NAME.pkg" "dist/$1-$GITHUB_REF_NAME.pkg.sha256" "dist/$1-$GITHUB_REF_NAME.pkg.minisig"; }
+          # OpenReleasePilot's package first: versions before 0.5 install the first .pkg of a release.
+          gh release create "$GITHUB_REF_NAME" $(files OpenReleasePilot) \
             --title "OpenReleasePilot $GITHUB_REF_NAME" --generate-notes "${PRE[@]}"
+          gh release upload "$GITHUB_REF_NAME" $(files OpenSitePilot)

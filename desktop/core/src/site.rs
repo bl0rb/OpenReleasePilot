@@ -32,6 +32,11 @@ pub fn file_name(project: &Path) -> &'static str {
     }
 }
 
+/// Whether the folder is a website project: it has a project file, new or old.
+pub fn is_project(dir: &Path) -> bool {
+    dir.join(SITE_FILE).is_file() || dir.join(LEGACY_SITE_FILE).is_file()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Site {

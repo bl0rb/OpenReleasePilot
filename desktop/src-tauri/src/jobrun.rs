@@ -8,11 +8,11 @@ use crate::{changed, with_model, Status};
 use anyhow::{anyhow, bail, Context, Result};
 use openreleasepilot_core::claude::{self, ContentSource, Event};
 use openreleasepilot_core::content::{self, Basis, Conflict, Delivery, Proposal, PullRequestRef, TargetKind};
-use openreleasepilot_core::jobs::{self, CareItem, ItemKind, ItemOutcome, Job, JobState, Link, Resolution, StepKind, StepState, WebsiteProposal};
+use openreleasepilot_core::jobs::{self, CareItem, ItemKind, ItemOutcome, Job, JobState, Link, Resolution, StepKind, StepState};
 use openreleasepilot_core::repocare::{self, Action, CiWait, Done, Plan, PlanSet, ReleaseWait, RunState};
-use openreleasepilot_core::repos::RepoTarget;
+use openreleasepilot_core::repos::{self, RepoTarget};
 use openreleasepilot_core::forge::Forge;
-use openreleasepilot_core::{git, github, proof, release, repair, shell};
+use openreleasepilot_core::{github, proof, release, repair, shell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -37,24 +37,14 @@ fn save(ctx: &Ctx, job: &mut Job) -> Result<()> {
 
 /// The managed repositories as they are configured now.
 fn current_targets(ctx: &Ctx) -> Vec<RepoTarget> {
-    let (config, site) = with_model(&ctx.app, |m| (m.config.clone(), m.site.clone()));
-    crate::repo_targets(&config, &site)
+    repos::targets(&ctx.config())
 }
 
-/// Model, effort and cost limit for a Claude run of a job: the choice, the app's default, the website's.
+/// Model, effort and cost limit for a Claude run of a job: the choice, else the app's default.
 fn claude_settings(ctx: &Ctx, chosen: &[&str]) -> (Option<String>, Option<String>, Option<f64>) {
-    let (config, site) = with_model(&ctx.app, |m| (m.config.clone(), m.site.clone().ok()));
-    let model = chosen
-        .iter()
-        .copied()
-        .chain([config.claude_model.as_str()])
-        .map(str::trim)
-        .find(|m| !m.is_empty())
-        .map(str::to_owned)
-        .or_else(|| site.as_ref().and_then(|s| s.claude.model.clone()));
-    let effort = site.as_ref().and_then(|s| s.claude.effort.clone());
-    let budget = config.max_budget_usd.or_else(|| site.as_ref().and_then(|s| s.claude.max_budget_usd));
-    (model, effort, budget)
+    let config = ctx.config();
+    let model = chosen.iter().copied().chain([config.claude_model.as_str()]).map(str::trim).find(|m| !m.is_empty()).map(str::to_owned);
+    (model, None, config.max_budget_usd)
 }
 
 pub fn pass(ctx: &Ctx, id: &str) -> Result<(Status, String)> {
@@ -86,8 +76,10 @@ pub fn pass(ctx: &Ctx, id: &str) -> Result<(Status, String)> {
             StepKind::Follow => follow(ctx, &mut job, i),
             StepKind::Docs | StepKind::Wiki if approved => content_publish(ctx, &mut job, i),
             StepKind::Docs | StepKind::Wiki => content_prepare(ctx, &mut job, i),
-            StepKind::Website if approved => website_publish(ctx, &mut job, i),
-            StepKind::Website => website_prepare(ctx, &mut job, i),
+            StepKind::Website => {
+                job.steps[i].set(StepState::Skipped, jobs::WEBSITE_MOVED, now());
+                Ok(())
+            }
         };
         if let Err(e) = result {
             let message = format!("{e:#}");
@@ -953,13 +945,13 @@ fn release_merge(ctx: &Ctx, job: &mut Job, i: usize, plan: &Plan, number: u64) -
 }
 
 /// Later steps of this job that wait for release step `i` and build on the newest GitHub release:
-/// the website, docs and wiki with the basis "neuestes Release".
+/// docs and wiki with the basis "neuestes Release".
 fn release_readers(job: &Job, i: usize) -> Vec<String> {
     let id = &job.steps[i].id;
     job.steps
         .iter()
         .filter(|s| s.after.contains(id))
-        .filter(|s| s.kind == StepKind::Website || (matches!(s.kind, StepKind::Docs | StepKind::Wiki) && s.basis == Some(Basis::Release)))
+        .filter(|s| matches!(s.kind, StepKind::Docs | StepKind::Wiki) && s.basis == Some(Basis::Release))
         .map(|s| s.label.clone())
         .collect()
 }
@@ -1232,71 +1224,6 @@ fn record_pull_request(ctx: &Ctx, job: &mut Job, i: usize, target: &content::Con
     save(ctx, job)?;
     let delivery = Delivery { job: job.id.clone(), at: now(), sources: proposal.sources.clone(), what: r, url: pr.url, pr: Some(pr.number) };
     update_target_state(ctx, &target.id, |s| s.delivered = Some(delivery));
-    Ok(())
-}
-
-// MARK: Website
-
-/// The website's update for the products of this job's repositories: Claude, build, a local commit.
-/// Ends with that commit as the proposal.
-fn website_prepare(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
-    if blocked_by_unreleased(ctx, job, i)? {
-        return Ok(());
-    }
-    let project = ctx.project()?;
-    let before = git::head(&project).unwrap_or_default();
-    let update = steps::update_site(ctx, &job.options.instructions, Some(&job.repos))?;
-    let Some((short_sha, files)) = update.commit else {
-        job.steps[i].set(StepState::NothingToDo, update.summary, now());
-        return Ok(());
-    };
-    let commit = git::head(&project)?;
-    let stat = shell::output("git", &["show", "--stat", "--format=%s", &commit], &project).unwrap_or_default();
-    let mut diff = shell::output("git", &["show", "--no-color", "--format=", &commit], &project).unwrap_or_default();
-    const MAX: usize = 300 * 1024;
-    if diff.len() > MAX {
-        let mut cut = MAX;
-        while !diff.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        diff.truncate(cut);
-        diff.push_str(&format!("\n… gekürzt; vollständig: git -C \"{}\" show {short_sha}", project.display()));
-    }
-    let step = &mut job.steps[i];
-    step.website = Some(WebsiteProposal { base: before, commit: commit.clone(), stat, diff, summary: update.summary, products: update.products });
-    step.set(StepState::NeedsApproval, format!("Commit {short_sha}: {files} Dateien; Freigabe zum Veröffentlichen nötig"), now());
-    Ok(())
-}
-
-/// Publishes the approved website commit: push, upload, verify (the website's own steps).
-fn website_publish(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
-    let proposal = job.steps[i].website.clone().context("Kein Vorschlag vorhanden")?;
-    if job.steps[i].approved.as_deref() != Some(proposal.commit.as_str()) {
-        job.steps[i].set(StepState::Blocked, "Die Freigabe passt nicht zum Vorschlag; neu vorbereiten", now());
-        return Ok(());
-    }
-    let project = ctx.project()?;
-    let head = git::head(&project)?;
-    if head != proposal.commit {
-        let why = format!(
-            "Im Website-Projekt steht HEAD auf {} statt auf dem freigegebenen {}; neu vorbereiten oder im Bereich Website veröffentlichen",
-            content::short(&head),
-            content::short(&proposal.commit)
-        );
-        job.steps[i].set(StepState::Blocked, why, now());
-        return Ok(());
-    }
-    job.steps[i].writing = Some("Upload".into());
-    save(ctx, job)?;
-    let uploaded = steps::upload(ctx, false);
-    job.steps[i].writing = None;
-    let (_, upload_summary) = uploaded?;
-    let site = ctx.site()?;
-    job.steps[i].links.push(Link { label: site.url.replace("https://", "").replace("http://", ""), url: site.url.clone() });
-    save(ctx, job)?;
-    let (verified, verify_summary) = steps::verify(ctx)?;
-    let state = if verified == Status::Error { StepState::Partial } else { StepState::Done };
-    job.steps[i].set(state, format!("{upload_summary} · Live-Seite: {verify_summary}"), now());
     Ok(())
 }
 

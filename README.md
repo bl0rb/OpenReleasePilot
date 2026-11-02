@@ -4,20 +4,26 @@
 
 # OpenReleasePilot
 
-Desktop app that looks after the repositories you choose on GitHub and GitLab, with Claude Code doing the
-work and you making the decisions. It reads their state, reviews and merges pull and merge requests, cleans up merged
-branches, tags releases (patch, minor or major) and waits for the published release, keeps a README, other documentation
-or a wiki up to date, and, if you have one, updates and publishes a static website as the last
-step. Everything that changes something on GitHub, GitLab, in a wiki or on a website is first shown as a
-concrete proposal and only carried out after your approval.
+Two desktop apps in one repository, sharing the Rust library `desktop/core`; Claude Code does the work and
+you make the decisions:
 
-The app has three areas, switched in the sidebar, and its settings under **Einstellungen** (settings) at the bottom of it:
+- **OpenReleasePilot** looks after the repositories you choose on GitHub and GitLab. It reads their state,
+  reviews and merges pull and merge requests, cleans up merged branches, tags releases (patch, minor or
+  major) and waits for the published release, and keeps a README, other documentation or a wiki up to
+  date. Everything that changes something on GitHub, GitLab or in a wiki is first shown as a concrete
+  proposal and only carried out after your approval.
+- **OpenSitePilot** updates and publishes a static website that describes your products (see
+  [OpenSitePilot](#opensitepilot-website)). Without a website you do not need it.
+
+OpenReleasePilot has two areas, switched in the sidebar, and its settings under **Einstellungen**
+(settings) at the bottom of it:
 
 | Area | What it is for |
 |---|---|
 | **Repositories** (start view) | the managed repositories with their health, open jobs and the decisions they wait for; select repositories and start a care job |
 | **Aufträge** (jobs) | every care job: its steps, plans, proposals with their diffs, results and log; running, waiting and earlier ones |
-| **Website** (only with a website) | the website's own four steps: Prüfen (check), Inhalte aktualisieren (update content), Veröffentlichen (publish), Live-Seite prüfen (verify the live site) |
+
+The website no longer has an area in OpenReleasePilot; it is OpenSitePilot's job.
 
 Each view has at most one main action at its top right; refreshing (↻) and opening a page (↗) are
 icons next to it, rarer and irreversible actions are in the ⋯ menu. Cards open with a click.
@@ -36,8 +42,7 @@ The app starts with **Repositories auswählen**: it lists the local Git clones i
 whose origin is on GitHub, and you tick the ones it should look after; their local clone is filled in
 right away. Nothing else is needed: no website, no SFTP access, no release. A read-only status check
 works without Claude; a care job needs Claude Code and the signed-in GitHub CLI, a README job
-additionally only Git access to the repository. The same applies to an installation that already has a
-website: its products do not decide what the app manages.
+additionally only Git access to the repository.
 
 ## Managed repositories
 
@@ -57,8 +62,9 @@ nothing, neither on GitHub nor the local clone nor any website configuration. In
   brings it along (see [Release chains](#release-chains)). One step only: the source has a release rule
   and is not released by another repository itself.
 
-Which website products name a repository is shown (and where `site.json` disagrees with the release rule,
-also that), but the website's product selection does not decide what the app manages.
+If the local clone contains `.openreleasepilot/site.json` (or the older `.openftpupdater/site.json`), the
+repository is shown as **Website-Projekt** (website project). It is cared for like any other; the website
+itself is updated and published by OpenSitePilot.
 
 ## Repository status
 
@@ -70,7 +76,7 @@ repositories can still be read (GitHub then allows 60 requests per hour; a repos
 | State | When |
 |---|---|
 | **Blockiert** | the default branch's CI failed, or the repository cannot be read (GitHub answers 404 or refuses access; a 404 can also mean private without access) |
-| **Aufmerksamkeit nötig** | open Dependabot pull requests, commits since the last release or tag, a website product documents an older version than the latest release, the repository it is released by has a newer version than its own newest release (a failed or running export), or (after the detail view read them) pull requests with conflicts or failed CI |
+| **Aufmerksamkeit nötig** | open Dependabot pull requests, commits since the last release or tag, the repository it is released by has a newer version than its own newest release (a failed or running export), or (after the detail view read them) pull requests with conflicts or failed CI |
 | **Unbekannt** | nothing of the above, but required facts are missing, incomplete or old: CI still running, no checks found, unclear result, query failed |
 | **In Ordnung** | everything required was read successfully and recently, and nothing needs doing |
 
@@ -120,9 +126,9 @@ nothing is loosened or removed:
 - **Nur noch über Pull Requests** / **Force-Push und Löschen verbieten**: creates or extends the
   repository ruleset `OpenReleasePilot: Default-Branch` for the default branch (pull requests without a
   required review, so you can still merge your own; no force push, no deletion; also for admins). A rule
-  of the same type that is already there stays as it is. For the website's own repository the app warns
-  that its upload push would then be refused. Private repositories need GitHub Pro, Team or Enterprise
-  for rulesets.
+  of the same type that is already there stays as it is. For a website project the app warns that the
+  direct push OpenSitePilot publishes the website with would then be refused. Private repositories need
+  GitHub Pro, Team or Enterprise for rulesets.
 - **Secret scanning**, **push protection**, **Dependabot alerts** and **security updates**, **CodeQL
   default setup**, **private vulnerability reporting**: switched on.
 - **Workflow token read-only**: default `GITHUB_TOKEN` rights to read, workflows may not approve pull
@@ -149,13 +155,12 @@ activities you pick, each optional:
   longer implies a tag.
 - **Content targets** fed by the selected repositories: README/documentation or wiki, each with the
   basis chosen for this job (newest release or current state of the default branch).
-- **Website** (if the selected repositories feed it): update, publish and verify as the last step.
 
 The app turns this into steps and runs them as far as it can without you: reading, Claude's review,
 preparing content in its own work folder. Before anything external changes it stops with a concrete
 proposal: the care plan (each action can be left out; merges Claude advised against but the app's rules
-allow are offered for you to tick; nothing else can be added), a content change with its diff and
-the app's checks, the website commit with its diff. Approving continues the job; nothing else needs to
+allow are offered for you to tick; nothing else can be added) or a content change with its diff and
+the app's checks. Approving continues the job; nothing else needs to
 be started by hand. A tag is not a release: a step that needs the release waits for it (up to 30 minutes
 per look, then the job waits visibly and **Erneut prüfen** looks again). A failed step stops the steps
 that depend on it; independent ones go on, and a partial success is shown as such.
@@ -176,8 +181,12 @@ up on GitHub (or in the wiki, or the clone) whether a write that had begun happe
 runs, so nothing is merged, commented, tagged, opened or published twice. An approval only counts for
 the unchanged proposal: a changed target, a changed repository configuration, a newer release of a
 release-based source or a changed file makes the step ask again. **Abbrechen** stops after the current
-item; nothing done is rolled back. A repository, content target or the website belongs to at most one
-open job, and only one job (or website step) runs at a time.
+item; nothing done is rolled back. A repository or content target belongs to at most one open job, and
+only one job runs at a time.
+
+New jobs can no longer include the website. Older open jobs with a website step stay readable; the step
+is skipped with the note that OpenSitePilot now updates and publishes the website. A local commit already
+prepared for it stays unpublished in the website project.
 
 ## Repository care rules
 
@@ -272,8 +281,7 @@ precondition (closing, deleting a branch), a short window between the last check
 ## Release chains
 
 A release often goes on in other repositories: a private repository exports its core to a public one
-that builds its own images and release from the same tag, and the public repository feeds a wiki and the
-website. Set **Veröffentlicht durch** on the public repository, and a job that tags the private one takes
+that builds its own images and release from the same tag, and the public repository feeds a wiki. Set **Veröffentlicht durch** on the public repository, and a job that tags the private one takes
 the whole chain:
 
 1. Care plan and the tag in the source repository, as usual.
@@ -281,7 +289,7 @@ the whole chain:
    with the same tag (up to 30 minutes per look). A failed run in the source at the tagged commit (the
    export, for example) or a failed run for the tag in the repository itself blocks the step with a
    link to the run; a tag is never moved, so after the fix a new version is needed.
-3. README, wiki and website steps that the published repository feeds wait for that release, not for
+3. README and wiki steps that the published repository feeds wait for that release, not for
    the source's tag, and build on it.
 
 The published repository is not cared for in that job (its pull requests, if any, in a job of its
@@ -360,11 +368,15 @@ strip and opens that service's overview below.
   checkable". Fixes for maintainers: protect the default branch, block force pushes, require a green
   pipeline, the push rule against secrets, restrict job token access.
 
-## Website (optional)
+## OpenSitePilot: website
 
-A website is an optional target, not the configuration root. It is set up under **Einstellungen →
-Website und Veröffentlichung** (project folder with `.openreleasepilot/site.json`, SFTP access) and gets its own area with
-the four steps, run one by one or all in a row:
+OpenSitePilot is the app of its own for what used to be OpenReleasePilot's "Website (optional)" area: a
+static website whose project file `.openreleasepilot/site.json` describes the build and the watched
+products (see [Website project file](#website-project-file-openreleasepilotsitejson)). It is set up under
+**Einstellungen → Website und Veröffentlichung**: pick the website repository from the list (the project
+folder follows from its local clone; if there is none, the app clones it into the repo folder), the repo
+folder and the SFTP target; **App** holds the update check. Its view shows the four steps, run one by one
+or all in a row:
 
 | Step | What happens | Changes anything? |
 |---|---|---|
@@ -382,26 +394,38 @@ site, and stops at the first error. If a release lookup fails, the state is unkn
 content update stops, and with it the whole run before publishing, instead of publishing on an incomplete
 basis.
 
-As the last step of a care job, the same update runs for the products of the job's repositories (the
-website's product selection applies, too), and several repositories feeding one website are updated
-together in one step, after their releases. The resulting local commit is the proposal: the approval
-view first names the affected products with their version change, Claude's summary and what approving or
-rejecting does, then the technical preview with the diff (cut above 300 KiB, with the `git show` command
-for the full view). After approval the app pushes, uploads and verifies. Rejecting leaves the commit
-unpublished in the website project.
+OpenSitePilot notices new product releases itself: the check asks GitHub for the latest release of every
+product. There is no direct link to OpenReleasePilot. OpenSitePilot reads GitHub with the GitHub CLI
+login (`gh`); no own token can be set here. OpenSitePilot has no menu bar icon: closing the window quits
+the app.
 
-**Produkt zur Website hinzufügen** (add product to the website, button in the Website area): pick one of
+**Produkt zur Website hinzufügen** (add product to the website, button in OpenSitePilot): pick one of
 your GitHub repositories; "Produktseite erstellen" has Claude Code add it to the site with the project's
 `addProductSkill` (product page, listings, icon, diagram, `site.json` entry), then the app builds and
 commits. It goes live with "Veröffentlichen".
 
-The Website area lists the products from `site.json` with a checkbox each. The check and the content
+OpenSitePilot lists the products from `site.json` with a checkbox each. The check and the content
 update only handle selected products: the check does not look up the others, and the update names them to
 Claude as "not selected, leave unchanged". The selection is stored in the app's settings, not in the website
-repository; it does not change which repositories the app manages.
+repository; it does not change which repositories OpenReleasePilot manages.
+
+**Takeover on first start:** while OpenSitePilot has no settings of its own yet, it takes over
+OpenReleasePilot's: project folder, repo folder, SFTP settings including the trusted host key, the choice
+of update tasks, deselected products and whether to check for updates at start. The upload manifests
+(`uploads/`) are copied, so the next upload stays incremental. The SFTP password moves from
+OpenReleasePilot's keychain entry to OpenSitePilot's on first use; macOS may ask once whether
+OpenSitePilot may use that keychain entry. OpenReleasePilot leaves its old website fields untouched in its
+`config.json`, so the takeover also works later. If a website was set up there, OpenReleasePilot shows a
+banner once saying that the website now lives in OpenSitePilot, with a button to the releases page.
 
 ## Changed from earlier versions
 
+- From 0.5.0: the website moved into an app of its own, **OpenSitePilot**, published in the same release
+  (see [OpenSitePilot](#opensitepilot-website)). OpenReleasePilot only looks after repositories and content
+  targets (README, documentation, wiki): no Website area, no website step in jobs, no SFTP settings, no
+  website products on the repositories; a clone with `site.json` is called **Website-Projekt**.
+  OpenSitePilot takes over the website and SFTP settings, the upload manifests and the SFTP password on its
+  first start. Older open jobs skip their website step.
 - The managed repositories are the app's own list, chosen from the local clones. Product repositories of
   `site.json` no longer appear by themselves. The start view is **Repositories**.
 - Pull request care, cleanup and release are chosen separately; merging no longer implies a patch tag,
@@ -428,38 +452,41 @@ repository; it does not change which repositories the app manages.
 ## Choosing repositories
 
 **Repositories auswählen** lists the Git clones directly inside the repo folder whose `origin` is a
-GitHub repository, with their path, and marks those that are managed already, a product of the website,
-or the website's own repository. Clones of a wiki are left out (wikis are content targets), and a
-repository cloned twice is listed once, with the folder named like it. Another folder can be picked for
+GitHub repository, with their path, and marks those that are managed already or are a
+**Website-Projekt** (website project, with `site.json`). Clones of a wiki are left out (wikis are content
+targets), and a repository cloned twice is listed once, with the folder named like it. Another folder can be picked for
 one selection. A repository is taken
 as its clone's origin names it, with the clone as its local copy; GitHub's name and id are added when
 GitHub can be asked (a private repository without `gh` login is added from its origin alone). For a
 repository without a local clone, type `owner/name`; it must exist on GitHub.
 
 - **Repo folder** (Settings): where the selection looks for clones and where new clones are made; by
-  default the parent of the website project or `~/Documents/Code`.
-- **Website repository** (Settings, optional): pick it from the list; the project folder follows from its
-  local clone. If there is none, the app clones it into the repo folder.
+  default `~/Documents/Code`. If none was set, the app used to take the parent of the website project;
+  on load it now writes that folder into its own repo folder setting, so nothing moves.
+- **Website repository**: now in OpenSitePilot's settings (see [OpenSitePilot](#opensitepilot-website)).
 
 ## Installation
 
 Download `OpenReleasePilot-<version>.pkg` from the
-[releases](https://github.com/bl0rb/OpenReleasePilot/releases) (Apple silicon) and check it against the
-`.sha256` file next to it:
+[releases](https://github.com/bl0rb/OpenReleasePilot/releases) (Apple silicon), plus
+`OpenSitePilot-<version>.pkg` only if you publish a website, and check each against the `.sha256` file
+next to it:
 
 ```bash
 shasum -a 256 -c OpenReleasePilot-*.pkg.sha256
+shasum -a 256 -c OpenSitePilot-*.pkg.sha256
 ```
 
-The package installs `OpenReleasePilot.app` to `/Applications` and replaces an installed version. It is
-not signed, so macOS blocks it on the first open; allow it once under **System Settings → Privacy &
-Security → Open Anyway**, or install it in the terminal:
+Each package installs its app (`OpenReleasePilot.app`, `OpenSitePilot.app`) to `/Applications` and
+replaces an installed version. The packages are not signed, so macOS blocks them on the first open; allow
+them once under **System Settings → Privacy & Security → Open Anyway**, or install them in the terminal:
 
 ```bash
-sudo installer -pkg OpenReleasePilot-0.4.11.pkg -target /
+sudo installer -pkg OpenReleasePilot-0.5.0.pkg -target /
+sudo installer -pkg OpenSitePilot-0.5.0.pkg -target /
 ```
 
-The same package can be distributed through Microsoft Intune as a "macOS app (PKG)"; then turn off
+The same packages can be distributed through Microsoft Intune as a "macOS app (PKG)"; then turn off
 "Beim Start nach neuen Versionen suchen" in the settings.
 
 Up to version 0.1.3 the app was called OpenFTPUpdater-AI. OpenReleasePilot does not replace
@@ -467,8 +494,9 @@ Up to version 0.1.3 the app was called OpenFTPUpdater-AI. OpenReleasePilot does 
 
 ## App updates
 
-As in ClaudeKeyZapper: at start, the app quietly looks up the latest release of this repository on
-GitHub once; **Nach Updates suchen** at the bottom of the sidebar checks manually. If a newer version exists, a banner
+Both apps update themselves from the same release of this repository, each taking only its own package
+(`<App>-<version>.pkg`); both have the same version number. As in ClaudeKeyZapper: at start, the app
+quietly looks up the latest release on GitHub once; **Nach Updates suchen** at the bottom of the sidebar checks manually. If a newer version exists, a banner
 appears at the top. **Installieren** downloads the `.pkg` from `github.com`, checks it against the SHA-256
 digest GitHub publishes for the release asset and against the release's minisign signature
 (`<package>.minisig`, verified with the public key built into the app,
@@ -482,18 +510,21 @@ suchen** under **Einstellungen → App** or when a beta is installed. Developmen
 - macOS (developed on macOS 27; the code is cross-platform Tauri, Windows is untested)
 - On the machine: `git` with access to your repositories, [Claude Code](https://claude.com/claude-code)
   signed in, the GitHub CLI `gh` signed in for care jobs (it also raises the GitHub API limit from 60 to
-  5000 requests per hour; the token is used by the app, and handed to the website build as
-  `GITHUB_TOKEN`, but never to Claude Code), and for GitLab projects the GitLab CLI `glab` signed in
-  (`brew install glab`, then `glab auth login --hostname <instance>`). Instead of the CLIs, each service
-  also takes an own token under **Einstellungen → Zugänge**
-- Only for a website: Node.js/npm (or whatever its build needs) and an SFTP account for the web space
+  5000 requests per hour; the token is used by the app, but never handed to Claude Code), and for GitLab
+  projects the GitLab CLI `glab` signed in (`brew install glab`, then
+  `glab auth login --hostname <instance>`). Instead of the CLIs, each service also takes an own token
+  under OpenReleasePilot's **Einstellungen → Zugänge**
+- Only for OpenSitePilot: the GitHub CLI `gh` signed in (its token is handed to the website build as
+  `GITHUB_TOKEN`, never to Claude Code), Node.js/npm (or whatever the build needs) and an SFTP account for
+  the web space
 
-The app starts from the Finder and asks the login shell for the user's `PATH` once, so tools
+Both apps start from the Finder and ask the login shell for the user's `PATH` once, so tools
 installed with nvm, Homebrew or into `~/.local/bin` are found.
 
 ## Website project file `.openreleasepilot/site.json`
 
-Lives in the website repository and describes how to build and what to watch. Projects set up
+Lives in the website repository and describes how to build and what to watch; OpenSitePilot reads it.
+Projects set up
 before the app was renamed from OpenFTPUpdater-AI keep their `.openftpupdater/site.json`; it is read as
 long as the new file does not exist.
 
@@ -534,8 +565,8 @@ long as the new file does not exist.
 | `products[].documented` | Release the site content describes; the skill raises it after updating |
 | `products[].tagPrefix` | `v` for tags like `v1.2.0`, empty for `1.2.0` |
 | `products[].localPath` | Local clone, relative to the project; Claude reads it through `git -C`, never edits it |
-| `claude.model`, `claude.effort` | Default model alias (`opus`, `sonnet`, `haiku`, `fable`) and effort (`low` … `max`) for every Claude run |
-| `claude.maxBudgetUsd` | Cost limit per Claude run (`--max-budget-usd`) |
+| `claude.model`, `claude.effort` | Default model alias (`opus`, `sonnet`, `haiku`, `fable`) and effort (`low` … `max`) for every Claude run of OpenSitePilot |
+| `claude.maxBudgetUsd` | Cost limit per Claude run of OpenSitePilot (`--max-budget-usd`) |
 | `claude.allowedTools` | Added to the app's allowlist (see below); CLI flags and an unrestricted `Bash` are rejected |
 
 The skill is the actual know-how: where the product texts live, how screenshots are made,
@@ -564,9 +595,10 @@ Effort is the first lever: `high` for texts and the consistency check, `medium` 
 diagrams. With a Claude subscription login, the cost shown per run is a notional API price; the runs
 count against the subscription's usage limits instead.
 
-Care jobs use the model chosen for the job (a content target can set its own), else the default under
-**Einstellungen → Allgemein → Ausführungsregeln**, else the website's `claude.model`, else Claude Code's
-default; the cost limit per run likewise. The cost limit is an amount in USD above 0 (comma or point); an
+OpenReleasePilot's care jobs use the model chosen for the job (a content target can set its own), else
+the default under **Einstellungen → Allgemein → Ausführungsregeln**, else Claude Code's default; the cost
+limit per run likewise. The website's `claude.model` and `claude.maxBudgetUsd` no longer apply to them.
+The cost limit is an amount in USD above 0 (comma or point); an
 empty field means no limit of the app's own.
 
 ## What Claude may do
@@ -583,9 +615,10 @@ denied calls are listed after the run. Each kind of run has its own rights:
 - **Content (README, documentation, wiki):** reading and editing files in the app's work folder (the
   target's clone) and reading the pinned sources beside it; skills. No shell, no web, nothing in `.git`,
   `.github`, `.gitlab` or `.gitlab-ci.yml`. What counts is decided afterwards by the app (see Content targets).
-- **Website update:** as follows.
+- **Website update (OpenSitePilot):** as follows.
 
-For the website, Claude Code runs as `claude -p … --permission-mode acceptEdits` in the project folder:
+For the website, Claude Code runs in OpenSitePilot as `claude -p … --permission-mode acceptEdits` in the
+project folder:
 
 - read, search, edit and write files in the project; use skills
 - read-only git in the project and in other repositories via `git -C <path> log|show|diff|tag|describe|ls-tree|fetch --tags`
@@ -602,6 +635,8 @@ cannot widen its own rights; adding products is not affected.
 
 ## Upload
 
+Uploading is done by OpenSitePilot.
+
 - The password (or key passphrase) is stored in the system keychain, never in a file or repository.
   SSH keys are supported as well.
 - The server's host key is confirmed once (`SHA256:…`, compare with `ssh-keyscan -p 22 host | ssh-keygen -lf -`);
@@ -617,11 +652,16 @@ cannot widen its own rights; adding products is not affected.
   nothing more than a normal upload.
 - Only a committed, clean working tree is uploaded, and only if it is not behind `origin`.
 
-Settings live in `~/Library/Application Support/OpenReleasePilot/config.json` (managed repositories,
-content targets, website and SFTP settings; no secrets). Next to it: `jobs/` (one file and one log per
-care job; the newest 50 finished jobs are kept), `content.json` (what each content target was last
-brought to) and `work/` (the work folders of open jobs, removed when a job is finished). On the first
-start after the rename the app takes over the folder `OpenFTPUpdater-AI` and the SFTP password saved
+Each app has its own data folder, without secrets:
+
+- **OpenReleasePilot**, `~/Library/Application Support/OpenReleasePilot/`: `config.json` (managed
+  repositories, content targets, token settings), `jobs/` (one file and one log per care job; the newest
+  50 finished jobs are kept), `content.json` (what each content target was last brought to) and `work/`
+  (the work folders of open jobs, removed when a job is finished).
+- **OpenSitePilot**, `~/Library/Application Support/OpenSitePilot/`: `config.json` (website and SFTP
+  settings) and `uploads/` (the upload manifests).
+
+On the first start after the rename OpenReleasePilot takes over the folder `OpenFTPUpdater-AI` and the SFTP password saved
 under the old name; macOS may ask once whether OpenReleasePilot may use that keychain entry.
 
 ## Building
@@ -629,21 +669,43 @@ under the old name; macOS may ask once whether OpenReleasePilot may use that key
 ```bash
 cd desktop
 npm ci
-npm run build
+scripts/build-pkg.sh releasepilot   # or: scripts/build-pkg.sh sitepilot
 ```
 
-`scripts/build-pkg.sh` builds the installer as CI does: `dist/OpenReleasePilot-<version>.pkg` with a
-`.sha256` file (`VERSION=0.2.0 scripts/build-pkg.sh`). `SIGN_IDENTITY` (Developer ID Application) and
-`INSTALLER_IDENTITY` (Developer ID Installer) sign app and package; without them the app is ad-hoc signed
-and the package unsigned.
+`scripts/build-pkg.sh` builds the installer as CI does: `dist/<App>-<version>.pkg` with a `.sha256` file,
+OpenReleasePilot without an argument (`VERSION=0.5.0 scripts/build-pkg.sh sitepilot`). The Tauri CLI runs
+inside the app's folder (`desktop/src-tauri` or `desktop/sitepilot`), because both apps share one
+workspace. The app ends up in `desktop/target/release/bundle/macos/<App>.app` (ad-hoc signed). During
+development: `cd desktop/src-tauri && npx tauri dev` or `cd desktop/sitepilot && npx tauri dev`. Tests:
+`cargo test --workspace`; tests that read GitHub or run Claude (a few cents) are marked `ignored` and run
+with `cargo test -p openreleasepilot-core -- --ignored`; none of them writes to a real repository.
+
+`SIGN_IDENTITY` (Developer ID Application) and `INSTALLER_IDENTITY` (Developer ID Installer) sign app and
+package; without them the app is ad-hoc signed and the package unsigned.
+
+`bundle.macOS.minimumSystemVersion` is deliberately unset: with `MACOSX_DEPLOYMENT_TARGET=14.0`,
+Rust 1.94 on macOS 27 produced proc-macro libraries that fail to load in release builds
+("mis-aligned LINKEDIT string pool").
+
+```
+desktop/core        Rust library shared by both apps: config, repositories, care rules, content targets,
+                    jobs, site.json, shell/PATH, git, GitHub, GitLab, Claude, SFTP, manifest, verify, updates
+desktop/src-tauri   OpenReleasePilot: state, commands, job passes, menu bar icon
+desktop/sitepilot   OpenSitePilot: state, commands, the four website steps
+desktop/ui          Web UI of both apps without a build step: index.html + releasepilot.js (OpenReleasePilot),
+                    site.html + sitepilot.js (OpenSitePilot), common.js and style.css shared
+```
 
 ## Continuous integration and releases
 
-- `.github/workflows/ci.yml`: every pull request and every push to `main` runs the core tests and the
-  release build (`build.yml`, macOS 15, Apple silicon).
-- `.github/workflows/release.yml`: a tag `X.Y.Z` (or `X.Y.Z-beta.N` for a pre-release) runs the same
-  build with that version, signs the `.pkg` with minisign and publishes a GitHub release with the
-  `.pkg`, its checksum and its `.minisig`. Publishing only starts after tests and build are green, and
+- `.github/workflows/ci.yml`: every pull request and every push to `main` runs `build.yml` (macOS 15,
+  Apple silicon): `cargo test --workspace`, `node --check` for every `ui/*.js` and the build of both
+  packages.
+- `.github/workflows/release.yml`: a tag `X.Y.Z` (or `X.Y.Z-beta.N` for a pre-release) builds both apps
+  with that version, signs both `.pkg` with minisign and publishes a GitHub release with
+  `OpenReleasePilot-<version>.pkg` and `OpenSitePilot-<version>.pkg`, each with its checksum and its
+  `.minisig`. The OpenReleasePilot package is uploaded first: versions before the split take the first
+  `.pkg` of a release and so keep getting OpenReleasePilot. Publishing only starts after tests and build are green, and
   needs the repository secret `MINISIGN_SECRET_KEY` (the secret key matching `desktop/update-key.pub`);
   without it the workflow stops instead of publishing an unsigned installer.
 - All actions are pinned to commit SHAs (version as a comment); Dependabot proposes updates for actions,
@@ -651,22 +713,6 @@ and the package unsigned.
 
 ```bash
 git tag 0.2.0 && git push origin 0.2.0
-```
-
-The app ends up in `desktop/target/release/bundle/macos/OpenReleasePilot.app` (ad-hoc signed).
-During development: `npm run dev`. Tests: `cargo test --workspace`; tests that read GitHub or run
-Claude (a few cents) are marked `ignored` and run with `cargo test -p openreleasepilot-core -- --ignored`;
-none of them writes to a real repository.
-
-`bundle.macOS.minimumSystemVersion` is deliberately unset: with `MACOSX_DEPLOYMENT_TARGET=14.0`,
-Rust 1.94 on macOS 27 produced proc-macro libraries that fail to load in release builds
-("mis-aligned LINKEDIT string pool").
-
-```
-desktop/core       Rust library: config, repositories and their health, care rules, content targets,
-                   jobs, site.json, shell/PATH, git, GitHub, Claude, SFTP, manifest, verify
-desktop/src-tauri  Tauri app: state, commands, job passes, the website's four steps
-desktop/ui         Web UI (HTML, JS, CSS), no build step
 ```
 
 ## License

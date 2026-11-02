@@ -5,22 +5,17 @@ mod jobrun;
 mod steps;
 mod tray;
 
-use steps::{NewProductInput, Work};
+use steps::Work;
 
-use openreleasepilot_core::claude::{Outcome, Outdated, ReleaseCheck};
-use openreleasepilot_core::config::{self, AuthKind, Config, ManagedRepo, ReleaseRule};
+use openreleasepilot_core::config::{self, Config, ManagedRepo, ReleaseRule};
 use openreleasepilot_core::content::{self, ContentTarget, TargetState};
 use openreleasepilot_core::jobs::{self, Job, JobOptions};
 use openreleasepilot_core::update::{self, ReleaseInfo};
 use openreleasepilot_core::forge::{self, Forge};
-use openreleasepilot_core::{github, gitlab, localrepo, manifest, repos, security};
+use openreleasepilot_core::{github, gitlab, localrepo, repos, security, site};
 use openreleasepilot_core::paths::{self, abbreviate_home, expand_home};
-use openreleasepilot_core::secrets;
 use openreleasepilot_core::tokens;
-use openreleasepilot_core::sftp::{self, ConnectError};
 use openreleasepilot_core::shell::Runner;
-use openreleasepilot_core::site::{self, Site};
-use openreleasepilot_core::verify::Report;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,16 +27,8 @@ use tauri_plugin_opener::OpenerExt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Step {
-    Precheck,
-    Update,
-    Upload,
-    Verify,
     /// A pass of a care job; its lines go to the job's own log.
     Jobs,
-}
-
-impl Step {
-    pub const ALL: [Step; 5] = [Step::Precheck, Step::Update, Step::Upload, Step::Verify, Step::Jobs];
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Default)]
@@ -69,17 +56,8 @@ pub struct StepState {
     pub summary: String,
     /// Unix seconds.
     pub finished_at: Option<u64>,
-    /// The result predates a later Update or Upload (only used for Precheck).
-    pub stale: bool,
     #[serde(skip)]
     pub log: Vec<LogLine>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct Check {
-    pub label: String,
-    pub status: Status,
-    pub detail: String,
 }
 
 /// What the Repositories area knows about one repository; read only, kept in memory.
@@ -111,19 +89,9 @@ pub fn next_token() -> u64 {
 
 pub struct Model {
     pub config: Config,
-    pub site: Result<Site, String>,
     pub steps: BTreeMap<Step, StepState>,
     pub running: Option<Step>,
     pub runner: Option<Arc<Runner>>,
-    pub checks: Vec<Check>,
-    /// `None` until a precheck has looked at the releases.
-    pub outdated: Option<ReleaseCheck>,
-    /// Product id → newest release tag, as last looked up.
-    pub latest_tags: BTreeMap<String, String>,
-    /// Claude runs of the last Update or New product, one per task.
-    pub claude_runs: Vec<ClaudeRun>,
-    pub upload: Option<UploadResult>,
-    pub verify: Option<Report>,
     /// Repository key → what the Repositories area read about it.
     pub repo_status: BTreeMap<String, RepoStatus>,
     /// Care jobs, newest first; each also stored as a file.
@@ -134,8 +102,6 @@ pub struct Model {
     pub jobs_unreadable: Vec<String>,
     /// Content target id → what it was last brought to.
     pub content_states: BTreeMap<String, TargetState>,
-    /// Fingerprint the user has to confirm before the first SFTP connection.
-    pub pending_host_key: Option<String>,
     /// Newer version of the app itself, found by the update check.
     pub available_update: Option<ReleaseInfo>,
     pub checking_update: bool,
@@ -144,28 +110,9 @@ pub struct Model {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ClaudeRun {
-    pub task: String,
-    pub model: String,
-    pub outcome: Outcome,
-}
-
-#[derive(Debug, Clone, Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct UploadResult {
-    pub uploaded: usize,
-    pub deleted: usize,
-    pub unchanged: usize,
-    /// What happened with git, e.g. `2 Commit(s) gepusht`.
-    pub pushed: String,
-}
-
 impl Model {
     fn load() -> Self {
         let config = config::load();
-        let site = load_site(&config);
         // A job that was running when the app stopped is marked, never continued by itself.
         let (mut jobs, jobs_unreadable) = jobs::load_all();
         for job in &mut jobs {
@@ -176,22 +123,14 @@ impl Model {
         jobs::prune(&mut jobs);
         Self {
             config,
-            site,
-            steps: Step::ALL.iter().map(|s| (*s, StepState::default())).collect(),
+            steps: BTreeMap::from([(Step::Jobs, StepState::default())]),
             running: None,
             runner: None,
-            checks: Vec::new(),
-            outdated: None,
-            latest_tags: BTreeMap::new(),
-            claude_runs: Vec::new(),
-            upload: None,
-            verify: None,
             repo_status: BTreeMap::new(),
             jobs,
             job_running: None,
             jobs_unreadable,
             content_states: content::load_states(),
-            pending_host_key: None,
             available_update: None,
             checking_update: false,
             installing_update: false,
@@ -199,28 +138,6 @@ impl Model {
             error: None,
         }
     }
-}
-
-pub fn load_site(config: &Config) -> Result<Site, String> {
-    if config.project_dir.trim().is_empty() {
-        return Err("Keine Website eingerichtet".into());
-    }
-    site::load(&expand_home(&config.project_dir)).map_err(|e| format!("{e:#}"))
-}
-
-/// The managed repositories, with the website's product links where a website is set up.
-pub fn repo_targets(config: &Config, site: &Result<Site, String>) -> Vec<repos::RepoTarget> {
-    let website = if config.project_dir.trim().is_empty() { None } else { localrepo::origin_repo(&expand_home(&config.project_dir)) };
-    repos::targets(config, site.as_ref().ok(), website.as_deref())
-}
-
-/// Keys of the managed repositories that feed the website: those of its selected products.
-pub fn website_sources(config: &Config, site: &Result<Site, String>) -> Option<Vec<String>> {
-    let site = site.as_ref().ok()?;
-    let mut keys: Vec<String> = site.products.iter().filter(|p| config.product_enabled(&p.id)).map(|p| p.repo.trim().to_lowercase()).collect();
-    keys.retain(|k| config.repository(k).is_some());
-    keys.dedup();
-    Some(keys)
 }
 
 fn save_config(app: &AppHandle, change: impl FnOnce(&mut Config) -> Result<(), String>) -> Result<(), String> {
@@ -290,14 +207,6 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct LastUpload {
-    commit: Option<String>,
-    uploaded_at: Option<u64>,
-    files: usize,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
 struct View {
     version: String,
     /// Debug build: no update check.
@@ -307,34 +216,14 @@ struct View {
     /// The system material shows behind the window; the page leaves its sidebar transparent.
     vibrancy: bool,
     config: Config,
-    project_display: String,
     /// Folder with the clones, as displayed (auto value if not set).
     workspace_display: String,
-    /// `owner/name` of the website repository (origin of the project folder).
-    site_repo: Option<String>,
-    site: Option<Site>,
-    /// Project file in use: `.openreleasepilot/site.json`, or the old path while only that exists.
-    site_file: &'static str,
-    site_error: Option<String>,
-    sftp_ready: bool,
-    steps: BTreeMap<Step, StepState>,
     running: Option<Step>,
-    checks: Vec<Check>,
-    outdated: Option<Vec<Outdated>>,
-    /// Products whose newest release the last lookup could not read.
-    release_unknown: Vec<String>,
-    products: Vec<steps::ProductView>,
-    tasks: Vec<steps::ResolvedTask>,
-    claude_runs: Vec<ClaudeRun>,
-    upload: Option<UploadResult>,
-    verify: Option<Report>,
     repositories: Vec<RepoView>,
     targets: Vec<TargetView>,
     jobs: Vec<JobSummary>,
     job_running: Option<String>,
     jobs_unreadable: Vec<String>,
-    /// Keys of the managed repositories that feed the website; `None` without a website.
-    website_sources: Option<Vec<String>>,
     /// Whether gh is signed in, once known.
     signed_in: Option<bool>,
     /// The GitLab instances: those of managed repositories and those glab is signed in to.
@@ -343,8 +232,6 @@ struct View {
     fresh_secs: u64,
     /// Unix seconds when the view was made.
     now: u64,
-    last_upload: Option<LastUpload>,
-    pending_host_key: Option<String>,
     available_update: Option<ReleaseInfo>,
     checking_update: bool,
     installing_update: bool,
@@ -501,8 +388,7 @@ fn freshness(state: &TargetState, status: &BTreeMap<String, RepoStatus>) -> Vec<
 fn get_view(app: AppHandle) -> View {
     let version = app.package_info().version.to_string();
     // Reads .git/config of the clones: outside the lock.
-    let (site, config) = with_model(&app, |m| (m.site.clone(), m.config.clone()));
-    let targets = repo_targets(&config, &site);
+    let targets = repos::targets(&with_model(&app, |m| m.config.clone()));
     let now = steps::now();
     with_model(&app, |m| {
         let open_job = |pred: &dyn Fn(&Job) -> bool| {
@@ -515,23 +401,8 @@ fn get_view(app: AppHandle) -> View {
             platform: std::env::consts::OS,
             vibrancy: VIBRANCY.load(Ordering::Relaxed),
             config: m.config.clone(),
-            project_display: if m.config.project_dir.is_empty() { String::new() } else { abbreviate_home(&expand_home(&m.config.project_dir)) },
             workspace_display: abbreviate_home(&m.config.workspace()),
-            site_repo: if m.config.project_dir.is_empty() { None } else { localrepo::origin_repo(&expand_home(&m.config.project_dir)) },
-            site: m.site.as_ref().ok().cloned(),
-            site_file: if m.config.project_dir.is_empty() { site::SITE_FILE } else { site::file_name(&expand_home(&m.config.project_dir)) },
-            site_error: if m.config.project_dir.is_empty() { None } else { m.site.as_ref().err().cloned() },
-            sftp_ready: m.config.sftp.is_complete(),
-            steps: m.steps.clone(),
             running: m.running,
-            checks: m.checks.clone(),
-            outdated: m.outdated.as_ref().map(|c| c.outdated.clone()),
-            release_unknown: m.outdated.as_ref().map(|c| c.unknown.clone()).unwrap_or_default(),
-            products: m.site.as_ref().map(|site| steps::resolve_products(site, &m.config, &m.latest_tags)).unwrap_or_default(),
-            tasks: m.site.as_ref().map(|site| steps::resolve_tasks(site, &m.config)).unwrap_or_default(),
-            claude_runs: m.claude_runs.clone(),
-            upload: m.upload.clone(),
-            verify: m.verify.clone(),
             repositories: targets
                 .into_iter()
                 .map(|target| {
@@ -574,17 +445,10 @@ fn get_view(app: AppHandle) -> View {
             jobs: m.jobs.iter().map(|j| summary(j, m.job_running.as_deref() == Some(j.id.as_str()))).collect(),
             job_running: m.job_running.clone(),
             jobs_unreadable: m.jobs_unreadable.clone(),
-            website_sources: website_sources(&m.config, &m.site),
             signed_in: if m.config.github_token_saved { Some(true) } else { github::signed_in() },
             gitlab_hosts: gitlab_hosts(&m.config),
             fresh_secs: repos::FRESH_SECS,
             now,
-            last_upload: manifest::load_last(&m.config.sftp).map(|last| LastUpload {
-                commit: last.commit.map(|c| c.chars().take(7).collect()),
-                uploaded_at: last.uploaded_at,
-                files: last.files.len(),
-            }),
-            pending_host_key: m.pending_host_key.clone(),
             available_update: m.available_update.clone(),
             checking_update: m.checking_update,
             installing_update: m.installing_update,
@@ -594,39 +458,22 @@ fn get_view(app: AppHandle) -> View {
     })
 }
 
-#[tauri::command]
-fn get_log(app: AppHandle, step: Step) -> Vec<LogLine> {
-    with_model(&app, |m| m.steps.get(&step).map(|s| s.log.clone()).unwrap_or_default())
-}
-
 // MARK: Settings
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SettingsInput {
-    project_dir: String,
     #[serde(default)]
     workspace_dir: String,
-    host: String,
-    port: u16,
-    user: String,
-    remote_dir: String,
-    auth: AuthKind,
-    key_path: String,
-    /// New password or passphrase; empty keeps the stored one.
-    secret: String,
     /// Look for a new app version at start.
     #[serde(default = "yes")]
     update_check: bool,
-    /// Claude model for care jobs without a choice; empty = the website's, else Claude Code's default.
+    /// Claude model for care jobs without a choice; empty = Claude Code's default.
     #[serde(default)]
     claude_model: String,
-    /// Cost limit per Claude run of a care job, as typed; empty = none (or the website's).
+    /// Cost limit per Claude run of a care job, as typed; empty = none.
     #[serde(default)]
     max_budget_usd: String,
-    /// A server key the user confirmed in the dialog for a server not saved yet; saved with the rest.
-    #[serde(default)]
-    host_key: String,
 }
 
 fn yes() -> bool {
@@ -636,46 +483,17 @@ fn yes() -> bool {
 /// The settings `input` makes of `current`, without saving anything or touching the keychain.
 fn settings_config(current: &Config, input: &SettingsInput) -> Result<Config, String> {
     let mut next = current.clone();
-    let previous_account = next.sftp.secret_account();
-    let target_changed = next.sftp.host.trim() != input.host.trim() || next.sftp.port != input.port;
-    next.project_dir = input.project_dir.trim().to_owned();
     next.workspace_dir = input.workspace_dir.trim().to_owned();
-    next.sftp.host = input.host.trim().to_owned();
-    next.sftp.port = if input.port == 0 { 22 } else { input.port };
-    next.sftp.user = input.user.trim().to_owned();
-    next.sftp.remote_dir = input.remote_dir.trim().to_owned();
-    next.sftp.auth = input.auth.clone();
-    next.sftp.key_path = input.key_path.trim().to_owned();
     next.no_update_check = !input.update_check;
     next.claude_model = input.claude_model.trim().to_owned();
     next.max_budget_usd = config::parse_budget(&input.max_budget_usd)?;
-    if target_changed {
-        // Another server needs its own confirmed host key.
-        next.sftp.host_key.clear();
-    }
-    if !input.host_key.trim().is_empty() {
-        next.sftp.host_key = input.host_key.trim().to_owned();
-    }
-    if next.sftp.secret_account() != previous_account && next.sftp.secret_saved && input.secret.is_empty() {
-        // The keychain entry belongs to the old user/host; ask for the password again.
-        next.sftp.secret_saved = false;
-    }
     Ok(next)
 }
 
 fn apply_settings(app: &AppHandle, input: SettingsInput) -> Result<(), String> {
-    let mut next = settings_config(&with_model(app, |m| m.config.clone()), &input)?;
-    if !input.secret.is_empty() {
-        secrets::set(&next.sftp, &input.secret).map_err(|e| format!("{e:#}"))?;
-        next.sftp.secret_saved = true;
-    }
+    let next = settings_config(&with_model(app, |m| m.config.clone()), &input)?;
     config::save(&next).map_err(|e| format!("{e:#}"))?;
-    let site = load_site(&next);
-    with_model(app, |m| {
-        m.config = next;
-        m.site = site;
-        m.pending_host_key = None;
-    });
+    with_model(app, |m| m.config = next);
     changed(app);
     Ok(())
 }
@@ -775,75 +593,6 @@ async fn forget_forge_token(app: AppHandle, forge: Forge) -> Result<(), String> 
     .await
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
-enum ConnectionTest {
-    Connected { message: String },
-    /// The server is not trusted yet: the dialog shows its key; trusted, it goes along with the next test and save.
-    UnknownHostKey { fingerprint: String },
-}
-
-/// Connects once with the dialog's entries and lists the target folder. Saves nothing:
-/// only "Sichern" does.
-#[tauri::command]
-async fn test_connection(app: AppHandle, input: SettingsInput) -> Result<ConnectionTest, String> {
-    blocking(move || {
-        let sftp_config = settings_config(&with_model(&app, |m| m.config.clone()), &input)?.sftp;
-        let secret = if !input.secret.is_empty() {
-            Some(input.secret.clone())
-        } else if sftp_config.secret_saved {
-            secrets::get(&sftp_config)
-        } else {
-            None
-        };
-        match sftp::connect(&sftp_config, secret.as_deref()) {
-            Ok(connection) => {
-                let names = connection.list_root().map_err(|e| format!("{e:#}"))?;
-                Ok(ConnectionTest::Connected {
-                    message: format!("Verbunden. Zielordner enthält {} Einträge{}", names.len(), steps::preview(&names)),
-                })
-            }
-            Err(ConnectError::UnknownHostKey(fingerprint)) => Ok(ConnectionTest::UnknownHostKey { fingerprint }),
-            Err(e) => Err(e.to_string()),
-        }
-    })
-    .await
-}
-
-#[tauri::command]
-fn trust_host_key(app: AppHandle, fingerprint: String) -> Result<(), String> {
-    let next = with_model(&app, |m| {
-        m.config.sftp.host_key = fingerprint;
-        m.pending_host_key = None;
-        m.config.clone()
-    });
-    config::save(&next).map_err(|e| format!("{e:#}"))?;
-    changed(&app);
-    Ok(())
-}
-
-#[tauri::command]
-fn reject_host_key(app: AppHandle) {
-    with_model(&app, |m| m.pending_host_key = None);
-    changed(&app);
-}
-
-#[tauri::command]
-async fn forget_secret(app: AppHandle) -> Result<(), String> {
-    blocking(move || {
-        let sftp_config = with_model(&app, |m| m.config.sftp.clone());
-        secrets::delete(&sftp_config).map_err(|e| format!("{e:#}"))?;
-        let next = with_model(&app, |m| {
-            m.config.sftp.secret_saved = false;
-            m.config.clone()
-        });
-        config::save(&next).map_err(|e| format!("{e:#}"))?;
-        changed(&app);
-        Ok(())
-    })
-    .await
-}
-
 #[tauri::command]
 async fn pick_folder(app: AppHandle) -> Option<String> {
     blocking(move || app.dialog().file().blocking_pick_folder().and_then(|p| p.into_path().ok()).map(|p| p.display().to_string())).await
@@ -860,38 +609,6 @@ fn open_url(app: AppHandle, url: String) -> Result<(), String> {
         return Err("Nur http(s)-Adressen".into());
     }
     app.opener().open_url(url, None::<&str>).map_err(|e| e.to_string())
-}
-
-/// Turns an update task on or off and sets its model (empty = default).
-#[tauri::command]
-fn set_task(app: AppHandle, id: String, enabled: bool, model: String) -> Result<(), String> {
-    let next = with_model(&app, |m| {
-        let choice = m.config.tasks.entry(id).or_default();
-        choice.enabled = Some(enabled);
-        choice.model = model.trim().to_owned();
-        m.config.clone()
-    });
-    config::save(&next).map_err(|e| format!("{e:#}"))?;
-    changed(&app);
-    Ok(())
-}
-
-/// Turns watched products on or off; turned-off products are neither checked nor updated.
-#[tauri::command]
-fn set_products(app: AppHandle, ids: Vec<String>, enabled: bool) -> Result<(), String> {
-    let next = with_model(&app, |m| {
-        for id in ids {
-            if enabled {
-                m.config.skipped_products.remove(&id);
-            } else {
-                m.config.skipped_products.insert(id);
-            }
-        }
-        m.config.clone()
-    });
-    config::save(&next).map_err(|e| format!("{e:#}"))?;
-    changed(&app);
-    Ok(())
 }
 
 // MARK: App updates
@@ -1007,20 +724,6 @@ fn dismiss(app: AppHandle) {
     changed(&app);
 }
 
-// MARK: Steps
-
-#[tauri::command]
-fn run_step(app: AppHandle, step: Step, instructions: String, everything: Option<bool>) -> Result<(), String> {
-    let job = match step {
-        Step::Precheck => Work::Precheck,
-        Step::Update => Work::Update(instructions),
-        Step::Upload => Work::Upload(everything.unwrap_or(false)),
-        Step::Verify => Work::Verify,
-        Step::Jobs => return Err("Aufträge starten im Bereich Repositories".into()),
-    };
-    steps::start(&app, vec![job])
-}
-
 // MARK: Repositories
 
 /// The repository that publishes `target`'s release, with what was last read of it.
@@ -1034,8 +737,8 @@ pub(crate) fn upstream_of<'a>(m: &'a Model, target: &repos::RepoTarget) -> Optio
 /// soon as it arrives. Read only and without Claude; runs beside a step, never under the model lock.
 /// Also looks whether pull requests delivered by content targets were merged meanwhile.
 pub fn refresh_status(app: &AppHandle, keys: &[String]) {
-    let (site, config) = with_model(app, |m| (m.site.clone(), m.config.clone()));
-    let targets: Vec<repos::RepoTarget> = repo_targets(&config, &site).into_iter().filter(|t| keys.is_empty() || keys.contains(&t.key)).collect();
+    let config = with_model(app, |m| m.config.clone());
+    let targets: Vec<repos::RepoTarget> = repos::targets(&config).into_iter().filter(|t| keys.is_empty() || keys.contains(&t.key)).collect();
     if targets.is_empty() {
         return;
     }
@@ -1190,8 +893,8 @@ fn load_repo_details(app: AppHandle, key: String) -> Result<(), String> {
 /// The security check of the repositories (all when `keys` is empty), four at a time, each stored
 /// as soon as it arrives. Read only and without Claude.
 fn check_security_of(app: &AppHandle, keys: &[String]) {
-    let (site, config) = with_model(app, |m| (m.site.clone(), m.config.clone()));
-    let targets: Vec<repos::RepoTarget> = repo_targets(&config, &site).into_iter().filter(|t| keys.is_empty() || keys.contains(&t.key)).collect();
+    let config = with_model(app, |m| m.config.clone());
+    let targets: Vec<repos::RepoTarget> = repos::targets(&config).into_iter().filter(|t| keys.is_empty() || keys.contains(&t.key)).collect();
     if targets.is_empty() {
         return;
     }
@@ -1279,8 +982,7 @@ struct LocalRepo {
     /// Further clones of the same repository.
     others: Vec<String>,
     managed: bool,
-    /// A product of the website, or the website's own repository.
-    on_site: bool,
+    /// A website project: the clone has `.openreleasepilot/site.json`.
     is_website: bool,
 }
 
@@ -1296,20 +998,18 @@ struct LocalRepoList {
 /// selection the app offers. Reads only the clones' `.git/config`.
 #[tauri::command]
 async fn list_local_repos(app: AppHandle, dir: Option<String>) -> LocalRepoList {
-    let (site, config) = with_model(&app, |m| (m.site.clone().ok(), m.config.clone()));
+    let config = with_model(&app, |m| m.config.clone());
     blocking(move || {
         let folder = match dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
             Some(dir) => expand_home(dir),
             None => config.workspace(),
         };
-        let website = if config.project_dir.is_empty() { None } else { localrepo::origin_repo(&expand_home(&config.project_dir)) };
         let repos = localrepo::clones(&folder)
             .into_iter()
             .map(|clone| LocalRepo {
                 forge: Forge::of(&clone.repo),
                 managed: config.repository(&clone.repo).is_some(),
-                on_site: site.iter().flat_map(|s| s.products.iter()).any(|p| p.repo.trim().eq_ignore_ascii_case(&clone.repo)),
-                is_website: website.as_ref().is_some_and(|w| w.eq_ignore_ascii_case(&clone.repo)),
+                is_website: site::is_project(&clone.path),
                 path: clone.path.display().to_string(),
                 others: clone.others.iter().map(|p| p.display().to_string()).collect(),
                 repo: clone.repo,
@@ -1437,8 +1137,7 @@ fn update_repository(app: AppHandle, key: String, settings: RepoSettings) -> Res
     })
 }
 
-/// Takes a repository out of the managed list. Deletes nothing: not on GitHub, not the clone, not
-/// the website's configuration.
+/// Takes a repository out of the managed list. Deletes nothing: not on GitHub, not the clone.
 #[tauri::command]
 fn remove_repository(app: AppHandle, key: String) -> Result<(), String> {
     if let Some(job) = with_model(&app, |m| held_by_job(m, &key)) {
@@ -1529,7 +1228,7 @@ fn start_job(app: AppHandle, input: JobInput) -> Result<String, String> {
     let mut created = String::new();
     steps::start_with(&app, |m| {
         let open: Vec<&Job> = m.jobs.iter().filter(|j| j.open()).collect();
-        let scope = jobs::Scope { config: &m.config, website_sources: website_sources(&m.config, &m.site) };
+        let scope = jobs::Scope { config: &m.config };
         let now = steps::now();
         let job = jobs::make(&jobs::new_id(now, next_token()), now, &input.repos, &input.options, &scope)?;
         if let Some(why) = jobs::overlap(&open, &job.held(), &job.options) {
@@ -1681,91 +1380,6 @@ fn log_kind(kind: &str) -> &'static str {
     }
 }
 
-/// Precheck, then Update (only if something is outdated or there are instructions), Upload, Verify.
-#[tauri::command]
-fn run_all(app: AppHandle, instructions: String) -> Result<(), String> {
-    steps::start(&app, vec![Work::Precheck, Work::Update(instructions), Work::Upload(false), Work::Verify])
-}
-
-/// Claude adds a repository as a new product (runs in the Update slot, ends with a commit).
-#[tauri::command]
-fn run_add_product(app: AppHandle, input: NewProductInput) -> Result<(), String> {
-    if !github::is_repo_name(input.repo.trim()) {
-        return Err("Repository im Format owner/name angeben".into());
-    }
-    steps::start(&app, vec![Work::AddProduct(input)])
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoEntry {
-    #[serde(flatten)]
-    info: github::RepoInfo,
-    /// Absolute path of the clone in the repo folder, if any.
-    local_path: Option<String>,
-    on_site: bool,
-    is_website: bool,
-    /// Already in the managed list.
-    managed: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoList {
-    repos: Vec<RepoEntry>,
-    workspace: String,
-    /// Why only public repositories are listed, if so.
-    note: Option<String>,
-}
-
-/// The user's GitHub repositories with their local clone, whether the app manages them and their
-/// role on the website. Without a gh login: the public repositories of the owners already known.
-#[tauri::command]
-async fn list_repos(app: AppHandle) -> Result<RepoList, String> {
-    let (site, config) = with_model(&app, |m| (m.site.clone().ok(), m.config.clone()));
-    blocking(move || {
-        let workspace = config.workspace();
-        let (repos, note) = match github::user_repos() {
-            Ok(repos) => (repos, None),
-            Err(e) => {
-                let mut owners: Vec<String> = site
-                    .iter()
-                    .flat_map(|s| s.products.iter().map(|p| p.repo.clone()))
-                    .chain(config.repositories.iter().map(|r| r.repo.clone()))
-                    .filter_map(|repo| repo.split('/').next().map(str::to_owned))
-                    .collect();
-                owners.sort();
-                owners.dedup();
-                if owners.is_empty() {
-                    return Err(format!("{e:#}"));
-                }
-                let mut repos = Vec::new();
-                for owner in &owners {
-                    repos.extend(github::owner_repos(owner).map_err(|e| format!("{e:#}"))?);
-                }
-                (repos, Some(format!("{e:#}. Gezeigt werden nur öffentliche Repositories.")))
-            }
-        };
-        let mut clones = localrepo::clones_in(&workspace);
-        let website = if config.project_dir.is_empty() { None } else { localrepo::origin_repo(&expand_home(&config.project_dir)) };
-        let repos = repos
-            .into_iter()
-            .map(|info| {
-                let key = info.full_name.to_lowercase();
-                RepoEntry {
-                    local_path: clones.remove(&key).map(|p| p.display().to_string()),
-                    on_site: site.iter().flat_map(|s| s.products.iter()).any(|p| p.repo.eq_ignore_ascii_case(&info.full_name)),
-                    is_website: website.as_ref().is_some_and(|w| w.eq_ignore_ascii_case(&info.full_name)),
-                    managed: config.repository(&key).is_some(),
-                    info,
-                }
-            })
-            .collect();
-        Ok(RepoList { repos, workspace: abbreviate_home(&workspace), note })
-    })
-    .await
-}
-
 /// Clones a repository into the repo folder and returns its path.
 #[tauri::command]
 async fn clone_repo(app: AppHandle, repo: String, workspace_dir: String) -> Result<String, String> {
@@ -1778,30 +1392,6 @@ async fn clone_repo(app: AppHandle, repo: String, workspace_dir: String) -> Resu
             return Err("Repository im Format owner/name (GitHub) oder host/gruppe/name (GitLab) angeben".to_owned());
         }
         localrepo::clone(repo.trim(), &config.workspace()).map(|p| p.display().to_string()).map_err(|e| format!("{e:#}"))
-    })
-    .await
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RepoCheck {
-    info: github::RepoInfo,
-    latest_tag: Option<String>,
-    /// Absolute path of a clone found next to the project.
-    local_path: Option<String>,
-    on_site: bool,
-}
-
-#[tauri::command]
-async fn inspect_repo(app: AppHandle, repo: String) -> Result<RepoCheck, String> {
-    let (site, workspace) = with_model(&app, |m| (m.site.clone(), m.config.workspace()));
-    let site = site.map_err(|e| format!("Website nicht lesbar: {e}"))?;
-    blocking(move || {
-        let info = github::repo_info(repo.trim()).map_err(|e| format!("{e:#}"))?;
-        let latest_tag = github::latest_release(&info.full_name).map_err(|e| format!("{e:#}"))?;
-        let local_path = localrepo::clones_in(&workspace).remove(&info.full_name.to_lowercase()).map(|p| p.display().to_string());
-        let on_site = site.products.iter().any(|p| p.repo.eq_ignore_ascii_case(&info.full_name));
-        Ok(RepoCheck { info, latest_tag, local_path, on_site })
     })
     .await
 }
@@ -1835,22 +1425,14 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             get_view,
-            get_log,
             save_settings,
             save_forge_token,
             forget_forge_token,
-            test_connection,
-            trust_host_key,
-            reject_host_key,
-            forget_secret,
             pick_folder,
             pick_file,
             open_url,
             dismiss,
             dismiss_notice,
-            run_step,
-            run_all,
-            run_add_product,
             refresh_repos,
             cancel_repo_refresh,
             load_repo_details,
@@ -1873,14 +1455,10 @@ fn main() {
             delete_job,
             get_job,
             get_job_log,
-            set_task,
-            set_products,
             check_for_updates,
             install_update,
             dismiss_update,
-            list_repos,
             clone_repo,
-            inspect_repo,
             cancel
         ])
         // Closing the window keeps the app in the menu bar, with running jobs going on; it ends
@@ -1913,38 +1491,23 @@ mod tests {
     use super::*;
 
     fn input(changes: serde_json::Value) -> SettingsInput {
-        let mut base = serde_json::json!({
-            "projectDir": "~/site", "workspaceDir": "", "host": "h", "port": 22, "user": "u", "remoteDir": "/w",
-            "auth": "password", "keyPath": "", "secret": "", "updateCheck": true, "claudeModel": "", "maxBudgetUsd": "2",
-        });
+        let mut base = serde_json::json!({ "workspaceDir": "", "updateCheck": true, "claudeModel": "", "maxBudgetUsd": "2" });
         base.as_object_mut().unwrap().extend(changes.as_object().unwrap().clone());
         serde_json::from_value(base).unwrap()
     }
 
     fn saved() -> Config {
-        Config {
-            project_dir: "~/site".into(),
-            max_budget_usd: Some(2.0),
-            sftp: config::SftpConfig {
-                host: "h".into(),
-                user: "u".into(),
-                remote_dir: "/w".into(),
-                host_key: "SHA256:old".into(),
-                secret_saved: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
+        Config { max_budget_usd: Some(2.0), project_dir: "~/site".into(), ..Default::default() }
     }
 
     #[test]
     fn settings_are_built_without_changing_the_saved_ones() {
         let current = saved();
-        let next = settings_config(&current, &input(serde_json::json!({ "projectDir": "~/other", "maxBudgetUsd": "1,50" }))).unwrap();
-        assert_eq!(next.project_dir, "~/other");
+        let next = settings_config(&current, &input(serde_json::json!({ "workspaceDir": "~/Code", "maxBudgetUsd": "1,50" }))).unwrap();
+        assert_eq!(next.workspace_dir, "~/Code");
         assert_eq!(next.max_budget_usd, Some(1.5));
-        assert_eq!(current.project_dir, "~/site", "the saved settings stay as they are");
-        assert_eq!(next.sftp.host_key, "SHA256:old", "same server, same key");
+        assert_eq!(current.max_budget_usd, Some(2.0), "the saved settings stay as they are");
+        assert_eq!(next.project_dir, "~/site", "the old website settings stay for OpenSitePilot");
     }
 
     #[test]
@@ -1954,14 +1517,5 @@ mod tests {
         }
         let next = settings_config(&saved(), &input(serde_json::json!({ "maxBudgetUsd": "" }))).unwrap();
         assert_eq!(next.max_budget_usd, None, "only an empty field removes it");
-    }
-
-    #[test]
-    fn another_server_needs_its_own_key() {
-        let next = settings_config(&saved(), &input(serde_json::json!({ "host": "other" }))).unwrap();
-        assert!(next.sftp.host_key.is_empty());
-        assert!(!next.sftp.secret_saved, "the stored password belongs to the old server");
-        let trusted = settings_config(&saved(), &input(serde_json::json!({ "host": "other", "hostKey": "SHA256:new" }))).unwrap();
-        assert_eq!(trusted.sftp.host_key, "SHA256:new", "a key confirmed in the dialog is kept");
     }
 }

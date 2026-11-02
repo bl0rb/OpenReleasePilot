@@ -1,12 +1,32 @@
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+/// The repository app; the default identity of a process.
 pub const APP_NAME: &str = "OpenReleasePilot";
+/// The website app: build, upload, live check.
+pub const SITE_APP_NAME: &str = "OpenSitePilot";
 /// Name before the rename; its data folder and keychain entries are taken over.
 pub const LEGACY_APP_NAME: &str = "OpenFTPUpdater-AI";
 
-/// `~/Library/Application Support/OpenReleasePilot` on macOS, `%APPDATA%\OpenReleasePilot` on Windows.
+static APP: OnceLock<&'static str> = OnceLock::new();
+
+/// Sets which app this process is, once at start, before anything reads a path; the default is
+/// OpenReleasePilot. Decides the data folder, keychain service and update package.
+pub fn set_app(name: &'static str) {
+    let _ = APP.set(name);
+}
+
+pub fn app_name() -> &'static str {
+    APP.get().copied().unwrap_or(APP_NAME)
+}
+
+/// `~/Library/Application Support/<app>` on macOS, `%APPDATA%\<app>` on Windows.
 pub fn data_dir() -> PathBuf {
-    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join(APP_NAME)
+    data_dir_of(app_name())
+}
+
+pub fn data_dir_of(app: &str) -> PathBuf {
+    dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join(app)
 }
 
 /// Takes over the data folder of the app under its old name (settings, upload manifests), once.

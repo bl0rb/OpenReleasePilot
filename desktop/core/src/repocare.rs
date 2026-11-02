@@ -1745,10 +1745,8 @@ mod tests {
             forge: crate::forge::Forge::Github,
             github_id: None,
             enabled: true,
-            products: Vec::new(),
             release: Some(ReleaseRule { tag_prefix: String::new(), publishes_release: false }),
             released_by: None,
-            conflicts: Vec::new(),
             local: LocalCopy::Found { path: dir.display().to_string() },
             website: false,
         }

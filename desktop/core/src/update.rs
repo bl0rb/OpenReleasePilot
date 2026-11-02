@@ -1,11 +1,13 @@
 //! Updates of the app itself, as in ClaudeKeyZapper: the newest GitHub release of
-//! `bl0rb/OpenReleasePilot`, its `.pkg` downloaded and verified against the SHA-256 digest GitHub
+//! `bl0rb/OpenReleasePilot`, which carries the package of each app (`<app>-<version>.pkg`); the
+//! running app's package is downloaded and verified against the SHA-256 digest GitHub
 //! publishes for the asset and against the release's minisign signature (`<package>.minisig`), then
 //! handed to the macOS installer. The signature is made in CI with a key whose public half is built
 //! into the app (`desktop/update-key.pub`): the hash alone only proves the download is what GitHub
 //! serves, the signature proves the release was built by our pipeline.
 
 use crate::github;
+use crate::paths::app_name;
 use anyhow::{bail, Context, Result};
 use minisign_verify::{PublicKey, Signature};
 use sha2::{Digest, Sha256};
@@ -58,10 +60,17 @@ fn newest(releases: &serde_json::Value) -> Option<ReleaseInfo> {
 }
 
 fn release_info(release: &serde_json::Value) -> Option<ReleaseInfo> {
+    release_info_for(release, app_name())
+}
+
+/// The release with the package of `app`; a release without one has no `package_url`.
+fn release_info_for(release: &serde_json::Value, app: &str) -> Option<ReleaseInfo> {
     // Only packages served by GitHub itself; `*.pkg.sha256` does not end with `.pkg`.
     let assets = release["assets"].as_array()?;
     let from_github = |a: &&serde_json::Value| a["browser_download_url"].as_str().is_some_and(|u| u.starts_with("https://github.com/"));
-    let asset = assets.iter().filter(from_github).find(|a| a["name"].as_str().is_some_and(|n| n.ends_with(PACKAGE_EXTENSION)));
+    let prefix = format!("{app}-");
+    let ours = |n: &str| n.starts_with(&prefix) && n.ends_with(PACKAGE_EXTENSION);
+    let asset = assets.iter().filter(from_github).find(|a| a["name"].as_str().is_some_and(ours));
     let signature = asset.and_then(|a| a["name"].as_str()).and_then(|package| {
         let name = format!("{package}{SIGNATURE_EXTENSION}");
         assets.iter().filter(from_github).find(|a| a["name"].as_str() == Some(name.as_str()))
@@ -142,10 +151,10 @@ pub fn download_package(release: &ReleaseInfo) -> Result<PathBuf> {
     if hex_sha256(&data) != *expected {
         bail!("Prüfsumme des heruntergeladenen Pakets stimmt nicht. Installation abgebrochen.");
     }
-    let name = url.rsplit('/').next().filter(|n| n.ends_with(PACKAGE_EXTENSION)).unwrap_or("OpenReleasePilot.pkg");
+    let name = url.rsplit('/').next().filter(|n| n.ends_with(PACKAGE_EXTENSION)).unwrap_or("update.pkg");
     let signature = download(signature_url, 16 * 1024).context("Signatur konnte nicht geladen werden")?;
     verify_signature(UPDATE_PUBLIC_KEY, &data, &String::from_utf8_lossy(&signature), name)?;
-    let dir = std::env::temp_dir().join("OpenReleasePilot-Update");
+    let dir = std::env::temp_dir().join(format!("{}-Update", app_name()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).context("Download-Ordner anlegen")?;
     let target = dir.join(name);
@@ -174,7 +183,7 @@ pub fn install(package: &std::path::Path, version: &str) -> Result<Installed> {
     let output = std::process::Command::new("/usr/bin/osascript")
         .args(script.into_iter().flat_map(|line| ["-e", line]))
         .arg(package)
-        .arg(format!("OpenReleasePilot möchte das Update auf Version {version} installieren."))
+        .arg(format!("{} möchte das Update auf Version {version} installieren.", app_name()))
         .output()
         .context("Installer starten")?;
     let error = String::from_utf8_lossy(&output.stderr);
@@ -245,6 +254,27 @@ mod tests {
         assert_eq!(info.package_sha256.as_deref(), Some("abc"));
         assert_eq!(info.package_url.as_deref(), Some("https://github.com/x/y/OpenReleasePilot-0.1.2.pkg"));
         assert_eq!(info.signature_url, None);
+    }
+
+    #[test]
+    fn each_app_takes_its_own_package() {
+        let release: serde_json::Value = serde_json::from_str(
+            r#"{"tag_name":"0.5.0","html_url":"https://github.com/x/y/releases/0.5.0","assets":[
+              {"name":"OpenReleasePilot-0.5.0.pkg","browser_download_url":"https://github.com/x/y/OpenReleasePilot-0.5.0.pkg","digest":"sha256:AA"},
+              {"name":"OpenSitePilot-0.5.0.pkg","browser_download_url":"https://github.com/x/y/OpenSitePilot-0.5.0.pkg","digest":"sha256:BB"},
+              {"name":"OpenSitePilot-0.5.0.pkg.minisig","browser_download_url":"https://github.com/x/y/OpenSitePilot-0.5.0.pkg.minisig"}]}"#,
+        )
+        .unwrap();
+        let site = release_info_for(&release, "OpenSitePilot").unwrap();
+        assert_eq!(site.package_sha256.as_deref(), Some("bb"));
+        assert_eq!(site.signature_url.as_deref(), Some("https://github.com/x/y/OpenSitePilot-0.5.0.pkg.minisig"));
+        assert_eq!(release_info_for(&release, "OpenReleasePilot").unwrap().package_sha256.as_deref(), Some("aa"));
+        let older: serde_json::Value = serde_json::from_str(
+            r#"{"tag_name":"0.4.11","html_url":"https://github.com/x/y/releases/0.4.11","assets":[
+              {"name":"OpenReleasePilot-0.4.11.pkg","browser_download_url":"https://github.com/x/y/OpenReleasePilot-0.4.11.pkg","digest":"sha256:AA"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(release_info_for(&older, "OpenSitePilot").unwrap().package_url, None, "never the other app's package");
     }
 
     #[test]

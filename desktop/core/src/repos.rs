@@ -2,9 +2,8 @@
 //! website), what GitHub reports about them (read only, without Claude) and what follows from it:
 //! a health state with its reasons, and the care actions that are possible.
 //!
-//! A repository is identified by `owner/name`, case-insensitive (and GitHub's id where known). A
-//! website may name it in products of its site.json; those links are shown, but they neither add
-//! nor configure a repository. Facts carry when they were read and which part failed, so "0 PRs",
+//! A repository is identified by `owner/name`, case-insensitive (and GitHub's id where known).
+//! Websites and what they document are OpenSitePilot's. Facts carry when they were read and which part failed, so "0 PRs",
 //! "not asked" and "query failed" stay apart, and nothing old or incomplete ever reads as healthy.
 //! Nothing in this module writes: no GitHub write, no git command.
 
@@ -12,9 +11,9 @@ use crate::config::{Config, ManagedRepo, ReleaseRule};
 use crate::forge::Forge;
 use crate::github::{encode_ref, get, get_list, is_newer, Forbidden};
 use crate::localrepo;
+use crate::site;
 use crate::paths::expand_home;
 use crate::repocare::latest_release_tag;
-use crate::site::Site;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -26,18 +25,6 @@ pub const FRESH_SECS: u64 = 300;
 pub const DETAIL_LIMIT: usize = 30;
 
 // MARK: Identity
-
-/// A website product that names the repository.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProductLink {
-    pub id: String,
-    pub name: String,
-    pub documented: String,
-    pub tag_prefix: String,
-    /// Selected for the website's Precheck and Update.
-    pub enabled: bool,
-}
 
 /// The local clone of a managed repository.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -62,16 +49,13 @@ pub struct RepoTarget {
     pub github_id: Option<u64>,
     /// Turned off: listed and readable, but no care job takes it.
     pub enabled: bool,
-    /// Website products that name it; empty without a website.
-    pub products: Vec<ProductLink>,
     /// The release line the app may continue; `None` = no automatic tag.
     pub release: Option<ReleaseRule>,
     /// Key of the managed repository whose release publishes this one; `None` = none.
     pub released_by: Option<String>,
-    /// Where the configuration disagrees with itself, e.g. site.json and the release rule.
-    pub conflicts: Vec<String>,
     pub local: LocalCopy,
-    /// It is also the website's own repository.
+    /// It is a website project (its clone has `.openreleasepilot/site.json`), which OpenSitePilot
+    /// builds and pushes to directly.
     pub website: bool,
 }
 
@@ -99,47 +83,27 @@ impl RepoTarget {
     }
 }
 
-/// The managed repositories in the order they were added, each with the website products that
-/// name it. `website`: `owner/name` of the website's own repository, if there is one.
-pub fn targets(config: &Config, site: Option<&Site>, website: Option<&str>) -> Vec<RepoTarget> {
-    config.repositories.iter().map(|managed| target(managed, config, site, website)).collect()
+/// The managed repositories in the order they were added.
+pub fn targets(config: &Config) -> Vec<RepoTarget> {
+    config.repositories.iter().map(target).collect()
 }
 
-fn target(managed: &ManagedRepo, config: &Config, site: Option<&Site>, website: Option<&str>) -> RepoTarget {
-    let key = managed.key();
-    let products: Vec<ProductLink> = site
-        .into_iter()
-        .flat_map(|s| s.products.iter())
-        .filter(|p| p.repo.trim().eq_ignore_ascii_case(&key))
-        .map(|p| ProductLink {
-            id: p.id.clone(),
-            name: p.name.clone(),
-            documented: p.documented.clone(),
-            tag_prefix: p.tag_prefix.clone(),
-            enabled: config.product_enabled(&p.id),
-        })
-        .collect();
-    let mut conflicts = Vec::new();
-    if let Some(rule) = &managed.release {
-        for product in products.iter().filter(|p| p.tag_prefix != rule.tag_prefix) {
-            conflicts.push(format!(
-                "site.json nennt für {} das Tag-Präfix „{}“, die Release-Regel „{}“; es gilt die Release-Regel",
-                product.name, product.tag_prefix, rule.tag_prefix
-            ));
-        }
-    }
+fn target(managed: &ManagedRepo) -> RepoTarget {
+    let local = local_copy(&managed.local_path, &managed.repo);
+    let website = match &local {
+        LocalCopy::Found { path } => site::is_project(std::path::Path::new(path)),
+        _ => false,
+    };
     RepoTarget {
-        website: website.is_some_and(|w| w.eq_ignore_ascii_case(&key)),
+        key: managed.key(),
         forge: Forge::of(&managed.repo),
         repo: managed.repo.trim().to_owned(),
         github_id: managed.github_id,
         enabled: managed.enabled,
         release: managed.release.clone(),
         released_by: managed.released_by_key(),
-        local: local_copy(&managed.local_path, &managed.repo),
-        conflicts,
-        products,
-        key,
+        local,
+        website,
     }
 }
 
@@ -599,7 +563,6 @@ pub fn health_with(target: &RepoTarget, facts: Option<&Facts>, details: Option<&
     if !target.enabled {
         notes.push("deaktiviert: wird gelesen, aber nicht gepflegt".to_owned());
     }
-    notes.extend(target.conflicts.iter().cloned());
     let Some(facts) = facts else {
         gaps.insert(0, "noch nicht geprüft".to_owned());
         return Health { state: HealthState::Unknown, reasons: Vec::new(), gaps, notes, stale: false };
@@ -651,16 +614,6 @@ pub fn health_with(target: &RepoTarget, facts: Option<&Facts>, details: Option<&
                 if let Some(up) = &upstream {
                     if let Some(newer) = up.facts.and_then(Facts::version).filter(|v| is_newer(v, tag)) {
                         attention.push(format!("{} hat {newer}, hier ist {tag} das neueste Release: Export oder Workflow in {} prüfen", up.repo, up.repo));
-                    }
-                }
-                for product in &target.products {
-                    if is_newer(tag, &product.documented) {
-                        let text = format!("Website beschreibt {} {}, neuestes Release {tag}", product.name, product.documented);
-                        if product.enabled {
-                            attention.push(text);
-                        } else {
-                            notes.push(format!("{text} (Produkt nicht ausgewählt)"));
-                        }
                     }
                 }
             }
@@ -772,14 +725,6 @@ mod tests {
     use crate::github::mock;
     use serde_json::json;
 
-    fn site(products: Value) -> Site {
-        serde_json::from_value(json!({ "name": "s", "url": "https://s", "build": "b", "output": "dist", "products": products })).unwrap()
-    }
-
-    fn product(id: &str, repo: &str, prefix: &str) -> Value {
-        json!({ "id": id, "name": id.to_uppercase(), "repo": repo, "tagPrefix": prefix, "documented": "1.0.0" })
-    }
-
     fn managed(repos: &[&str]) -> Config {
         let mut config = Config::default();
         for repo in repos {
@@ -788,30 +733,39 @@ mod tests {
         config
     }
 
-    /// A managed repository with release rule (no prefix), named by one product of a website.
+    /// A managed repository with release rule (no prefix).
     fn target(repo: &str) -> RepoTarget {
         let mut config = managed(&[repo]);
         config.repositories[0].release = Some(ReleaseRule { tag_prefix: String::new(), publishes_release: false });
-        targets(&config, Some(&site(json!([product("a", repo, "")]))), None).remove(0)
+        targets(&config).remove(0)
     }
 
     #[test]
-    fn the_managed_list_is_the_basis_and_a_website_only_adds_links() {
-        let site = site(json!([product("a", "Owner/App", "v"), product("b", "owner/app", "v"), product("c", "owner/other", "")]));
+    fn the_managed_list_is_the_basis() {
         let mut config = managed(&["owner/app", "owner/tool"]);
-        config.skipped_products.insert("b".into());
         config.repositories[0].release = Some(ReleaseRule { tag_prefix: "".into(), publishes_release: false });
-        let list = targets(&config, Some(&site), Some("OWNER/TOOL"));
-        assert_eq!(list.len(), 2, "only managed repositories; owner/other is a product, not managed");
-        assert_eq!(list[0].products.iter().map(|p| (p.id.as_str(), p.enabled)).collect::<Vec<_>>(), [("a", true), ("b", false)]);
-        assert_eq!(list[0].conflicts.len(), 2, "site.json and the release rule disagree, visibly");
+        let list = targets(&config);
+        assert_eq!(list.len(), 2);
         assert_eq!(list[0].tag_prefix(), Some(""), "the release rule counts");
-        assert!(list[1].products.is_empty() && list[1].website);
-        assert!(targets(&config, None, None).iter().all(|t| t.products.is_empty()), "works without a website");
+        assert!(!list[1].website, "no clone, no site.json");
         let caps = capabilities(&list[1], None, Some(true));
         assert!(caps.tag.is_some() && caps.care.is_none(), "no release rule, no tag; care still possible");
         config.repositories[1].enabled = false;
-        assert_eq!(capabilities(&targets(&config, None, None)[1], None, Some(true)).care.as_deref(), Some("deaktiviert"));
+        assert_eq!(capabilities(&targets(&config)[1], None, Some(true)).care.as_deref(), Some("deaktiviert"));
+    }
+
+    #[test]
+    fn a_clone_with_site_json_is_a_website() {
+        let dir = std::env::temp_dir().join(format!("orp-website-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".openreleasepilot")).unwrap();
+        std::fs::write(dir.join(site::SITE_FILE), "{}").unwrap();
+        crate::shell::output("git", &["init", "-q"], &dir).unwrap();
+        crate::shell::output("git", &["remote", "add", "origin", "https://github.com/o/site.git"], &dir).unwrap();
+        let mut config = managed(&["o/site"]);
+        config.repositories[0].local_path = dir.display().to_string();
+        assert!(targets(&config)[0].website);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn runs(list: Value) -> Value {
@@ -874,7 +828,7 @@ mod tests {
     fn a_version_the_upstream_has_and_the_export_not_is_half_a_release() {
         let mut config = managed(&["o/ee", "o/core"]);
         config.repositories[1].released_by = "o/ee".into();
-        let core = targets(&config, None, None).remove(1);
+        let core = targets(&config).remove(1);
         assert_eq!(core.released_by.as_deref(), Some("o/ee"));
         let mut ee = clean(1000);
         ee.release = Fetch::Ok(None);
@@ -936,10 +890,6 @@ mod tests {
         let mut unreleased = clean(1000);
         unreleased.since = Fetch::Ok(Since { base_kind: "tag", base: "1.0.0".into(), commits: 3 });
         assert_eq!(health(&target, Some(&unreleased), None, 1000).reasons, ["3 Commits seit Tag 1.0.0"]);
-
-        let mut outdated = clean(1000);
-        outdated.release = Fetch::Ok(Some("1.1.0".into()));
-        assert_eq!(state(&outdated), HealthState::NeedsAttention, "the website documents 1.0.0");
     }
 
     #[test]
