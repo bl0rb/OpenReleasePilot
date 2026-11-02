@@ -83,6 +83,7 @@ const ICONS = {
   error: '<path d="M8 2h8l6 6v8l-6 6H8l-6-6V8z"/><path d="m15 9-6 6M9 9l6 6"/>',
   done: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
   download: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
+  upload: '<path d="M12 15V3M7 8l5-5 5 5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
   more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
   trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
   blank: '',
@@ -758,6 +759,8 @@ function uploadResult() {
   const items = [];
   const cfg = view.config.sftp;
   items.push(h('div', { class: 'facts' },
+    view.site && h('span', null, h('strong', null, 'Quelle: '), `${view.config.projectDir}/${view.site.output}`,
+      h('span', { class: 'muted small' }, ` (output in ${view.siteFile})`)),
     h('span', null, h('strong', null, 'Ziel: '), cfg.host ? `${cfg.user}@${cfg.host}:${cfg.port} ${cfg.remoteDir}` : 'nicht eingerichtet'),
     view.lastUpload && h('span', null, h('strong', null, 'Letzter Upload: '),
       `${view.lastUpload.uploadedAt ? formatTime(view.lastUpload.uploadedAt) : '?'} · Commit ${view.lastUpload.commit ?? '?'} · ${view.lastUpload.files} Dateien`)));
@@ -768,6 +771,11 @@ function uploadResult() {
       h('span', null, h('strong', null, 'Unverändert: '), view.upload.unchanged),
       h('span', null, h('strong', null, 'Git: '), view.upload.pushed)));
   }
+  // The step button sends only changes; this sends every file again, e.g. after the server lost some.
+  items.push(h('div', { class: 'facts' },
+    button('Alles neu hochladen', () => call('run_step', { step: 'upload', instructions: '', everything: true }),
+      { iconName: 'upload', disabled: !!view.running || !ready('upload'),
+        title: 'Build, Push, dann jede Datei des Ausgabeordners per SFTP hochladen, auch unveränderte' })));
   return items;
 }
 

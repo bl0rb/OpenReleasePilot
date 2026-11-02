@@ -120,7 +120,8 @@ impl Ctx {
 pub enum Work {
     Precheck,
     Update(String),
-    Upload,
+    /// `true` uploads every file of the build, not only the changed ones.
+    Upload(bool),
     Verify,
     AddProduct(NewProductInput),
     /// One pass of a care job: runs until it needs a decision, waits or is finished.
@@ -132,7 +133,7 @@ impl Work {
         match self {
             Work::Precheck => Step::Precheck,
             Work::Update(_) | Work::AddProduct(_) => Step::Update,
-            Work::Upload => Step::Upload,
+            Work::Upload(_) => Step::Upload,
             Work::Verify => Step::Verify,
             Work::Job(_) => Step::Jobs,
         }
@@ -298,7 +299,7 @@ pub fn start_with(app: &AppHandle, work: impl FnOnce(&mut Model) -> Result<Vec<W
             let result = match &unit {
                 Work::Precheck => precheck(&ctx),
                 Work::Update(instructions) => update(&ctx, instructions),
-                Work::Upload => upload(&ctx),
+                Work::Upload(everything) => upload(&ctx, *everything),
                 Work::Verify => verify(&ctx),
                 Work::AddProduct(input) => add_product(&ctx, input),
                 Work::Job(id) => crate::jobrun::pass(&ctx, id),
@@ -850,7 +851,7 @@ fn add_product(ctx: &Ctx, input: &NewProductInput) -> Result<(Status, String)> {
 
 // MARK: Upload
 
-pub(crate) fn upload(ctx: &Ctx) -> Result<(Status, String)> {
+pub(crate) fn upload(ctx: &Ctx, everything: bool) -> Result<(Status, String)> {
     let project = ctx.project()?;
     let site = ctx.site()?;
     let config = ctx.config();
@@ -879,11 +880,16 @@ pub(crate) fn upload(ctx: &Ctx) -> Result<(Status, String)> {
     if current.files.is_empty() {
         bail!("Ausgabeordner {} ist leer", site.output);
     }
+    ctx.info(format!("Quelle: {} ({} Dateien)", output.display(), current.files.len()));
     let previous = manifest::load_last(&config.sftp).unwrap_or_default();
     let first = previous.files.is_empty();
-    let diff = manifest::diff(&previous, &current);
-    ctx.info(format!("{} neu oder geändert, {} zu entfernen, {} unverändert", diff.upload.len(), diff.delete.len(), diff.unchanged));
-    if first {
+    let diff = if everything { manifest::diff_all(&previous, &current) } else { manifest::diff(&previous, &current) };
+    if everything {
+        ctx.info(format!("Alles neu hochladen: {} Dateien, {} zu entfernen", diff.upload.len(), diff.delete.len()));
+    } else {
+        ctx.info(format!("{} neu oder geändert, {} zu entfernen, {} unverändert", diff.upload.len(), diff.delete.len(), diff.unchanged));
+    }
+    if first && !everything {
         ctx.warn("Erster Upload mit dieser App: alle Dateien werden hochgeladen, vorhandene Dateien auf dem Server bleiben unberührt.");
     }
 

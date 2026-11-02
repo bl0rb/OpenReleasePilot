@@ -636,6 +636,10 @@ betroffen.
   einem temporären Namen und dann umbenannt, damit Besucher nie halbe Dateien bekommen. Gelöscht
   werden nur Dateien, die die App selbst hochgeladen hat; andere Dateien auf dem Server (andere
   Domains, `.htaccess`, …) bleiben unberührt.
+- Hochgeladen wird immer der Ausgabeordner aus `site.json` (`"output"`, z. B. `dist` oder `build/public`).
+- „Alles neu hochladen“ im Ergebnis von „Veröffentlichen“ lädt jede Datei des Builds hoch, auch
+  unveränderte, etwa wenn auf dem Server Dateien fehlen oder von anderswo überschrieben wurden.
+  Gelöscht wird dabei nichts anderes als beim normalen Upload.
 - Hochgeladen wird nur ein committeter, sauberer Stand, und nur wenn er nicht hinter `origin` liegt.
 
 Die Einstellungen liegen in `~/Library/Application Support/OpenReleasePilot/config.json` (verwaltete

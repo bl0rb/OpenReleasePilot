@@ -611,6 +611,10 @@ cannot widen its own rights; adding products is not affected.
   It uploads only new or changed files, assets before pages, each to a temporary name and then
   renamed, so visitors never get half-written files. It deletes only files that it uploaded itself
   before; other files on the server (other domains, `.htaccess`, …) are never touched.
+- The upload always sends the output folder from `site.json` (`"output"`, e.g. `dist` or `build/public`).
+- "Alles neu hochladen" in the result of "Veröffentlichen" uploads every file of the build, unchanged
+  ones too, e.g. when files are missing on the server or were overwritten from elsewhere. It deletes
+  nothing more than a normal upload.
 - Only a committed, clean working tree is uploaded, and only if it is not behind `origin`.
 
 Settings live in `~/Library/Application Support/OpenReleasePilot/config.json` (managed repositories,

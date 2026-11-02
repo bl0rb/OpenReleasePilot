@@ -1288,7 +1288,7 @@ fn website_publish(ctx: &Ctx, job: &mut Job, i: usize) -> Result<()> {
     }
     job.steps[i].writing = Some("Upload".into());
     save(ctx, job)?;
-    let uploaded = steps::upload(ctx);
+    let uploaded = steps::upload(ctx, false);
     job.steps[i].writing = None;
     let (_, upload_summary) = uploaded?;
     let site = ctx.site()?;

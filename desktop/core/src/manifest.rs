@@ -84,6 +84,11 @@ pub fn diff(previous: &Manifest, current: &Manifest) -> Diff {
     d
 }
 
+/// Every file of the build, for a server that lost files or got them from elsewhere; deletes as in `diff`.
+pub fn diff_all(previous: &Manifest, current: &Manifest) -> Diff {
+    Diff { upload: diff(&Manifest::default(), current).upload, delete: diff(previous, current).delete, unchanged: 0 }
+}
+
 fn last_upload_file(sftp: &SftpConfig) -> PathBuf {
     let key = format!("{}:{}:{}:{}", sftp.host.trim(), sftp.port, sftp.user.trim(), sftp.remote_dir.trim());
     let hash = hex::encode(Sha256::digest(key.as_bytes()));
@@ -119,5 +124,15 @@ mod tests {
         assert_eq!(d.upload, vec!["app.css", "index.html"]);
         assert_eq!(d.delete, vec!["old.css"]);
         assert_eq!(d.unchanged, 1);
+    }
+
+    #[test]
+    fn uploading_everything_keeps_the_deletes() {
+        let old = manifest(&[("index.html", "a"), ("old.css", "b"), ("logo.svg", "c")]);
+        let new = manifest(&[("index.html", "a"), ("logo.svg", "c")]);
+        let d = diff_all(&old, &new);
+        assert_eq!(d.upload, vec!["logo.svg", "index.html"]);
+        assert_eq!(d.delete, vec!["old.css"]);
+        assert_eq!(d.unchanged, 0);
     }
 }

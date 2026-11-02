@@ -1010,11 +1010,11 @@ fn dismiss(app: AppHandle) {
 // MARK: Steps
 
 #[tauri::command]
-fn run_step(app: AppHandle, step: Step, instructions: String) -> Result<(), String> {
+fn run_step(app: AppHandle, step: Step, instructions: String, everything: Option<bool>) -> Result<(), String> {
     let job = match step {
         Step::Precheck => Work::Precheck,
         Step::Update => Work::Update(instructions),
-        Step::Upload => Work::Upload,
+        Step::Upload => Work::Upload(everything.unwrap_or(false)),
         Step::Verify => Work::Verify,
         Step::Jobs => return Err("Aufträge starten im Bereich Repositories".into()),
     };
@@ -1684,7 +1684,7 @@ fn log_kind(kind: &str) -> &'static str {
 /// Precheck, then Update (only if something is outdated or there are instructions), Upload, Verify.
 #[tauri::command]
 fn run_all(app: AppHandle, instructions: String) -> Result<(), String> {
-    steps::start(&app, vec![Work::Precheck, Work::Update(instructions), Work::Upload, Work::Verify])
+    steps::start(&app, vec![Work::Precheck, Work::Update(instructions), Work::Upload(false), Work::Verify])
 }
 
 /// Claude adds a repository as a new product (runs in the Update slot, ends with a commit).
