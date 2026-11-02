@@ -1,0 +1,25 @@
+[package]
+name = "opensitepilot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+default-run = "opensitepilot"
+
+[[bin]]
+name = "opensitepilot"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+openreleasepilot-core = { path = "../core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+tauri = { version = "2", features = ["macos-private-api"] }
+# Same version Tauri uses; called directly because Tauri does not report whether an effect was applied.
+window-vibrancy = "0.8"
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"

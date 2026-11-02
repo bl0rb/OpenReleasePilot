@@ -2,7 +2,7 @@
 //! way back into the window. It shows what the app already knows; it never reads anything remote
 //! by itself.
 
-use crate::{refresh_status, repo_targets, show_window, steps, with_model};
+use crate::{refresh_status, show_window, steps, with_model};
 use openreleasepilot_core::jobs::JobState;
 use openreleasepilot_core::repos::{self, HealthState};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,8 +90,7 @@ pub fn update(app: &AppHandle) {
 fn summary(app: &AppHandle) -> Summary {
     let version = app.package_info().version.to_string();
     // Reads .git/config of the clones: outside the lock.
-    let (site, config) = with_model(app, |m| (m.site.clone(), m.config.clone()));
-    let targets = repo_targets(&config, &site);
+    let targets = repos::targets(&with_model(app, |m| m.config.clone()));
     let now = steps::now();
     with_model(app, |m| {
         let mut summary = Summary {

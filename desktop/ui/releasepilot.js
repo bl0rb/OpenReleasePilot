@@ -1,32 +1,13 @@
 // OpenReleasePilot UI: renders the view the Rust side sends and calls its commands. No framework, no build step.
-const { invoke } = window.__TAURI__.core;
-const { listen } = window.__TAURI__.event;
+import {
+  invoke, listen, modelName, modelSelect, h, icon, button, iconButton, menuButton, formatTime, ago, short, domId, call, act, refresher,
+  banner, updateBanner, renderToast, usd, markdown, appendTo, openDialog, confirmDialog, row,
+} from './common.js';
 
-const STEPS = [
-  { id: 'precheck', title: 'Prüfen', desc: 'Repo, Werkzeuge, Releases, SFTP und Live-Seite. Ändert nichts.' },
-  { id: 'update', title: 'Inhalte aktualisieren', desc: 'Claude passt die Seite mit den gewählten Aufgaben an, dann Build und lokaler Commit.' },
-  { id: 'upload', title: 'Veröffentlichen', desc: 'Build, Push, dann nur geänderte Dateien per SFTP auf den Server.' },
-  { id: 'verify', title: 'Live-Seite prüfen', desc: 'Vergleicht die Live-Seite Datei für Datei mit dem Build.' },
-];
-const stepTitle = (id) => STEPS.find((s) => s.id === id)?.title ?? id;
-const STATUS_TEXT = { idle: 'Bereit', running: 'Läuft', ok: 'OK', warning: 'Hinweis', error: 'Fehler' };
-// Claude Code model aliases; each follows the newest model of its family.
-const MODELS = [['opus', 'Opus'], ['sonnet', 'Sonnet'], ['haiku', 'Haiku'], ['fable', 'Fable']];
-const modelName = (alias) => MODELS.find(([id]) => id === alias)?.[1] ?? alias ?? 'Claude-Code-Standard';
-
-/** Model dropdown; the first entry stands for the default that applies without a choice. */
-function modelSelect(value, fallback, onChange, id) {
-  return h('select', { id, class: 'model-select', title: 'Modell für diesen Claude-Lauf', onchange: (e) => onChange(e.target.value) },
-    h('option', { value: '', selected: !value }, `Standard (${modelName(fallback)})`),
-    MODELS.map(([alias, name]) => h('option', { value: alias, selected: value === alias }, name)));
-}
 
 let view = null;
-// Main area: 'repos' (start), 'runs' (care jobs, shown as "Aufträge") or 'website' (the optional website's four steps).
+// Main area: 'repos' (start) or 'runs' (care jobs, shown as "Aufträge"). The website is OpenSitePilot's.
 let area = 'repos';
-let selected = 'precheck';
-// Tab of the website's detail panel: 'result' or 'log'.
-let detailTab = 'result';
 // Repository whose details are open; null = the list. The list's scroll position for the way back.
 let repoKey = null;
 let repoListScroll = 0;
@@ -34,200 +15,18 @@ let repoListScroll = 0;
 let jobId = null;
 let jobTab = 'result';
 let jobListScroll = 0;
-// Repositories chosen for the next job; independent of the website's product selection.
+// Repositories chosen for the next job.
 const selection = new Set();
 let reposRead = false;
-let lastRunning = null;
 let lastJobRunning = null;
-let hostKeyOpen = false;
 
-// MARK: Helpers
-
-const PROPS = new Set(['value', 'checked', 'disabled', 'selected', 'hidden', 'required', 'indeterminate']);
-
-function h(tag, props, ...children) {
-  const el = document.createElement(tag);
-  for (const [key, value] of Object.entries(props ?? {})) {
-    if (value == null || value === false) continue;
-    if (key.startsWith('on')) el.addEventListener(key.slice(2), value);
-    else if (key === 'class') el.className = value;
-    else if (PROPS.has(key)) el[key] = value;
-    else el.setAttribute(key, value === true ? '' : value);
-  }
-  for (const child of children.flat(Infinity)) {
-    if (child == null || child === false) continue;
-    el.append(child instanceof Node ? child : document.createTextNode(String(child)));
-  }
-  return el;
-}
-
-const ICONS = {
-  play: '<path d="M7 5v14l11-7z"/>',
-  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
-  gear: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/>',
-  external: '<path d="M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5"/>',
-  folder: '<path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>',
-  forward: '<path d="M5 12h14M13 6l6 6-6 6"/>',
-  close: '<path d="M6 6l12 12M18 6 6 18"/>',
-  plus: '<path d="M12 5v14M5 12h14"/>',
-  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
-  branch: '<circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="7" r="2"/><path d="M6 7v10M18 9c0 5-6 4-11 8"/>',
-  back: '<path d="M19 12H5M11 6l-6 6 6 6"/>',
-  check: '<path d="M5 12l5 5 9-10"/>',
-  shield: '<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
-  repo: '<path d="M5 4a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1z"/><path d="M9 3v18M12 8h4M12 12h4"/>',
-  jobs: '<path d="M9 6h11M9 12h11M9 18h11"/><path d="m3.5 6 1 1 2-2M3.5 12l1 1 2-2M3.5 18l1 1 2-2"/>',
-  globe: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/>',
-  info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01"/>',
-  warning: '<path d="M12 3 2 20h20z"/><path d="M12 9v5M12 17h.01"/>',
-  error: '<path d="M8 2h8l6 6v8l-6 6H8l-6-6V8z"/><path d="m15 9-6 6M9 9l6 6"/>',
-  done: '<circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/>',
-  download: '<path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/>',
-  more: '<circle cx="5" cy="12" r="1"/><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/>',
-  trash: '<path d="M3 6h18M8 6V4h8v2M6 6l1 14h10l1-14"/>',
-  blank: '',
-};
-
-function icon(name, cls = '') {
-  const span = document.createElement('span');
-  span.innerHTML = `<svg class="icon ${cls}" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name]}</svg>`;
-  return span.firstElementChild;
-}
-
-function button(label, onClick, { iconName, cls, disabled, title, iconOnly, id } = {}) {
-  return h('button', {
-    type: 'button', id, class: [cls, iconOnly && 'icon-only'].filter(Boolean).join(' ') || null, disabled,
-    title: title ?? (iconOnly ? label : null), 'aria-label': iconOnly ? label : null,
-    onclick: (e) => { e.stopPropagation(); onClick?.(e); },
-  }, iconName && icon(iconName), !iconOnly && label);
-}
-
-/** A frequent secondary action as an icon; while `busy` a spinner stands in for the icon. */
-function iconButton(label, onClick, iconName, { id, disabled, busy, title } = {}) {
-  const b = button(label, onClick, { id, iconName: busy ? null : iconName, iconOnly: true, disabled: disabled || busy, title: title ?? label });
-  if (busy) b.prepend(h('span', { class: 'spinner', 'aria-hidden': 'true' }));
-  return b;
-}
-
-// MARK: Menus
-
-let openedMenu = null;
-/** The menu button whose menu the last outside click closed, so that click does not open it again. */
-let closedByTrigger = null;
-
-function closeMenu() {
-  openedMenu?.remove();
-  openedMenu = null;
-}
-
-/** Opens a menu below `anchor`; items are [label, action, { iconName, danger, disabled, title }] or '-'. */
-function openMenu(anchor, items) {
-  closeMenu();
-  const menu = h('div', { class: 'menu', popover: 'manual', role: 'menu' },
-    items.filter(Boolean).map((item) => (item === '-' ? h('div', { class: 'menu-separator', role: 'separator' })
-      : h('button', { type: 'button', role: 'menuitem', class: item[2]?.danger ? 'danger' : null, disabled: item[2]?.disabled, title: item[2]?.title,
-        onclick: () => { closeMenu(); item[1](); } }, icon(item[2]?.iconName ?? 'blank'), item[0]))));
-  menu.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') {
-      closeMenu();
-      anchor.focus();
-      return;
-    }
-    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
-    e.preventDefault();
-    const entries = [...menu.querySelectorAll('button:not(:disabled)')];
-    const next = entries.indexOf(document.activeElement) + (e.key === 'ArrowDown' ? 1 : -1);
-    entries[(next + entries.length) % entries.length]?.focus();
-  });
-  document.body.append(menu);
-  menu.showPopover();
-  openedMenu = menu;
-  const rect = anchor.getBoundingClientRect();
-  const { offsetWidth: width, offsetHeight: height } = menu;
-  menu.style.left = `${Math.max(8, Math.min(rect.right - width, innerWidth - width - 8))}px`;
-  menu.style.top = `${rect.bottom + 4 + height <= innerHeight ? rect.bottom + 4 : Math.max(8, rect.top - 4 - height)}px`;
-  menu.querySelector('button:not(:disabled)')?.focus();
-}
-
-// Menus close on clicks outside, when the window loses focus or changes size.
-document.addEventListener('pointerdown', (e) => {
-  closedByTrigger = null;
-  if (!openedMenu || openedMenu.contains(e.target)) return;
-  closedByTrigger = e.target.closest?.('[aria-haspopup="menu"]') ?? null;
-  closeMenu();
-}, true);
-window.addEventListener('blur', closeMenu);
-window.addEventListener('resize', closeMenu);
-
-/** "⋯": rarer and destructive actions of a view; `items()` is read when it opens. */
-function menuButton(label, items, { id } = {}) {
-  const trigger = button(label, () => {
-    if (closedByTrigger === trigger) closedByTrigger = null;
-    else openMenu(trigger, items());
-  }, { id, iconName: 'more', iconOnly: true });
-  trigger.setAttribute('aria-haspopup', 'menu');
-  return trigger;
-}
-
-const formatTime = (secs) => new Date(secs * 1000).toLocaleString('de-DE', { dateStyle: 'medium', timeStyle: 'short' });
-
-/** `vor 3 Min.` for a Unix time. */
-function ago(secs) {
-  const d = Math.max(0, Math.round(Date.now() / 1000 - secs));
-  if (d < 45) return 'gerade eben';
-  if (d < 3600) return `vor ${Math.round(d / 60)} Min.`;
-  if (d < 86400) return `vor ${Math.round(d / 3600)} Std.`;
-  return `am ${formatTime(secs)}`;
-}
-
-const short = (sha) => (sha ?? '').slice(0, 7);
 const repoName = (key) => view.repositories.find((r) => r.key === key)?.repo ?? key;
 /** The bump a job gives one repository: its own, else the job's. */
 const bumpOf = (job, key) => job.options.bumps?.[key] ?? job.options.bump ?? 'patch';
 /** The managed repositories whose release `key` publishes (their "Veröffentlicht durch"). */
 const releasedThrough = (key) => view.repositories.filter((r) => r.releasedBy === key);
 
-async function call(command, args) {
-  try {
-    return await invoke(command, args);
-  } catch (error) {
-    showAlert(String(error));
-    return null;
-  }
-}
-
-/** Runs a command; on success returns true, on error shows it and returns false. */
-async function act(command, args) {
-  try {
-    await invoke(command, args);
-    return true;
-  } catch (error) {
-    showAlert(String(error));
-    return false;
-  }
-}
-
-// Events come in bursts while a job runs; overlapping requests for a view are merged into one.
-let refreshing = null;
-let refreshAgain = false;
-
-async function refresh() {
-  if (refreshing) {
-    refreshAgain = true;
-    return refreshing;
-  }
-  refreshing = (async () => {
-    do {
-      refreshAgain = false;
-      setView(await invoke('get_view'));
-    } while (refreshAgain);
-  })();
-  try {
-    await refreshing;
-  } finally {
-    refreshing = null;
-  }
-}
+const refresh = refresher(setView);
 
 // MARK: Render
 
@@ -236,18 +35,7 @@ const openJobs = () => view.jobs.filter((j) => !JOB_FINISHED.has(j.status.state)
 
 function setView(next) {
   view = next;
-  if (!view.config.projectDir && area === 'website') area = 'repos';
-  if (view.running && view.running !== lastRunning && view.running !== 'jobs') {
-    // Follow the website step that just started and watch its log.
-    selected = view.running;
-    detailTab = 'log';
-    loadLog(selected);
-  } else if (!view.running && lastRunning === selected && hasResult(selected)) {
-    // The step is done: show what came out of it. Without a result the log has the details.
-    detailTab = 'result';
-  }
   if (lastJobRunning && !view.jobRunning && lastJobRunning === jobId) jobTab = 'result';
-  lastRunning = view.running;
   lastJobRunning = view.jobRunning;
   for (const key of [...selection]) if (!view.repositories.some((r) => r.key === key)) selection.delete(key);
   const root = document.documentElement;
@@ -256,8 +44,7 @@ function setView(next) {
   renderSidebar();
   renderBanners();
   renderMain();
-  renderToast();
-  if (view.pendingHostKey && !hostKeyOpen) hostKeyDialog();
+  renderToast(view);
 }
 
 let sidebarSignature = '';
@@ -267,12 +54,10 @@ function renderSidebar() {
   const attention = view.repositories.filter((r) => r.health.state === 'blocked' || r.health.state === 'needsAttention').length;
   const decisions = view.jobs.filter((j) => j.status.state === 'needsApproval').length;
   const open = openJobs().length;
-  const started = view.repositories.length > 0 || !!view.config.projectDir;
-  const areas = started ? [
+  const areas = view.repositories.length > 0 ? [
     ['repos', 'Repositories', 'repo', attention ? [attention, 'warning', `${attention} brauchen Aufmerksamkeit`] : [view.repositories.length || null]],
     ['runs', 'Aufträge', 'jobs', decisions ? [decisions, 'decision', `${decisions} warten auf eine Entscheidung`] : [open || null, null, open ? `${open} offen` : null]],
-    view.config.projectDir && ['website', 'Website', 'globe', view.running ? ['…', null, 'Ein Schritt läuft'] : [null]],
-  ].filter(Boolean) : [];
+  ] : [];
   const signature = JSON.stringify([area, areas, !!view.running, view.version, view.devBuild, view.checkingUpdate]);
   if (signature === sidebarSignature) return;
   sidebarSignature = signature;
@@ -286,7 +71,7 @@ function renderSidebar() {
     count != null && h('span', { class: `nav-badge ${tone ?? ''}`, title: text, 'aria-label': text }, count))),
     h('div', { class: 'sidebar-footer' },
       h('button', {
-        type: 'button', class: 'nav-item', disabled: !!view.running, title: 'Zugänge, Ausführungsregeln, optionale Website', onclick: settingsDialog,
+        type: 'button', class: 'nav-item', disabled: !!view.running, title: 'Zugänge und Ausführungsregeln', onclick: settingsDialog,
       }, icon('gear'), h('span', null, 'Einstellungen')),
       h('div', { class: 'version' },
         view.devBuild ? 'OpenReleasePilot Entwicklungsversion' : `OpenReleasePilot ${view.version}`,
@@ -298,7 +83,7 @@ function renderSidebar() {
  *  frequent ones as icons, rare and destructive ones in "⋯". The open details fill it themselves. */
 const pageHead = h('header', { class: 'page-header', 'data-tauri-drag-region': '' });
 // Set by the area renderers: { back: [label, action, id], title, chip, subtitle, actions }.
-const headerParts = { repos: null, runs: null, website: null };
+const headerParts = { repos: null, runs: null };
 
 function renderPageHeader() {
   const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
@@ -311,9 +96,6 @@ function renderPageHeader() {
     subtitle = open.length
       ? [count(open.length, 'offener Auftrag', 'offene Aufträge'), decisions && count(decisions, 'wartet auf eine Entscheidung', 'warten auf eine Entscheidung')].filter(Boolean).join(' · ')
       : 'Keine offenen Aufträge';
-  } else if (area === 'website') {
-    title = view.site ? `Website ${view.site.name}` : 'Website';
-    subtitle = view.site ? 'Prüfen, Inhalte aktualisieren, Veröffentlichen, Live-Seite prüfen' : 'Die Projektdatei der Website ist nicht lesbar';
   } else {
     const n = (state) => view.repositories.filter((r) => r.health.state === state).length;
     title = 'Repositories';
@@ -352,34 +134,18 @@ function showArea(id) {
   if (id === 'runs') main.scrollTop = jobId ? 0 : jobListScroll;
 }
 
-const BANNER_ICONS = { warning: 'warning', error: 'error', update: 'download' };
-
-function banner(kind, text, actions = []) {
-  return h('div', { class: `banner ${kind}`, role: kind === 'error' || kind === 'warning' ? 'alert' : 'status' },
-    icon(BANNER_ICONS[kind] ?? 'info'),
-    h('div', { class: 'banner-text selectable' }, text),
-    actions.map(([label, action, opts]) => button(label, action, opts)));
-}
-
-function updateBanner(u) {
-  const installing = view.installingUpdate;
-  const busy = view.running ? 'Erst nach dem laufenden Schritt' : view.jobRunning ? 'Erst nach dem laufenden Auftrag' : null;
-  return h('div', { class: 'banner update', role: 'status' },
-    icon('download'),
-    h('div', { class: 'banner-text' },
-      h('strong', null, `${u.prerelease ? 'Beta: ' : ''}OpenReleasePilot ${u.version} ist verfügbar (installiert: ${view.version})`),
-      h('div', { class: 'muted small' }, installing ? 'Paket wird geladen, geprüft und installiert …'
-        : `${u.prerelease ? 'Beta-Versionen sind zum Testen gedacht. ' : ''}Die Installation benötigt Administratorrechte, danach startet die App neu.`)),
-    button('Versionshinweise', () => call('open_url', { url: u.pageUrl })),
-    button('Später', () => call('dismiss_update'), { disabled: installing }),
-    button(installing ? 'Wird installiert …' : 'Installieren', () => call('install_update'),
-      { cls: 'primary', disabled: installing || !!busy, title: busy }));
-}
 
 function renderBanners() {
   const items = [];
-  if (view.availableUpdate) items.push(updateBanner(view.availableUpdate));
+  if (view.availableUpdate) items.push(updateBanner(view, 'OpenReleasePilot'));
   if (view.error) items.push(banner('error', view.error, [['Schließen', () => call('dismiss')]]));
+  // A website set up before OpenSitePilot existed: say once where it went.
+  if (view.config.projectDir && localStorage.getItem('sitepilot-hint') !== 'seen') {
+    items.push(banner('info', 'Die Website aktualisiert und veröffentlicht jetzt die eigene App OpenSitePilot; sie übernimmt Projektordner, SFTP-Zugang und Upload-Stand beim ersten Start.', [
+      ['OpenSitePilot laden', () => call('open_url', { url: 'https://github.com/bl0rb/OpenReleasePilot/releases/latest' })],
+      ['Ausblenden', () => { localStorage.setItem('sitepilot-hint', 'seen'); renderBanners(); }],
+    ]));
+  }
   if (view.jobsUnreadable.length) items.push(banner('warning', `Gespeicherte Aufträge nicht lesbar: ${view.jobsUnreadable.join('; ')}`));
   if (view.signedIn === false && view.repositories.some((r) => forgeOf(r) === 'github')) {
     items.push(banner('warning', 'Die GitHub-CLI ist nicht angemeldet: Status nur für öffentliche Repositories, Pflege nicht möglich. Im Terminal: gh auth login, oder ein eigenes Token in den Einstellungen.'));
@@ -387,401 +153,43 @@ function renderBanners() {
   for (const host of (view.gitlabHosts ?? []).filter((g) => g.signedIn === false && view.repositories.some((r) => forgeOf(r) === `gitlab:${g.host}`))) {
     items.push(banner('warning', `Die GitLab-CLI ist für ${host.host} nicht angemeldet: Status nur für öffentliche Projekte, Pflege nicht möglich. Im Terminal: glab auth login --hostname ${host.host}, oder ein eigenes Token in den Einstellungen.`));
   }
-  // The website's own warnings only where the website is worked on.
-  if (area === 'website' && view.siteError) items.push(banner('warning', `Website: ${view.siteError}`, [['Einstellungen', settingsDialog]]));
-  if (area === 'website' && view.site && !view.sftpReady) items.push(banner('warning', 'SFTP ist noch nicht eingerichtet: Veröffentlichen ist erst danach möglich.', [['Einstellungen', settingsDialog]]));
   document.getElementById('banners').replaceChildren(...items);
 }
 
-// MARK: Toasts
-
-let toastText = null;
-let toastTimer = null;
-
-/** Notices show briefly at the bottom right, so they are seen wherever the user clicked. */
-function renderToast() {
-  if (view.notice === toastText) return;
-  toastText = view.notice;
-  clearTimeout(toastTimer);
-  const container = document.getElementById('toasts');
-  if (!toastText) return container.replaceChildren();
-  const dismiss = () => call('dismiss_notice');
-  const later = (ms) => { clearTimeout(toastTimer); toastTimer = setTimeout(dismiss, ms); };
-  container.replaceChildren(h('div', { class: 'toast', onmouseenter: () => clearTimeout(toastTimer), onmouseleave: () => later(3000) },
-    icon('done', 'green'), h('div', { class: 'toast-text selectable' }, toastText),
-    button('Schließen', dismiss, { iconName: 'close', iconOnly: true })));
-  later(7000);
-}
-
-let skeleton = null;
 let reposUi = null;
 let runsUi = null;
 
 function renderMain() {
   const main = document.getElementById('main');
-  if (!view.repositories.length && !view.config.projectDir) {
-    skeleton = null;
+  if (!view.repositories.length) {
     reposUi = null;
     runsUi = null;
     area = 'repos';
     main.replaceChildren(h('div', { class: 'empty' },
       h('img', { src: 'icon.svg', alt: '' }),
       h('h2', null, 'Willkommen'),
-      h('p', { class: 'muted' }, 'OpenReleasePilot pflegt die Repositories, die du auswählst, auf GitHub und GitLab: Zustand, Pull und Merge Requests, Releases, README und Wiki. Du triffst die Entscheidungen, die App erledigt die Arbeit. Eine Website ist optional und kann später dazukommen.'),
+      h('p', { class: 'muted' }, 'OpenReleasePilot pflegt die Repositories, die du auswählst, auf GitHub und GitLab: Zustand, Pull und Merge Requests, Releases, README und Wiki. Du triffst die Entscheidungen, die App erledigt die Arbeit. Websites aktualisiert und veröffentlicht OpenSitePilot.'),
       h('div', { class: 'line' },
-        button('Repositories auswählen …', addReposDialog, { cls: 'primary', iconName: 'plus' }),
-        button('Website einrichten (optional) …', settingsDialog))));
+        button('Repositories auswählen …', addReposDialog, { cls: 'primary', iconName: 'plus' }))));
     return;
   }
   if (!reposUi) {
     buildRepos();
     buildRuns();
   }
-  if (view.config.projectDir && !skeleton) buildWebsite();
-  if (!view.config.projectDir && skeleton) skeleton = null;
   renderPageHeader();
-  const roots = [pageHead, reposUi.root, runsUi.root, skeleton?.root].filter(Boolean);
+  const roots = [pageHead, reposUi.root, runsUi.root];
   if (main.children.length !== roots.length || roots.some((r, i) => main.children[i] !== r)) main.replaceChildren(...roots);
   reposUi.root.hidden = area !== 'repos';
   runsUi.root.hidden = area !== 'runs';
-  if (skeleton) skeleton.root.hidden = area !== 'website';
   if (area === 'repos') {
     renderRepos();
     readReposOnce();
-  } else if (area === 'runs') {
+  } else {
     renderRuns();
-  } else if (skeleton) {
-    renderWebsite();
   }
 }
 
-// MARK: Website (optional)
-
-function buildWebsite() {
-  // Built once, so the instruction field keeps focus and the log keeps its scroll position.
-  skeleton = {
-    steps: h('section', { class: 'steps' }),
-    products: h('div', { class: 'list products' }),
-    productCount: h('span', { class: 'muted small' }),
-    productAll: h('input', { type: 'checkbox', onchange: (e) => call('set_products', { ids: view.products.map((p) => p.id), enabled: e.target.checked }) }),
-    tasks: h('div', { class: 'list tasks' }),
-    taskTech: h('div', { class: 'checks' }),
-    instructions: h('textarea', { id: 'instructions', rows: 1, placeholder: 'z. B. „Ergänze im nudgit-Abschnitt den Hinweis auf die Chrome-Erweiterung“ – leer lassen für ein reines Release-Update' }),
-    detailHead: h('div', { class: 'detail-head' }),
-    tabResult: h('button', { type: 'button', class: 'tab', role: 'tab', id: 'tab-result', 'aria-controls': 'detail-result', onclick: () => showTab('result') }, 'Ergebnis'),
-    tabLog: h('button', { type: 'button', class: 'tab', role: 'tab', id: 'tab-log', 'aria-controls': 'log', onclick: () => showTab('log') }),
-    detailResult: h('div', { class: 'detail-result', id: 'detail-result', role: 'tabpanel', 'aria-labelledby': 'tab-result' }),
-    log: h('pre', { class: 'log', id: 'log', role: 'tabpanel', 'aria-labelledby': 'tab-log', tabindex: '0' }),
-  };
-  skeleton.root = h('div', { class: 'area' },
-    h('div', { class: 'note' }, 'Der direkte Website-Ablauf. Als letzter Schritt eines Pflegeauftrags läuft dieselbe Website-Aktualisierung mit Vorschau und Freigabe im Bereich Repositories.'),
-    h('section', { class: 'section' },
-      h('div', { class: 'section-head' }, h('h2', null, 'Ablauf'),
-        h('span', { class: 'muted small' }, 'Schritte einzeln starten oder oben alle nacheinander bis zur Live-Seite')),
-      skeleton.steps),
-    h('div', { class: 'config' },
-      h('section', { class: 'section panel' },
-        h('div', { class: 'section-head' }, h('h2', null, 'Produkte'), skeleton.productCount, h('span', { class: 'spacer' }),
-          h('label', { class: 'check-all', title: 'Alle Produkte an- oder abwählen' }, skeleton.productAll, 'Alle')),
-        skeleton.products,
-        h('div', { class: 'note' }, 'Nur ausgewählte Produkte werden geprüft und aktualisiert. Welche Repositories die App pflegt, ist davon unabhängig.')),
-      h('section', { class: 'section panel' },
-        h('div', { class: 'section-head' }, h('h2', null, 'Update-Aufgaben'),
-          h('span', { class: 'muted small' }, 'je ein Claude-Lauf, in dieser Reihenfolge')),
-        skeleton.tasks,
-        h('div', { class: 'field-col' }, h('label', { for: 'instructions' }, 'Zusätzliche Anweisung an Claude (optional)'), skeleton.instructions),
-        h('details', { class: 'fold' }, h('summary', null, 'Technische Details der Aufgaben'),
-          h('div', { class: 'note' }, 'Skill und Effort stammen aus site.json und lassen sich dort ändern.'), skeleton.taskTech))),
-    h('section', { class: 'detail' }, skeleton.detailHead,
-      h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Ansicht', onkeydown: tabKey }, skeleton.tabResult, skeleton.tabLog),
-      skeleton.detailResult, skeleton.log));
-  loadLog(selected);
-}
-
-function renderWebsite() {
-  headerParts.website = {
-    actions: view.site ? [
-      iconButton('Live-Seite öffnen', () => call('open_url', { url: view.site.url }), 'external', { id: 'site-open', title: `Live-Seite öffnen: ${view.site.url}` }),
-      menuButton('Weitere Aktionen', () => [
-        ['Produkt hinzufügen …', addProductDialog, { iconName: 'plus', disabled: !!view.running, title: 'Ein Repository als neues Produkt auf der Website aufnehmen' }],
-      ], { id: 'site-more' }),
-      button('Aktualisieren und veröffentlichen', () => call('run_all', { instructions: skeleton.instructions.value }), {
-        id: 'site-run-all', cls: 'primary', iconName: 'forward', disabled: !!view.running,
-        title: 'Prüfen, Inhalte aktualisieren (wenn nötig), Veröffentlichen und Live-Seite prüfen nacheinander; geht bis zur Live-Seite und stoppt beim ersten Fehler',
-      }),
-    ] : [],
-  };
-  renderPageHeader();
-  skeleton.instructions.disabled = !!view.running;
-  renderSteps();
-  renderProducts();
-  renderTasks();
-  renderDetail();
-}
-
-
-function versionBadge(p) {
-  const latest = p.latestTag?.replace(/^v/, '');
-  if (!latest) return h('span', { class: 'badge', title: 'Dokumentierter Stand; „Prüfen“ fragt das neueste Release ab' }, p.documented);
-  if (p.outdated) return h('span', { class: 'badge orange', title: `Neues Release ${p.latestTag}` }, `${p.documented} → ${latest}`);
-  return h('span', { class: 'badge green', title: 'Dokumentierter Stand ist das neueste Release' }, `${p.documented} aktuell`);
-}
-
-function renderProducts() {
-  const products = view.products;
-  const on = products.filter((p) => p.enabled).length;
-  skeleton.productCount.textContent = products.length ? `${on} von ${products.length} ausgewählt` : '';
-  skeleton.productAll.checked = products.length > 0 && on === products.length;
-  skeleton.productAll.indeterminate = on > 0 && on < products.length;
-  skeleton.productAll.disabled = !!view.running || !products.length;
-  skeleton.products.replaceChildren(...(products.length ? [
-    h('div', { class: 'row head' }, h('span', null, 'Produkt · Repository'), h('span'), h('span', null, 'Stand')),
-    ...products.map((p) => h('div', { class: `row ${p.enabled ? 'on' : ''}` },
-    h('label', { class: 'row-name' },
-      h('input', { type: 'checkbox', checked: p.enabled, disabled: !!view.running, onchange: (e) => call('set_products', { ids: [p.id], enabled: e.target.checked }) }),
-      h('span', { class: 'row-text inline' }, h('strong', null, p.name), h('span', { class: 'muted small mono ellipsis', title: p.repo }, p.repo))),
-    p.local ? h('span') : h('span', { class: 'badge orange', title: p.localPath ? `Kein lokaler Klon unter ${p.localPath}` : 'Kein localPath in site.json' }, 'kein Klon'),
-    versionBadge(p)))]
-    : [h('div', { class: 'note empty-list' }, 'Noch keine Produkte: „Produkt hinzufügen …“ im ⋯-Menü oben rechts nimmt eins auf.')]));
-}
-
-function renderTasks() {
-  const head = h('div', { class: 'row head' }, h('span', null, 'Aufgabe'), h('span', null, 'Modell'));
-  skeleton.taskTech.replaceChildren(...view.tasks.map((t) => [h('span'), h('span', { class: 'label' }, t.label),
-    h('span', { class: 'detail-text' }, [t.skill ? `Skill ${t.skill}` : 'ohne Skill', t.effort && `Effort ${t.effort}`].filter(Boolean).join(' · '))]));
-  skeleton.tasks.replaceChildren(head, ...view.tasks.map((t) => {
-    const save = (enabled, model) => call('set_task', { id: t.id, enabled, model });
-    // One row per task; the columns line up across rows (CSS subgrid).
-    return h('div', { class: `row ${t.enabled ? 'on' : ''}` },
-      h('label', { class: 'row-name' },
-        h('input', { type: 'checkbox', checked: t.enabled, disabled: !!view.running, onchange: (e) => save(e.target.checked, t.chosenModel) }),
-        h('span', { class: 'row-text' }, h('strong', null, t.label), t.description && h('span', { class: 'muted small' }, t.description))),
-      modelSelect(t.chosenModel, t.defaultModel, (model) => save(t.enabled, model), `task-model-${t.id}`));
-  }));
-}
-
-function ready(step) {
-  if (!view.site) return step === 'precheck' && !!view.config.projectDir;
-  if (step === 'upload') return view.sftpReady;
-  return true;
-}
-
-/** The step that makes sense next, highlighted as the primary button. */
-function suggested() {
-  const s = view.steps;
-  if (view.running) return null;
-  if (s.precheck.status === 'idle') return 'precheck';
-  if (view.outdated?.length) return 'update';
-  if (s.update.status === 'ok' && s.upload.status !== 'ok') return 'upload';
-  if (s.upload.status === 'ok' && s.verify.status === 'idle') return 'verify';
-  return null;
-}
-
-function statusChip(status, stale = false) {
-  if (stale) return h('span', { class: 'chip idle', title: 'Stand vor der letzten Aktualisierung oder Veröffentlichung' }, 'Veraltet');
-  return h('span', { class: `chip ${status}` }, status === 'running' && h('span', { class: 'spinner' }), STATUS_TEXT[status]);
-}
-
-function renderSteps() {
-  const next = suggested();
-  skeleton.steps.replaceChildren(...STEPS.map((step, i) => {
-    const state = view.steps[step.id];
-    const running = view.running === step.id;
-    const action = running
-      ? button('Abbrechen', () => invoke('cancel'), { iconName: 'stop', cls: 'danger' })
-      : button('Starten', () => call('run_step', { step: step.id, instructions: skeleton.instructions.value }),
-        // The page's primary action is "Aktualisieren und veröffentlichen"; the suggested step stands out more quietly.
-        { iconName: 'play', cls: next === step.id ? 'suggested' : null, disabled: !!view.running || !ready(step.id) });
-    const summary = state.stale ? 'Nach Aktualisierung oder Veröffentlichung erneut prüfen' : state.summary;
-    return h('div', {
-      class: `step ${selected === step.id ? 'selected' : ''}`, role: 'button', tabindex: '0',
-      onclick: () => selectStep(step.id), onkeydown: (e) => { if (e.key === 'Enter') selectStep(step.id); },
-    },
-      h('div', { class: 'step-head' }, h('span', { class: 'step-number' }, i + 1), h('h2', null, step.title), statusChip(state.status, state.stale)),
-      h('div', { class: 'desc' }, step.desc),
-      h('div', { class: `summary ${state.stale ? 'muted' : state.status === 'error' ? 'red' : state.status === 'warning' ? 'orange' : 'muted'}`, title: summary || null },
-        summary || ''),
-      action);
-  }));
-}
-
-function selectStep(step) {
-  if (selected === step) return;
-  selected = step;
-  if (view.running === step) detailTab = 'log';
-  renderSteps();
-  renderDetail();
-  loadLog(step);
-}
-
-const RESULTS = { precheck: precheckResult, update: updateResult, upload: uploadResult, verify: verifyResult };
-const HAS_RESULT = {
-  precheck: () => view.checks.length > 0,
-  update: () => view.claudeRuns.length > 0,
-  upload: () => !!view.upload,
-  verify: () => !!view.verify,
-};
-const hasResult = (step) => HAS_RESULT[step]?.() ?? false;
-
-function renderDetail() {
-  const step = STEPS.find((s) => s.id === selected);
-  const state = view.steps[selected];
-  skeleton.detailHead.replaceChildren(...[
-    h('h3', null, step.title), statusChip(state.status, state.stale),
-    state.summary && !state.stale && h('span', { class: `detail-summary ${state.status === 'error' ? 'red' : state.status === 'warning' ? 'orange' : ''}` }, state.summary),
-    h('span', { class: 'spacer' }),
-    h('span', { class: 'muted small' }, state.finishedAt ? `zuletzt ${formatTime(state.finishedAt)}` : ''),
-  ].filter(Boolean));
-  const empty = !hasResult(selected) && (state.status === 'idle'
-    ? h('div', { class: 'note' }, 'Dieser Schritt ist noch nicht gelaufen.')
-    : h('div', { class: 'note' }, view.running === selected ? 'Läuft gerade. Die Ausgabe steht im ' : 'Kein Ergebnis. Was passiert ist, steht im ',
-      button('Log', () => showTab('log'), { cls: 'link' }), '.'));
-  skeleton.detailResult.replaceChildren(...[...RESULTS[selected](), empty].filter(Boolean));
-  renderTabs();
-}
-
-function renderTabs() {
-  const log = detailTab === 'log';
-  const showsLog = !skeleton.log.hidden;
-  for (const [tab, on] of [[skeleton.tabResult, !log], [skeleton.tabLog, log]]) {
-    tab.setAttribute('aria-selected', String(on));
-    tab.tabIndex = on ? 0 : -1;
-  }
-  skeleton.tabLog.replaceChildren(view.running === selected ? h('span', { class: 'spinner' }) : '', 'Log');
-  skeleton.detailResult.hidden = log;
-  skeleton.log.hidden = !log;
-  // A hidden log loses its scroll position; show the newest lines again.
-  if (log && !showsLog) skeleton.log.scrollTop = skeleton.log.scrollHeight;
-}
-
-function showTab(tab) {
-  if (detailTab === tab) return;
-  detailTab = tab;
-  renderTabs();
-}
-
-/** Arrow keys move between the two tabs, as in any tab bar. */
-function tabKey(e) {
-  if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
-  e.preventDefault();
-  const next = e.key === 'Home' ? 'result' : e.key === 'End' ? 'log' : detailTab === 'log' ? 'result' : 'log';
-  showTab(next);
-  (next === 'log' ? skeleton.tabLog : skeleton.tabResult).focus();
-}
-
-function precheckResult() {
-  if (!view.checks.length) return [];
-  const stale = view.steps.precheck.stale;
-  const unknown = view.releaseUnknown.length > 0 && !stale
-    && h('div', { class: 'note orange' }, `Release-Stand unklar: ${view.releaseUnknown.join('; ')}. „Inhalte aktualisieren“ und „Aktualisieren und veröffentlichen“ stoppen, bis der Stand bekannt ist.`);
-  const outdated = view.outdated?.length
-    ? h('div', { class: 'facts' }, h('span', null, h('strong', null, 'Neue Releases: '),
-      view.outdated.map((o) => `${o.name} ${o.documented} → ${o.latestTag.replace(/^v/, '')}`).join(', ')))
-    : null;
-  return [
-    stale && h('div', { class: 'note orange' }, 'Dieses Ergebnis stammt von vor der letzten Aktualisierung oder Veröffentlichung (z. B. Remote-Stand und Releases). „Prüfen“ erneut starten für den aktuellen Stand.'),
-    outdated && !stale ? outdated : null,
-    unknown,
-    h('div', { class: `checks ${stale ? 'stale' : ''}` }, view.checks.map((c) => [
-    h('span', { class: `status-dot ${c.status}` }), h('span', { class: 'label' }, c.label), h('span', { class: 'detail-text selectable' }, c.detail),
-  ]))];
-}
-
-const usd = (n) => `${n.toLocaleString('de-DE', { minimumFractionDigits: 2, maximumFractionDigits: 2 })} USD`;
-
-/** Claude's answer with the little Markdown it writes: paragraphs, headings, "- " lists, **bold**, `code`.
- *  Built as DOM nodes, never as HTML. */
-function markdown(text) {
-  const inline = (line) => line.split(/(\*\*[^*]+\*\*|`[^`]+`)/).filter(Boolean).map((part) =>
-    part.length > 4 && part.startsWith('**') && part.endsWith('**') ? h('strong', null, part.slice(2, -2))
-      : part.length > 2 && part.startsWith('`') && part.endsWith('`') ? h('code', null, part.slice(1, -1))
-        : part);
-  const blocks = [];
-  let list = null;
-  for (const line of text.split('\n')) {
-    const item = line.match(/^\s*[-*] (.*)$/);
-    if (item) {
-      if (!list) blocks.push(list = h('ul'));
-      list.append(h('li', null, inline(item[1])));
-      continue;
-    }
-    list = null;
-    if (!line.trim()) continue;
-    const heading = line.match(/^#{1,4} (.*)$/);
-    blocks.push(h('p', null, heading ? h('strong', null, inline(heading[1])) : inline(line)));
-  }
-  return h('div', { class: 'md selectable' }, blocks);
-}
-
-// Which Claude runs the user opened or closed; survives re-rendering.
-const runOpen = new Map();
-
-function runItem(run, index, count) {
-  const c = run.outcome;
-  const key = `${index}:${run.task}`;
-  const open = runOpen.get(key) ?? (count === 1 || !c.success || c.denials.length > 0);
-  return h('details', { class: 'run', open, ontoggle: (e) => runOpen.set(key, e.target.open) },
-    h('summary', null,
-      h('strong', null, run.task),
-      h('span', { class: 'muted small' }, [modelName(run.model === 'Standard' ? null : run.model),
-        c.turns != null && `${c.turns} Runden`, c.costUsd != null && usd(c.costUsd)].filter(Boolean).join(' · ')),
-      c.denials.length > 0 && h('span', { class: 'badge orange' }, `${c.denials.length} nicht freigegeben`),
-      h('span', { class: 'spacer' }),
-      h('span', { class: `chip ${c.success ? 'ok' : 'error'}` }, c.success ? 'Abgeschlossen' : 'Nicht abgeschlossen')),
-    h('div', { class: 'run-body' },
-      c.denials.length > 0 && h('div', { class: 'denials' },
-        h('div', null, h('strong', null, 'Nicht freigegeben: '),
-          'Claude durfte diese Befehle nicht ausführen und hat ohne sie weitergearbeitet. Dauerhaft erlauben lässt sich ein Befehl über ',
-          h('code', null, 'claude.allowedTools'), ' in ', h('code', null, view.siteFile), '.'),
-        h('ul', null, c.denials.map((d) => h('li', { class: 'mono selectable', title: d }, h('span', { class: 'clamp' }, d))))),
-      c.text ? markdown(c.text) : h('div', { class: 'muted' }, 'Keine Antwort von Claude.')));
-}
-
-function updateResult() {
-  const runs = view.claudeRuns;
-  if (!runs.length) runOpen.clear();
-  const items = [h('div', { class: 'facts' },
-    h('span', null, h('strong', null, 'Gewählte Aufgaben: '), view.tasks.filter((t) => t.enabled).map((t) => t.label).join(', ') || 'keine'),
-    view.site && h('span', null, h('strong', null, 'Build: '), h('span', { class: 'mono' }, view.site.build)))];
-  if (runs.length) {
-    const cost = runs.reduce((sum, r) => sum + (r.outcome.costUsd ?? 0), 0);
-    const turns = runs.reduce((sum, r) => sum + (r.outcome.turns ?? 0), 0);
-    items.push(h('div', { class: 'runs' },
-      h('div', { class: 'runs-head' }, h('strong', null, runs.length === 1 ? '1 Claude-Lauf' : `${runs.length} Claude-Läufe`),
-        h('span', { class: 'muted small' }, `${turns} Runden · ${usd(cost)}`)),
-      runs.map((run, i) => runItem(run, i, runs.length))));
-  }
-  return items;
-}
-
-function uploadResult() {
-  const items = [];
-  const cfg = view.config.sftp;
-  items.push(h('div', { class: 'facts' },
-    h('span', null, h('strong', null, 'Ziel: '), cfg.host ? `${cfg.user}@${cfg.host}:${cfg.port} ${cfg.remoteDir}` : 'nicht eingerichtet'),
-    view.lastUpload && h('span', null, h('strong', null, 'Letzter Upload: '),
-      `${view.lastUpload.uploadedAt ? formatTime(view.lastUpload.uploadedAt) : '?'} · Commit ${view.lastUpload.commit ?? '?'} · ${view.lastUpload.files} Dateien`)));
-  if (view.upload) {
-    items.push(h('div', { class: 'facts' },
-      h('span', null, h('strong', null, 'Hochgeladen: '), view.upload.uploaded),
-      h('span', null, h('strong', null, 'Entfernt: '), view.upload.deleted),
-      h('span', null, h('strong', null, 'Unverändert: '), view.upload.unchanged),
-      h('span', null, h('strong', null, 'Git: '), view.upload.pushed)));
-  }
-  return items;
-}
-
-function verifyResult() {
-  const r = view.verify;
-  if (!r) return [];
-  return [
-    h('div', { class: 'facts' },
-      h('span', null, h('strong', null, 'Geprüft: '), r.checked),
-      h('span', { class: 'green' }, h('strong', null, 'Identisch: '), r.identical),
-      r.problems.length > 0 && h('span', { class: 'red' }, h('strong', null, 'Abweichend: '), r.problems.length)),
-    r.problems.length > 0 && h('div', { class: 'result-text mono' }, r.problems.slice(0, 50).join('\n') + (r.problems.length > 50 ? `\n… ${r.problems.length - 50} weitere` : '')),
-  ];
-}
 
 // MARK: Repositories
 
@@ -810,8 +218,6 @@ const STEP_STATE = {
 const badge = (cls, text, title) => h('span', { class: `badge ${cls}`, title }, text);
 /** The value of a read part of the facts (`{ state: 'ok', value }`), else undefined. */
 const ok = (fetch) => (fetch?.state === 'ok' ? fetch.value : undefined);
-/** An id from a key, so focus survives re-rendering. */
-const domId = (prefix, key) => `${prefix}-${String(key).replace(/[^a-z0-9]+/gi, '-')}`;
 // Pull request details asked for once per reading of a repository.
 const detailsAsked = new Set();
 
@@ -1213,13 +619,12 @@ function checkedSummary(r) {
   return `gelesen ${ago(f.checkedAt)}${r.health.stale ? ', veraltet' : ''}${r.error ? ', letzte Abfrage fehlgeschlagen' : ''}`;
 }
 
-/** What the repository feeds: content targets, website products. */
+/** What the repository feeds: content targets. */
 function relations(r) {
   const targets = r.targets.map((id) => view.targets.find((t) => t.id === id)?.name).filter(Boolean);
   return [
     targets.length && `Inhalte: ${targets.join(', ')}`,
-    r.products.length && `Website: ${r.products.map((p) => `${p.name}${p.enabled ? '' : ' (abgewählt)'}`).join(', ')}`,
-    r.website && 'Website-Repository',
+    r.website && 'Website-Projekt',
     r.releasedBy ? `Release kommt aus ${repoName(r.releasedBy)}`
       : r.release ? `Release-Regel: Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, mit ${serviceOf(r.repo)}-Release` : ''}` : 'keine Release-Regel',
     releasedThrough(r.key).length > 0 && `veröffentlicht ${releasedThrough(r.key).map((f) => f.repo).join(', ')}`,
@@ -1372,8 +777,7 @@ function statusFacts(r, branch) {
       : row('Release-Regel', r.release ? `Tags ${r.release.tagPrefix}x.y.z${r.release.publishesRelease ? `, danach wartet die App auf das ${serviceOf(r.repo)}-Release` : ''}` : 'keine: die App setzt keine Tags', r.release ? '' : 'muted'),
     releasedThrough(r.key).length > 0 && row('Veröffentlicht', `${releasedThrough(r.key).map((f) => f.repo).join(', ')}: ein Tag hier bringt dort das Release mit`),
     row('Lokale Kopie', localText(r.local), ['found', 'notConfigured'].includes(r.local.state) ? '' : 'orange'),
-    r.products.length > 0 && row('Website', [...r.products.map((p) => `${p.name}: dokumentiert ${p.documented}${p.enabled ? '' : ', nicht ausgewählt'}`)].join(' · ')),
-    r.website && row('Rolle', 'zugleich das Repository der Website'),
+    r.website && row('Rolle', 'Website-Projekt (site.json); aktualisiert und veröffentlicht wird es mit OpenSitePilot'),
     row('Gelesen', f ? `${formatTime(f.checkedAt)} (${ago(f.checkedAt)})${r.health.stale ? ', veraltet' : ''}` : 'noch nicht', r.health.stale ? 'orange' : ''));
 }
 
@@ -1592,18 +996,13 @@ function targetItem(t, actions = true) {
 
 function contentSection(r) {
   const targets = view.targets.filter((t) => t.sources.includes(r.key));
-  const feedsWebsite = r.products.length > 0;
   return [
     h('div', { class: 'section-head wrap' }, h('h3', null, 'Zugeordnete Inhalte'),
-      h('span', { class: 'muted small' }, 'README, Wiki und Website; jedes Ziel ist für sich aktuell oder nicht'),
+      h('span', { class: 'muted small' }, 'README und Wiki; jedes Ziel ist für sich aktuell oder nicht'),
       h('span', { class: 'spacer' }),
       button('Ziel hinzufügen …', () => targetDialog(null, r.key), { id: 'target-add', iconName: 'plus' })),
     targets.length ? h('div', { class: 'items' }, targets.map((t) => targetItem(t))) : h('div', { class: 'note' }, 'Noch kein README-, Dokumentations- oder Wiki-Ziel für dieses Repository.'),
-    feedsWebsite && h('div', { class: 'item' },
-      h('div', { class: 'item-line' }, h('strong', null, view.site?.name ?? 'Website'), badge('', 'Website'), h('span', { class: 'spacer' }),
-        button('Website-Bereich', () => showArea('website'), { cls: 'link' })),
-      h('div', { class: 'item-reason' }, `Über die Produkte ${r.products.map((p) => p.name).join(', ')}; als letzter Schritt eines Auftrags wählbar, mit Vorschau vor dem Veröffentlichen.`)),
-  ].filter(Boolean);
+  ];
 }
 
 // MARK: Repositories: management
@@ -1612,7 +1011,7 @@ function contentSection(r) {
 const manageDrafts = new Map();
 
 function manageSection(r) {
-  const saved = { enabled: r.enabled, localPath: r.local.path ?? '', release: !!r.release, prefix: r.release?.tagPrefix ?? (r.products[0]?.tagPrefix ?? ''), publishes: r.release?.publishesRelease ?? false, releasedBy: r.releasedBy ?? '' };
+  const saved = { enabled: r.enabled, localPath: r.local.path ?? '', release: !!r.release, prefix: r.release?.tagPrefix ?? '', publishes: r.release?.publishesRelease ?? false, releasedBy: r.releasedBy ?? '' };
   const s = manageDrafts.get(r.key) ?? { ...saved };
   manageDrafts.set(r.key, s);
   const locked = !!r.job;
@@ -1675,19 +1074,18 @@ function manageSection(r) {
     h('div', { class: 'field-row' }, h('label', { for: 'manage-released-by' }, 'Veröffentlicht durch'), sourceSelect),
     h('div', { class: 'note', id: 'manage-released-by-note' }, followers.length > 0
       ? `Dieses Repository veröffentlicht ${followers.map((f) => f.repo).join(', ')}; es kann darum nicht selbst durch ein anderes veröffentlicht werden.`
-      : 'Für ein Repository, dessen Release ein anderes mit demselben Tag erzeugt (z. B. ein öffentlicher Export aus einem privaten Repository): die App taggt hier nie, wartet nach dem Tag dort auf das Release hier und nimmt README, Wiki und Website dieses Repositorys in dieselbe Kette. README und Doku pflegst du dann im Quell-Repository, weil der Export die Dateien hier ersetzt.'),
+      : 'Für ein Repository, dessen Release ein anderes mit demselben Tag erzeugt (z. B. ein öffentlicher Export aus einem privaten Repository): die App taggt hier nie, wartet nach dem Tag dort auf das Release hier und nimmt README und Wiki dieses Repositorys in dieselbe Kette. README und Doku pflegst du dann im Quell-Repository, weil der Export die Dateien hier ersetzt.'),
     h('label', { class: 'check-line top' }, releaseBox, h('span', null, h('strong', null, 'Release-Regel: die App darf die nächste Version taggen'),
       h('div', { class: 'note' }, 'Die App errät keine Versionierung. Getaggt wird nur auf grüner CI genau des Ziel-Commits.'))),
     h('div', { class: 'field-row' }, h('label', { for: 'manage-prefix' }, 'Tag-Präfix'), prefixInput),
     h('label', { class: 'check-line' }, publishes, gitlabHost(r.repo)
       ? 'Eine Pipeline des Projekts veröffentlicht zu jedem Tag ein GitLab-Release; die App wartet darauf'
       : 'Ein Workflow des Repositorys veröffentlicht zu jedem Tag ein GitHub-Release; die App wartet darauf'),
-    r.conflicts.length > 0 && h('div', { class: 'note orange' }, r.conflicts.join(' · ')),
     h('div', { class: 'line' },
       saveButton, state,
       h('span', { class: 'spacer' }),
       button('Aus der Verwaltung entfernen …', () => confirmDialog('Aus der Verwaltung entfernen',
-        `${r.repo} aus der Verwaltung nehmen? Gelöscht wird nichts: nicht auf ${serviceOf(r.repo)}, nicht die lokale Kopie, nicht die Website-Konfiguration.`, 'Entfernen',
+        `${r.repo} aus der Verwaltung nehmen? Gelöscht wird nichts: nicht auf ${serviceOf(r.repo)}, nicht die lokale Kopie.`, 'Entfernen',
         async () => { if (await act('remove_repository', { key: r.key })) { selection.delete(r.key); closeRepo(); } }), { id: 'manage-remove', cls: 'danger', disabled: locked })),
   ].filter(Boolean);
 }
@@ -1811,7 +1209,7 @@ function renderJob(summary, job) {
   const endJob = () => confirmDialog('Auftrag beenden', 'Den Auftrag beenden? Was noch nicht erledigt ist, bleibt unerledigt; nichts Erledigtes wird zurückgenommen.', 'Beenden',
     () => act('end_job', { id: summary.id }));
   const deleteJob = () => confirmDialog('Auftragsverlauf löschen',
-    'Gelöscht werden die gespeicherten Daten dieses Auftrags, sein Log und seine temporären Arbeitsdaten. Was der Auftrag auf GitHub oder GitLab, im Wiki oder auf der Website geändert hat, bleibt bestehen und wird nicht zurückgenommen.',
+    'Gelöscht werden die gespeicherten Daten dieses Auftrags, sein Log und seine temporären Arbeitsdaten. Was der Auftrag auf GitHub oder GitLab oder im Wiki geändert hat, bleibt bestehen und wird nicht zurückgenommen.',
     'Verlauf löschen', () => act('delete_job', { id: summary.id }).then((ok) => ok && closeJob()), { danger: true });
   const more = [
     !running && !finished && ['Auftrag beenden …', endJob, { iconName: 'stop', danger: true }],
@@ -1841,7 +1239,7 @@ function renderJob(summary, job) {
     h('span', null, h('strong', null, 'Repositories: '), summary.repos.map(repoName).join(', ')),
     activities.length > 0 && h('span', null, h('strong', null, 'Pflege: '), activities.join(', ')),
     targetNames.length > 0 && h('span', null, h('strong', null, 'Inhalte: '), targetNames.join(', ')),
-    o.website && h('span', null, h('strong', null, 'Website: '), 'als letzter Schritt'),
+    o.website && h('span', null, h('strong', null, 'Website: '), 'als letzter Schritt (jetzt in OpenSitePilot)'),
     o.model && h('span', null, h('strong', null, 'Modell: '), modelName(o.model)),
     h('span', null, h('strong', null, 'Begonnen: '), formatTime(summary.createdAt)),
   ].filter(Boolean));
@@ -2212,173 +1610,11 @@ function contentBlock(job, step) {
   ].filter(Boolean);
 }
 
+/** A website step of a job from before OpenSitePilot; it is not run here any more. */
 function websiteBlock(job, step) {
-  const w = step.website;
-  const decide = step.state === 'needsApproval';
-  const site = view.site?.name ?? 'die Website';
-  return [
-    waitsFor(job, step),
-    !w && h('div', { class: 'note' }, 'Aktualisiert die Website für die Produkte der Repositories dieses Auftrags (mit den Website-Aufgaben), baut sie und committet lokal. Veröffentlicht wird erst nach deiner Freigabe: Push, SFTP-Upload, Prüfung der Live-Seite.'),
-    w && decisionBrief([
-      ['Betroffen', w.products.length ? `${w.products.join(', ')} auf ${site}` : `${site} (keine Produktversion geändert)`],
-      ['Änderung', `lokaler Commit ${short(w.commit)} auf ${short(w.base)}`],
-      decide && ['Freigeben bewirkt', `Genau dieser Commit wird gepusht, die geänderten Dateien per SFTP auf ${view.site?.url?.replace(/^https?:\/\//, '') ?? 'den Server'} hochgeladen und die Live-Seite Datei für Datei geprüft.`],
-      decide && ['Verwerfen bewirkt', 'Nichts wird veröffentlicht; der Commit bleibt lokal im Website-Projekt stehen.'],
-    ], w.summary),
-    decide && decisionBar(
-      button('Freigeben: Website veröffentlichen', () => act('approve_step', { id: job.id, step: step.id, fingerprint: w.commit }), { cls: 'primary', iconName: 'check', disabled: !!view.running }),
-      button('Verwerfen', () => act('reject_step', { id: job.id, step: step.id }), { disabled: !!view.running }),
-      button('Neu vorbereiten', () => act('redo_step', { id: job.id, step: step.id }), { disabled: !!view.running, title: 'Neuer Claude-Lauf (kostet Claude-Nutzung)' })),
-    !decide && ['blocked', 'failed', 'nothingToDo'].includes(step.state) && !step.writing && decisionBar(
-      button('Neu vorbereiten', () => act('redo_step', { id: job.id, step: step.id }), { disabled: !!view.running })),
-    w && technicalPreview(`${job.id}:${step.id}:tech`, { stat: w.stat, diff: w.diff }),
-  ].filter(Boolean);
+  return [h('div', { class: 'note' }, step.detail || 'Die Website aktualisiert und veröffentlicht jetzt OpenSitePilot.')];
 }
 
-// MARK: Log
-
-function clearLog() {
-  if (skeleton) skeleton.log.replaceChildren();
-}
-
-function appendTo(log, lines) {
-  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-  log.append(...lines.map((l) => h('span', { class: `l-${l.kind}` }, `${l.text}\n`)));
-  if (atBottom) log.scrollTop = log.scrollHeight;
-}
-
-function appendLog(lines) {
-  if (skeleton) appendTo(skeleton.log, lines);
-}
-
-async function loadLog(step) {
-  const lines = await invoke('get_log', { step });
-  if (step !== selected || !skeleton) return;
-  clearLog();
-  appendLog(lines);
-}
-
-// MARK: Dialogs
-
-/** A modal dialog whose content `build` returns; `render` builds it again. A re-render keeps the
- *  scroll position and gives the focus back to the element with the same id (controls that change
- *  the dialog need a stable id). */
-function openDialog(title, build) {
-  const dialog = h('dialog', { 'aria-label': title, tabindex: '-1' });
-  const close = () => dialog.close();
-  // The id that last had the focus; a control disabled while busy gets it back once enabled again.
-  let wanted = null;
-  const render = () => {
-    const focused = dialog.contains(document.activeElement) ? document.activeElement : null;
-    if (focused && focused !== dialog) wanted = focused.id || null;
-    const focusId = wanted;
-    const scroll = dialog.querySelector('.dialog-body')?.scrollTop ?? 0;
-    const { body, actions } = build(close, render);
-    dialog.replaceChildren(h('form', { method: 'dialog', onsubmit: (e) => e.preventDefault() },
-      h('div', { class: 'dialog-body' }, body), h('div', { class: 'dialog-actions' }, actions)));
-    const bodyEl = dialog.querySelector('.dialog-body');
-    if (bodyEl) bodyEl.scrollTop = scroll;
-    if (focused) {
-      const again = focusId && dialog.querySelector(`#${CSS.escape(focusId)}`);
-      // Without the same element, the dialog itself keeps the focus instead of the page behind it.
-      (again && !again.disabled ? again : dialog).focus({ preventScroll: true });
-    }
-  };
-  render();
-  dialog.addEventListener('close', () => dialog.remove());
-  document.body.append(dialog);
-  dialog.showModal();
-  return { dialog, close, render };
-}
-
-function showAlert(message) {
-  openDialog('Fehler', (close) => ({
-    body: [h('h2', null, 'Fehler'), h('div', { class: 'selectable' }, message)],
-    actions: [button('OK', close, { cls: 'primary' })],
-  }));
-}
-
-/** Asks before something that cannot be undone from here; `action` runs on confirmation. Cancel has
- *  the focus, so Enter never confirms by accident. */
-function confirmDialog(title, text, label, action, { danger = false } = {}) {
-  const { dialog } = openDialog(title, (close) => ({
-    body: [h('h2', null, title), h('p', { class: 'selectable', style: 'margin:0' }, text)],
-    actions: [button('Abbrechen', close, { id: 'confirm-cancel' }), button(label, async () => { close(); await action(); }, { cls: danger ? 'primary danger-fill' : 'primary' })],
-  }));
-  dialog.querySelector('#confirm-cancel')?.focus();
-}
-
-function row(label, control, id) {
-  if (id) control.id = id;
-  return h('div', { class: 'field-row' }, h('label', { for: control.id || null }, label), control);
-}
-
-// MARK: Repository picker
-
-let repoCache = null;
-
-async function loadRepos(force = false) {
-  if (!repoCache || force) repoCache = await invoke('list_repos');
-  return repoCache;
-}
-
-/** Filterable list of the user's repositories. Keeps its own state, so typing never re-renders the
- *  dialog. With `multi`, rows toggle in `picked` (a Set of full names); else `onPick` gets the row. */
-function repoPicker({ include = () => true, onPick, multi = false, picked = new Set(), locked = () => null }) {
-  const state = { query: '', data: null, error: null, picked: null };
-  const list = h('div', { class: 'repo-list', role: 'listbox', 'aria-multiselectable': multi ? 'true' : null });
-  const note = h('div', { class: 'note' });
-  const search = h('input', { type: 'search', id: 'pick-search', placeholder: 'Repositories filtern …', spellcheck: 'false', autocomplete: 'off', 'aria-label': 'Repositories filtern',
-    oninput: (e) => { state.query = e.target.value.trim().toLowerCase(); renderList(); } });
-  const tag = (text, cls = '') => h('span', { class: `badge ${cls}` }, text);
-  const renderList = () => {
-    const focusId = list.contains(document.activeElement) ? document.activeElement.id : null;
-    renderRows();
-    if (focusId) document.getElementById(focusId)?.focus({ preventScroll: true });
-  };
-  const renderRows = () => {
-    if (state.error) { list.replaceChildren(h('div', { class: 'note error-text' }, state.error)); return; }
-    if (!state.data) { list.replaceChildren(h('div', { class: 'note' }, 'Repositories werden geladen …')); return; }
-    const repos = state.data.repos.filter(include).filter((r) => !state.query
-      || r.fullName.toLowerCase().includes(state.query) || (r.description ?? '').toLowerCase().includes(state.query));
-    note.textContent = [state.data.note, `Lokale Klone werden in ${state.data.workspace} gesucht.`].filter(Boolean).join(' ');
-    list.replaceChildren(...(repos.length ? repos.map((r) => {
-      const why = locked(r);
-      const on = multi ? picked.has(r.fullName) : state.picked === r.fullName;
-      return h('button', {
-        type: 'button', role: 'option', id: domId('pick-row', r.fullName), 'aria-selected': String(on), class: `repo-row ${on ? 'picked' : ''}`, disabled: !!why, title: why,
-        onclick: () => {
-          if (multi) on ? picked.delete(r.fullName) : picked.add(r.fullName);
-          else state.picked = r.fullName;
-          renderList();
-          onPick?.(r);
-        },
-      },
-        h('div', { class: 'repo-head' },
-          multi && h('input', { type: 'checkbox', checked: on, disabled: !!why, tabindex: '-1', 'aria-hidden': 'true' }),
-          h('strong', null, r.fullName),
-          r.managed && tag('verwaltet', 'green'),
-          r.private && tag('privat', 'orange'),
-          r.isWebsite && tag('Website', 'accent'),
-          r.onSite && tag('Produkt der Website', ''),
-          r.archived && tag('archiviert', 'orange'),
-          r.localPath ? tag('lokal', 'green') : tag('nicht lokal')),
-        r.description && h('div', { class: 'muted small' }, r.description));
-    }) : [h('div', { class: 'note' }, 'Keine passenden Repositories.')]));
-  };
-  const load = async (force) => {
-    state.error = null;
-    state.data = force ? null : state.data;
-    renderList();
-    try { state.data = await loadRepos(force); } catch (e) { state.error = String(e); }
-    renderList();
-  };
-  const el = h('div', { class: 'repo-picker' },
-    h('div', { class: 'line' }, search, button('Neu laden', () => load(true), { id: 'pick-reload', iconName: 'refresh', iconOnly: true })),
-    list, note);
-  load(false);
-  return el;
-}
 
 // MARK: Adding repositories
 
@@ -2432,8 +1668,7 @@ function addReposDialog() {
           h('strong', null, repoParts(r.repo).path),
           gitlabHost(r.repo) && tag(`GitLab · ${gitlabHost(r.repo)}`, 'orange'),
           r.managed && tag('verwaltet', 'green'),
-          r.isWebsite && tag('Website', 'accent'),
-          r.onSite && tag('Produkt der Website')),
+          r.isWebsite && tag('Website-Projekt', 'accent')),
         h('div', { class: 'muted small mono' }, r.path),
         r.others.length > 0 && h('div', { class: 'muted small' }, `Weitere Klone: ${r.others.join(', ')} (in der Verwaltung änderbar)`));
     }) : [h('div', { class: 'note' }, s.data.repos.length ? 'Keine passenden Repositories.' : 'In diesem Ordner liegt kein Git-Klon mit GitHub- oder GitLab-Origin.')]));
@@ -2608,7 +1843,7 @@ function targetDialog(target, source) {
         h('summary', null, 'Erweiterte Optionen', (t.skill || t.model || t.check) ? h('span', { class: 'muted small' }, ' · angepasst') : null),
         h('div', { class: 'fold-body' },
           row('Skill (optional)', h('input', { type: 'text', value: t.skill, placeholder: 'Name eines Claude-Code-Skills', spellcheck: 'false', oninput: (e) => { t.skill = e.target.value; } }), 't-skill'),
-          row('Modell', modelSelect(t.model, view.config.claudeModel || view.site?.claude?.model, (model) => { t.model = model; }, 't-model'), 't-model'),
+          row('Modell', modelSelect(t.model, view.config.claudeModel, (model) => { t.model = model; }, 't-model'), 't-model'),
           row('Prüfbefehl (optional)', h('input', { type: 'text', value: t.check, placeholder: 'z. B. npx --yes markdownlint-cli2 README.md', spellcheck: 'false', oninput: (e) => { t.check = e.target.value; } }), 't-check'),
           h('div', { class: 'note' }, 'Läuft im Arbeitsordner nach Claudes Änderung, ohne deine GitHub- und GitLab-Tokens; Exit-Code 0 heißt bestanden. Eigene Prüfungen der App laufen immer: Pfade, Konfliktmarker, leere Dateien, neu defekte relative Links.'))),
       s.error && h('div', { class: 'note error-text', role: 'alert', id: 't-form-error', tabindex: '-1' }, s.error),
@@ -2654,13 +1889,12 @@ function jobDialog(keys) {
   const excluded = repos.filter((r) => r.capabilities.care || r.job);
   const withRule = all.filter((r) => r.release);
   const followers = withRule.flatMap((u) => releasedThrough(u.key).filter((f) => f.enabled).map((f) => ({ follower: f, upstream: u })));
-  const o = { prs: true, proof: true, cleanup: false, release: false, bump: 'patch', bumps: {}, prepareRelease: true, targets: new Map(), website: false, model: '', instructions: '' };
+  const o = { prs: true, proof: true, cleanup: false, release: false, bump: 'patch', bumps: {}, prepareRelease: true, targets: new Map(), model: '', instructions: '' };
   // With a release, a repository whose release a chosen one publishes comes along by itself, not as a care target.
   const cared = () => all.filter((r) => !(o.release && followers.some((f) => f.follower.key === r.key)));
   // What the chain reaches: the cared-for repositories and, with a release, those their tag publishes.
   const reach = () => [...cared().map((r) => r.key), ...(o.release ? followers.map((f) => f.follower.key) : [])];
   const targetsNow = () => view.targets.filter((t) => t.sources.some((k) => reach().includes(k)));
-  const feedsNow = () => !!view.websiteSources && reach().some((k) => view.websiteSources.includes(k));
   // An example of what the chosen bump makes of the newest tag, from the first repository whose tag is known.
   const example = () => withRule.map((r) => {
     // The newest release names the tag; without one, the highest matching tag.
@@ -2677,11 +1911,9 @@ function jobDialog(keys) {
   openDialog('Pflegeauftrag', (close, render) => {
     const allowed = cared();
     const targets = targetsNow();
-    const feedsWebsite = feedsNow();
-    // A target or the website the chain no longer reaches (release turned off) is not chosen.
+    // A target the chain no longer reaches (release turned off) is not chosen.
     for (const id of [...o.targets.keys()]) if (!targets.some((t) => t.id === id)) o.targets.delete(id);
-    if (!feedsWebsite) o.website = false;
-    const nothing = !o.prs && !o.cleanup && !o.release && !o.targets.size && !o.website;
+    const nothing = !o.prs && !o.cleanup && !o.release && !o.targets.size;
     const option = (key, title, note, disabled) => h('label', { class: 'check-line top' },
       h('input', { type: 'checkbox', id: `job-opt-${key}`, checked: o[key], disabled, 'aria-describedby': `job-opt-${key}-note`, onchange: (e) => { o[key] = e.target.checked; render(); } }),
       h('span', null, h('strong', null, title), h('div', { class: 'note', id: `job-opt-${key}-note` }, note)));
@@ -2709,7 +1941,7 @@ function jobDialog(keys) {
                   Object.entries(BUMP_TEXT).map(([value, text]) => h('option', { value, selected: o.bumps[r.key] === value }, text)))))),
             followers.length > 0 && h('div', { class: 'note' }, `Kommt mit: ${followers.map((f) => `${f.follower.repo} (Release aus ${f.upstream.repo})`).join(', ')}. Die App taggt dort nicht, sie wartet nach dem Tag auf das Release und meldet einen fehlgeschlagenen Export.`),
             option('prepareRelease', 'Vorher Versionsdateien und CHANGELOG anpassen', `Vor dem Tag bringt die App Cargo.toml, package.json, tauri.conf.json, Chart.yaml und ähnliche Dateien sowie das CHANGELOG.md auf die neue Version, aber nur dort, wo genau die Version des letzten Tags steht. Du siehst den Diff und gibst ihn eigens frei; dann ein Release-${pick('PR', 'MR')}, Merge bei grüner CI und der Tag auf dem Merge-Commit. Ohne passende Datei folgt der Tag direkt.`))),
-        (targets.length > 0 || feedsWebsite) && h('fieldset', null, h('legend', null, 'Zugeordnete Inhalte'),
+        targets.length > 0 && h('fieldset', null, h('legend', null, 'Zugeordnete Inhalte'),
           targets.map((t) => h('div', { class: 'target-choice' },
             h('label', { class: 'check-line' },
               h('input', { type: 'checkbox', id: domId('job-target', t.id), checked: o.targets.has(t.id), disabled: !!t.problem || !!t.job, onchange: (e) => { e.target.checked ? o.targets.set(t.id, t.basis) : o.targets.delete(t.id); render(); } }),
@@ -2717,13 +1949,12 @@ function jobDialog(keys) {
             o.targets.has(t.id) && h('select', { class: 'basis-select', id: domId('job-basis', t.id), 'aria-label': `Basis für ${t.name}`, onchange: (e) => o.targets.set(t.id, e.target.value) },
               h('option', { value: 'release', selected: o.targets.get(t.id) === 'release' }, 'Basis: neuestes Release'),
               h('option', { value: 'commit', selected: o.targets.get(t.id) === 'commit' }, 'Basis: aktueller Stand')),
-            (t.problem || t.job) && h('div', { class: 'note orange' }, t.problem ?? 'gehört zu einem offenen Auftrag'))),
-          feedsWebsite && option('website', `Website ${view.site?.name ?? ''} aktualisieren und veröffentlichen`, 'Als letzter Schritt: die Website-Aufgaben für die Produkte dieser Repositories, Build, Commit; nach deiner Freigabe Push, SFTP-Upload und Prüfung der Live-Seite.', !view.site)),
+            (t.problem || t.job) && h('div', { class: 'note orange' }, t.problem ?? 'gehört zu einem offenen Auftrag')))),
         targets.length === 0 && h('div', { class: 'note' }, 'Für README oder Wiki zuerst ein Inhaltsziel anlegen (Repository → Zugeordnete Inhalte).'),
-        (o.prs || o.targets.size > 0 || o.website) && row('Modell', modelSelect(o.model, view.config.claudeModel || view.site?.claude?.model, (model) => { o.model = model; }, 'job-model'), 'job-model'),
-        (o.targets.size > 0 || o.website) && h('div', { class: 'field-col' }, h('label', { for: 'job-instructions' }, 'Zusätzliche Anweisung für Inhalte und Website (optional)'),
+        (o.prs || o.targets.size > 0) && row('Modell', modelSelect(o.model, view.config.claudeModel, (model) => { o.model = model; }, 'job-model'), 'job-model'),
+        o.targets.size > 0 && h('div', { class: 'field-col' }, h('label', { for: 'job-instructions' }, 'Zusätzliche Anweisung für Inhalte (optional)'),
           h('textarea', { id: 'job-instructions', rows: 2, value: o.instructions, oninput: (e) => { o.instructions = e.target.value; } })),
-        h('div', { class: 'note' }, `Der Auftrag liest und bereitet vor, ohne nachzufragen. Vor jeder Änderung auf ${service}, im Wiki oder auf der Website legt er dir einen Vorschlag zur Freigabe vor; der Fortschritt steht unter Aufträge.`),
+        h('div', { class: 'note' }, `Der Auftrag liest und bereitet vor, ohne nachzufragen. Vor jeder Änderung auf ${service} oder im Wiki legt er dir einen Vorschlag zur Freigabe vor; der Fortschritt steht unter Aufträge.`),
         s.error && h('div', { class: 'note error-text', role: 'alert' }, s.error),
       ],
       actions: [
@@ -2733,7 +1964,7 @@ function jobDialog(keys) {
           try {
             const options = {
               prs: o.prs, proof: o.prs && o.proof, cleanup: o.cleanup, release: o.release, bump: o.bump, bumps: o.release ? o.bumps : {}, prepareRelease: o.release && o.prepareRelease,
-              website: o.website, model: o.model, instructions: o.instructions,
+              model: o.model, instructions: o.instructions,
               targets: [...o.targets].map(([id, basis]) => ({ id, basis })),
             };
             const id = await invoke('start_job', { input: { repos: allowed.map((r) => r.key), options } });
@@ -2762,34 +1993,14 @@ function parseBudget(text) {
 function settingsDialog() {
   const c = view.config;
   const s = {
-    projectDir: c.projectDir, workspaceDir: c.workspaceDir ?? '', siteRepo: view.siteRepo, cloneRepo: null, cloning: false,
-    showPicker: false,
-    host: c.sftp.host, port: c.sftp.port || 22, user: c.sftp.user, remoteDir: c.sftp.remoteDir,
-    auth: c.sftp.auth, keyPath: c.sftp.keyPath, secret: '', message: null, busy: false,
+    workspaceDir: c.workspaceDir ?? '', message: null,
     updateCheck: !c.noUpdateCheck, claudeModel: c.claudeModel ?? '', budget: c.maxBudgetUsd != null ? String(c.maxBudgetUsd).replace('.', ',') : '',
-    // The connection test's answer, shown at the test; a server key it offered, and the one trusted here (saved with the rest).
-    test: null, offeredKey: null, hostKey: '', hostKeyFor: '',
-    open: { general: true, website: !!c.projectDir, app: false },
+    open: { general: true, app: false },
   };
-  const target = () => `${s.host.trim()}:${Number(s.port) || 22}`;
-  const input = () => ({
-    projectDir: s.projectDir, workspaceDir: s.workspaceDir, host: s.host, port: Number(s.port) || 22, user: s.user, remoteDir: s.remoteDir,
-    auth: s.auth, keyPath: s.keyPath, secret: s.secret, updateCheck: s.updateCheck,
-    claudeModel: s.claudeModel, maxBudgetUsd: String(s.budget ?? ''),
-    hostKey: s.hostKey && s.hostKeyFor === target() ? s.hostKey : '',
-  });
+  const input = () => ({ workspaceDir: s.workspaceDir, updateCheck: s.updateCheck, claudeModel: s.claudeModel, maxBudgetUsd: String(s.budget ?? '') });
   const text = (key, props = {}, after) => h('input', { type: 'text', value: s[key] ?? '', spellcheck: 'false', autocomplete: 'off', ...props,
     oninput: (e) => { s[key] = e.target.value; after?.(); } });
   let render = () => {};
-  const picker = repoPicker({
-    include: (r) => !r.archived,
-    onPick: (r) => {
-      s.siteRepo = r.fullName;
-      s.cloneRepo = r.localPath ? null : r.fullName;
-      if (r.localPath) { s.projectDir = r.localPath; s.showPicker = false; }
-      render();
-    },
-  });
   // The budget's error is updated in place while typing; the field keeps focus and caret.
   const budgetError = h('div', { class: 'field-error', id: 's-budget-error', role: 'alert', hidden: true });
   const showBudget = (input) => {
@@ -2801,21 +2012,6 @@ function settingsDialog() {
   };
   const section = (key, title, ...content) => h('details', { class: 'fold settings-group', open: s.open[key], ontoggle: (e) => { s.open[key] = e.target.open; } },
     h('summary', null, title), h('div', { class: 'fold-body' }, content));
-  const testConnection = async () => {
-    s.busy = true; s.test = { cls: 'note', text: 'Verbinde …' }; s.offeredKey = null; render();
-    try {
-      const result = await invoke('test_connection', { input: input() });
-      if (result.kind === 'unknownHostKey') {
-        s.offeredKey = result.fingerprint;
-        s.test = { cls: 'orange', text: 'Der Server ist noch nicht bestätigt. Schlüssel prüfen, dann vertrauen und erneut testen.' };
-      } else {
-        s.test = { cls: 'ok-text', text: `${result.message}. Noch nicht gesichert: erst „Sichern“ übernimmt die Einstellungen.` };
-      }
-    } catch (error) {
-      s.test = { cls: 'error-text', text: String(error) };
-    }
-    s.busy = false; render();
-  };
   // Own tokens: the form for GitHub or one GitLab instance; the token lives only in this field's state until saved.
   const tok = { forge: null, host: '', scheme: 'https', storage: 'keychain', token: '', busy: false, error: null, ok: null, lockHost: false };
   const tokClose = () => { tok.forge = null; tok.token = ''; tok.error = null; tok.busy = false; render(); };
@@ -2922,11 +2118,7 @@ function settingsDialog() {
   };
   const dlg = openDialog('Einstellungen', (close, rerender) => {
     render = rerender;
-    const password = s.auth === 'password';
-    const sameProject = c.projectDir === s.projectDir;
     const budgetInput = text('budget', { id: 's-budget', placeholder: 'USD, leer = keine', inputmode: 'decimal', 'aria-describedby': 's-budget-note s-budget-error' }, () => showBudget(budgetInput));
-    const savedKey = c.sftp.hostKey && `${c.sftp.host.trim()}:${c.sftp.port || 22}` === target() ? c.sftp.hostKey : '';
-    const trusted = s.hostKey && s.hostKeyFor === target() ? s.hostKey : '';
     queueMicrotask(() => { if (s.budget) showBudget(budgetInput); });
     return {
       body: [
@@ -2937,67 +2129,12 @@ function settingsDialog() {
             gitlabRow(),
             h('div', { class: 'note' }, 'Ohne eigenes Token nutzt die App das Token von gh bzw. glab. Claude bekommt nie eines.'),
             row('Repo-Ordner', h('div', { class: 'line' }, text('workspaceDir', { id: 's-workspace', placeholder: `${view.workspaceDisplay} (automatisch)` }),
-              button('Auswählen …', async () => { const p = await call('pick_folder'); if (p) { s.workspaceDir = p; repoCache = null; render(); } }, { id: 's-workspace-pick' }))),
+              button('Auswählen …', async () => { const p = await call('pick_folder'); if (p) { s.workspaceDir = p; render(); } }, { id: 's-workspace-pick' }))),
             h('div', { class: 'note' }, 'Aus diesem Ordner bietet „Repositories auswählen“ die lokalen Klone an; neue Klone legt die App hier an.')),
           h('fieldset', null, h('legend', null, 'Ausführungsregeln für Aufträge'),
-            row('Claude-Modell', modelSelect(s.claudeModel, view.site?.claude?.model, (model) => { s.claudeModel = model; }, 's-claude-model'), 's-claude-model'),
+            row('Claude-Modell', modelSelect(s.claudeModel, null, (model) => { s.claudeModel = model; }, 's-claude-model'), 's-claude-model'),
             h('div', { class: 'field-row' }, h('label', { for: 's-budget' }, 'Kostengrenze je Claude-Lauf'), h('div', { class: 'field-stack' }, budgetInput, budgetError)),
             h('div', { class: 'note', id: 's-budget-note' }, 'In USD, Komma oder Punkt. Gilt für PR-Prüfungen und Inhaltsarbeit, wenn Auftrag oder Ziel nichts anderes wählen. Schreibende Schritte laufen nie ohne Vorschau und deine Freigabe.'))),
-        section('website', 'Website und Veröffentlichung (optional)',
-          h('fieldset', null, h('legend', null, 'Website'),
-            h('div', { class: 'note' }, 'Nur nötig, wenn die App auch eine Website aktualisieren und per SFTP veröffentlichen soll.'),
-            row('Website-Repo', h('div', { class: 'line' },
-              h('span', { class: `spacer ${s.siteRepo ? 'mono' : 'muted'}` }, s.siteRepo ?? 'nicht gewählt'),
-              button(s.showPicker ? 'Liste schließen' : 'Aus Liste wählen …', () => { s.showPicker = !s.showPicker; render(); }, { id: 's-site-pick' }))),
-            s.showPicker && picker,
-            s.cloneRepo && h('div', { class: 'line' },
-              h('span', { class: 'note spacer' }, `${s.cloneRepo} ist noch nicht lokal vorhanden.`),
-              button(s.cloning ? 'Klone …' : `Nach ${s.workspaceDir || view.workspaceDisplay} klonen`, async () => {
-                s.cloning = true; render();
-                try {
-                  s.projectDir = await invoke('clone_repo', { repo: s.cloneRepo, workspaceDir: s.workspaceDir });
-                  s.cloneRepo = null; s.showPicker = false; repoCache = null;
-                } catch (error) { s.message = String(error); }
-                s.cloning = false; render();
-              }, { id: 's-clone', cls: 'primary', disabled: s.cloning })),
-            row('Projektordner', h('div', { class: 'line' }, text('projectDir', { id: 's-project', placeholder: 'leer = keine Website' }),
-              button('Auswählen …', async () => { const p = await call('pick_folder'); if (p) { s.projectDir = p; render(); } }, { id: 's-project-pick' }),
-              s.projectDir && button('Entfernen', () => { s.projectDir = ''; s.siteRepo = null; render(); }, { id: 's-project-remove', title: 'Website aus der App nehmen; im Projekt ändert sich nichts' }))),
-            h('div', { class: `note ${view.siteError && sameProject ? 'error-text' : ''}` },
-              !s.projectDir ? 'Keine Website eingerichtet.'
-                : view.site && sameProject ? `${view.siteFile} gefunden: ${view.site.name}, Build „${view.site.build}“, Ausgabe ${view.site.output}`
-                  : view.siteError && sameProject ? view.siteError
-                    : 'Der Projektordner braucht eine Datei .openreleasepilot/site.json (siehe README); geprüft wird beim Sichern.')),
-          s.projectDir && h('fieldset', null, h('legend', null, 'SFTP-Ziel der Website'),
-            row('Server', text('host', { id: 's-host', placeholder: 'ssh.strato.de' })),
-            row('Port', text('port', { id: 's-port', inputmode: 'numeric' })),
-            row('Benutzer', text('user', { id: 's-user', placeholder: 'z. B. example.com' })),
-            row('Zielordner', text('remoteDir', { id: 's-remote', placeholder: '/example.com' })),
-            h('div', { class: 'note' }, 'Ordner auf dem Server, der dem Ausgabeordner entspricht. Gelöscht werden nur Dateien, die die App selbst hochgeladen hat.'),
-            row('Anmeldung', h('select', { onchange: (e) => { s.auth = e.target.value; render(); } },
-              h('option', { value: 'password', selected: password }, 'Passwort'),
-              h('option', { value: 'key', selected: !password }, 'SSH-Schlüssel')), 's-auth'),
-            !password && row('Schlüsseldatei', h('div', { class: 'line' }, text('keyPath', { id: 's-key', placeholder: '~/.ssh/id_ed25519' }),
-              button('Auswählen …', async () => { const p = await call('pick_file'); if (p) { s.keyPath = p; render(); } }, { id: 's-key-pick' }))),
-            row(password ? 'Passwort' : 'Passphrase', h('input', { type: 'password', value: s.secret, autocomplete: 'off',
-              placeholder: c.sftp.secretSaved ? 'gespeichert – leer lassen zum Behalten' : (password ? '' : 'leer, wenn der Schlüssel keine hat'),
-              oninput: (e) => { s.secret = e.target.value; } }), 's-secret'),
-            h('div', { class: 'note' }, 'Das Passwort liegt nur im Schlüsselbund des Systems, nie in einer Datei oder im Repository.',
-              c.sftp.secretSaved && [' ', button('Gespeichertes Passwort entfernen', async () => { await call('forget_secret'); close(); }, { id: 's-forget', cls: 'link' })]),
-            row('Server-Schlüssel', h('div', { class: trusted || savedKey ? 'mono selectable' : 'muted' },
-              trusted ? `${trusted} (hier bestätigt; wird mit „Sichern“ gespeichert)` : savedKey || 'wird beim ersten Verbindungstest bestätigt')),
-            h('div', { class: 'line wrap' },
-              button(s.busy ? 'Verbinde …' : 'Verbindung testen', testConnection, { id: 's-test', disabled: s.busy || s.cloning, title: 'Testet die Eingaben dieses Dialogs; gesichert wird erst mit „Sichern“' }),
-              h('span', { class: 'note' }, 'Speichert nichts.')),
-            h('div', { class: `note ${s.test?.cls ?? ''}`, role: 'status', 'aria-live': 'polite' }, s.test?.text ?? ''),
-            s.offeredKey && h('div', { class: 'note-box warning' },
-              h('strong', null, `Server-Schlüssel von ${target()}`),
-              h('div', { class: 'fingerprint' }, s.offeredKey),
-              h('div', { class: 'note' }, 'Vergleiche ihn mit der Angabe deines Hosters oder im Terminal mit:'),
-              h('div', { class: 'fingerprint' }, `ssh-keyscan -p ${Number(s.port) || 22} ${s.host.trim()} | ssh-keygen -lf -`),
-              h('div', { class: 'line' },
-                button('Vertrauen und erneut testen', () => { s.hostKey = s.offeredKey; s.hostKeyFor = target(); s.offeredKey = null; testConnection(); }, { id: 's-trust', cls: 'primary' }),
-                button('Nicht vertrauen', () => { s.offeredKey = null; s.test = null; render(); }, { id: 's-distrust' }))))),
         section('app', 'App',
           h('label', { class: 'check-line' },
             h('input', { type: 'checkbox', id: 's-update-check', checked: s.updateCheck, onchange: (e) => { s.updateCheck = e.target.checked; } }),
@@ -3023,107 +2160,21 @@ function settingsDialog() {
             s.message = String(error); render();
             document.getElementById('s-message')?.focus();
           }
-        }, { id: 's-save', cls: 'primary', disabled: s.busy || s.cloning }),
+        }, { id: 's-save', cls: 'primary' }),
       ],
     };
   });
   return dlg;
 }
 
-// MARK: New product
-
-function addProductDialog() {
-  const s = { repo: null, check: null, checking: false, error: null, name: '', localPath: '', instructions: '', cloning: false, model: '' };
-  let render = () => {};
-  const inspect = async (repo) => {
-    s.repo = repo; s.check = null; s.error = null; s.checking = true;
-    s.name = repo.name; s.localPath = repo.localPath ?? '';
-    render();
-    try {
-      s.check = await invoke('inspect_repo', { repo: repo.fullName });
-      if (s.check.localPath) s.localPath = s.check.localPath;
-    } catch (error) { s.error = String(error); }
-    s.checking = false; render();
-  };
-  const picker = repoPicker({ include: (r) => !r.onSite && !r.isWebsite && !r.archived && !r.fork, onPick: inspect });
-  openDialog('Produkt zur Website hinzufügen', (close, rerender) => {
-    render = rerender;
-    const info = s.check?.info;
-    return {
-      body: [
-        h('h2', null, 'Produkt zur Website hinzufügen'),
-        h('p', { class: 'note', style: 'margin:0' }, 'Wähle das Repository des Produkts. Claude legt Produktseite (Deutsch und Englisch), Produktkarte, Navigation, Icon, Ablaufgrafik, llms.txt und den Eintrag in site.json an, nach dem Skill des Projekts. Danach baut die App und committet lokal; live geht es erst mit „Veröffentlichen“.'),
-        picker,
-        s.checking && h('div', { class: 'note' }, `${s.repo.fullName} wird geprüft …`),
-        s.error && h('div', { class: 'note error-text', role: 'alert' }, s.error),
-        info && h('fieldset', null, h('legend', null, info.fullName),
-          h('div', { class: 'facts' },
-            h('span', null, h('strong', null, 'Release: '), s.check.latestTag ?? 'noch keins'),
-            h('span', null, h('strong', null, 'Lizenz: '), info.license ?? 'keine erkannt'),
-            info.private && h('span', { class: 'orange' }, h('strong', null, 'privat: '), 'Besucher können GitHub-Links darauf nicht öffnen')),
-          info.description && h('div', { class: 'muted' }, info.description),
-          !s.check.latestTag && h('div', { class: 'note orange' }, 'Ohne Release gibt es kein Versions-Badge, und „Prüfen“ beobachtet das Produkt erst nach dem ersten Release.'),
-          row('Name', h('input', { type: 'text', value: s.name, spellcheck: 'false', oninput: (e) => { s.name = e.target.value; } }), 'n-name'),
-          row('Lokaler Klon', h('div', { class: 'line' },
-            h('span', { class: `spacer ${s.localPath ? 'mono' : 'muted'}` }, s.localPath || 'nicht vorhanden – Claude liest dann nur über GitHub'),
-            !s.localPath && button(s.cloning ? 'Klone …' : 'Klonen', async () => {
-              s.cloning = true; render();
-              try { s.localPath = await invoke('clone_repo', { repo: info.fullName, workspaceDir: '' }); repoCache = null; } catch (error) { s.error = String(error); }
-              s.cloning = false; render();
-            }, { id: 'n-clone', disabled: s.cloning }),
-            button('Auswählen …', async () => { const p = await call('pick_folder'); if (p) { s.localPath = p; render(); } }, { id: 'n-local-pick' })), 'n-local'),
-          row('Modell', modelSelect(s.model, view.site?.claude?.model, (model) => { s.model = model; }, 'n-model'), 'n-model'),
-          h('div', { class: 'field-col' },
-            h('label', { for: 'n-instructions' }, 'Anweisung an Claude (optional)'),
-            h('textarea', { id: 'n-instructions', rows: 3, value: s.instructions,
-              placeholder: 'z. B. Kategorie, Zielgruppe, Position in der Produktliste, welche Screenshots aus dem Repo',
-              oninput: (e) => { s.instructions = e.target.value; } }))),
-      ],
-      actions: [
-        button('Abbrechen', close),
-        button('Produktseite erstellen', async () => {
-          // A command without a return value resolves to null, so success is "no exception".
-          try {
-            await invoke('run_add_product', { input: { repo: info.fullName, name: s.name, localPath: s.localPath, instructions: s.instructions, model: s.model } });
-            close();
-          } catch (error) { s.error = String(error); render(); }
-        }, { id: 'n-create', cls: 'primary', disabled: !info || s.checking || s.cloning || !s.name.trim() || !!view.running,
-          title: 'Startet einen Claude-Lauf (kostet Claude-Nutzung), danach Build und lokaler Commit' }),
-      ],
-    };
-  });
-}
-
-function hostKeyDialog() {
-  hostKeyOpen = true;
-  const cfg = view.config.sftp;
-  const fingerprint = view.pendingHostKey;
-  const { dialog } = openDialog('Server-Schlüssel bestätigen', (close) => ({
-    body: [
-      h('h2', null, 'Server-Schlüssel bestätigen'),
-      h('p', { class: 'muted', style: 'margin:0' }, `Erste Verbindung zu ${cfg.host}:${cfg.port}. Der Server weist sich mit diesem Schlüssel aus:`),
-      h('div', { class: 'fingerprint' }, fingerprint),
-      h('p', { class: 'note', style: 'margin:0' }, 'Vergleiche ihn mit der Angabe deines Hosters oder im Terminal mit:'),
-      h('div', { class: 'fingerprint' }, `ssh-keyscan -p ${cfg.port} ${cfg.host} | ssh-keygen -lf -`),
-      h('p', { class: 'note', style: 'margin:0' }, 'Nach dem Bestätigen bricht jede Verbindung ab, falls sich der Schlüssel später ändert.'),
-    ],
-    actions: [
-      button('Abbrechen', async () => { await call('reject_host_key'); close(); }),
-      button('Vertrauen', async () => { await call('trust_host_key', { fingerprint }); close(); }, { cls: 'primary' }),
-    ],
-  }));
-  dialog.addEventListener('close', () => { hostKeyOpen = false; });
-}
 
 // MARK: Start
 
 async function start() {
   await listen('changed', refresh);
   await listen('log', (event) => {
-    const { step, job, line } = event.payload;
-    if (job) {
-      if (runsUi && job === jobId) appendTo(runsUi.log, [line]);
-    } else if (step === selected) appendLog([line]);
+    const { job, line } = event.payload;
+    if (job && runsUi && job === jobId) appendTo(runsUi.log, [line]);
   });
   // The menu bar icon asks for an area, a repository or a job.
   await listen('show', ({ payload }) => {
@@ -3143,12 +2194,11 @@ async function start() {
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState !== 'visible' || !view) return;
     refresh();
-    if (selected && skeleton) loadLog(selected);
     if (jobId && runsUi) loadJobLog(jobId);
   });
   await refresh();
   // Ages and "veraltet" move on without an event; a fresh view keeps them right. Reads nothing remote.
-  setInterval(() => { if (area !== 'website' && document.visibilityState === 'visible') refresh(); }, 30000);
+  setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 30000);
 }
 
 start();

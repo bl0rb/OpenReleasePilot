@@ -1,6 +1,7 @@
-//! OpenReleasePilot core: repository care, content targets and the website steps, without UI.
+//! The core of both apps, without UI: OpenReleasePilot (repository care, content targets) and
+//! OpenSitePilot (the website steps). `paths::set_app` says which app a process is.
 //!
-//! - `config`: the app's own settings (managed repositories, targets, website project, SFTP), stored in the app data folder
+//! - `config`: the apps' own settings (`Config`: managed repositories, targets; `SiteConfig`: website project, SFTP), each in its app's data folder
 //! - `site`: the project's `.openreleasepilot/site.json` (build, output, URL, watched products)
 //! - `shell`, `git`, `github`, `gitlab`, `claude`: external tools
 //! - `forge`: whether a repository lives on GitHub or on a GitLab instance

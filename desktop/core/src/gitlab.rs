@@ -1368,7 +1368,7 @@ mod tests {
             release: Some(crate::config::ReleaseRule { tag_prefix: "v".into(), publishes_release: true }),
             ..crate::config::ManagedRepo::new("gitlab.example.com/werk/app")
         });
-        crate::repos::targets(&config, None, None).remove(0)
+        crate::repos::targets(&config).remove(0)
     }
 
     #[test]
