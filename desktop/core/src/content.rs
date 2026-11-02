@@ -477,6 +477,16 @@ pub struct Changes {
 
 /// The changes in the work folder, or what makes them unacceptable (the reasons, none skipped).
 pub fn collect(prepared: &Prepared, patterns: &[String]) -> Result<Result<Changes, Vec<String>>> {
+    collect_with(prepared, &|path| allowed(patterns, path))
+}
+
+/// The changes of a file set the app wrote itself (no Claude), e.g. `.github/dependabot.yml`:
+/// exactly these paths are accepted, also below `.github`, which content targets never touch.
+pub fn collect_files(prepared: &Prepared, files: &[&str]) -> Result<Result<Changes, Vec<String>>> {
+    collect_with(prepared, &|path| is_plain_path(path) && !path.starts_with(".git/") && files.contains(&path))
+}
+
+fn collect_with(prepared: &Prepared, accepted: &dyn Fn(&str) -> bool) -> Result<Result<Changes, Vec<String>>> {
     let dir = &prepared.dir;
     let mut problems = Vec::new();
     if config_hash(dir)? != prepared.git_config {
@@ -489,7 +499,7 @@ pub fn collect(prepared: &Prepared, patterns: &[String]) -> Result<Result<Change
         let (code, path) = (&entry[..2], &entry[3..]);
         if code.contains('D') {
             problems.push(format!("{path}: gelöscht; Inhaltsziele löschen keine Dateien"));
-        } else if !allowed(patterns, path) {
+        } else if !accepted(path) {
             problems.push(format!("{path}: außerhalb der erlaubten Pfade"));
         } else if fs::symlink_metadata(dir.join(path)).map(|m| !m.is_file()).unwrap_or(true) {
             problems.push(format!("{path}: keine normale Datei (z. B. ein Link)"));
@@ -1289,7 +1299,7 @@ mod tests {
         let t = target(TargetKind::Docs, &["README.md"]);
         config.content_targets.push(t.clone());
         let options = JobOptions { targets: vec![TargetChoice { id: "t1".into(), basis: Basis::Commit }], ..JobOptions::default() };
-        let mut job = jobs::make("j1", 1, &["o/app".into()], &options, &jobs::Scope { config: &config }).unwrap();
+        let mut job = jobs::make("j1", 1, &["o/app".into()], &options, &jobs::Scope { config: &config, profiles: &Default::default() }).unwrap();
         assert_eq!(job.next_runnable(), Some(0), "no care, no release, no website: the README alone");
 
         // "Claude" reads the pinned source beside the target and edits the README.

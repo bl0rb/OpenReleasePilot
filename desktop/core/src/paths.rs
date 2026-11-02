@@ -62,3 +62,16 @@ pub fn expand_home(path: &str) -> PathBuf {
         _ => PathBuf::from(path),
     }
 }
+
+/// The app's own notes about one managed repository (profile, memory); never inside the repository.
+/// The key is encoded, so `a/b-c` and `a-b/c` stay apart.
+pub fn repo_dir(key: &str) -> PathBuf {
+    let name: String = key.chars().map(|c| match c {
+        '%' => "%25".to_owned(),
+        '/' => "%2F".to_owned(),
+        ':' => "%3A".to_owned(),
+        '\\' => "%5C".to_owned(),
+        c => c.to_string(),
+    }).collect();
+    data_dir().join("repos").join(name)
+}

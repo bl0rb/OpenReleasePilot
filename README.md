@@ -155,6 +155,8 @@ activities you pick, each optional:
   longer implies a tag.
 - **Content targets** fed by the selected repositories: README/documentation or wiki, each with the
   basis chosen for this job (newest release or current state of the default branch).
+- **Tasks from the analysis**, e.g. a Dependabot configuration as a proposal pull request (see
+  [Analysis, memory and tasks](#analysis-memory-and-tasks)).
 
 The app turns this into steps and runs them as far as it can without you: reading, Claude's review,
 preparing content in its own work folder. Before anything external changes it stops with a concrete
@@ -187,6 +189,35 @@ only one job runs at a time.
 New jobs can no longer include the website. Older open jobs with a website step stay readable; the step
 is skipped with the note that OpenSitePilot now updates and publishes the website. A local commit already
 prepared for it stays unpublished in the website project.
+
+## Analysis, memory and tasks
+
+What the app knows about a repository lives only in its data folder
+(`~/Library/Application Support/OpenReleasePilot/repos/`), never in the repository. Shown and deleted
+under repository → **Analyse und Gedächtnis**.
+
+- **Analysis**: on **Status aktualisieren** the app reads the local clone, without Claude and without
+  network: the default branch as last fetched (`origin/HEAD`, else `HEAD`), committed files only. It
+  detects the stack (Cargo, npm, Python, Go, Docker), CI configuration, Dependabot or Renovate, tests,
+  CHANGELOG, version files (the same as the release preparation), `CLAUDE.md`/`AGENTS.md`, own skills in
+  `.claude/skills` and `site.json`. Stored with the commit it describes; read again only when that commit
+  changes. Without a local clone there is no analysis, and jobs keep their previous defaults.
+- **Memory**: jobs remember per repository Claude's pull request verdicts, failures (with a count when
+  they recur across jobs) and what you left out or rejected; at most 60 notes, the oldest go first.
+  Claude gets them for pull request reviews and repairs as material, explicitly not as instructions,
+  together with a pointer to the repository's `CLAUDE.md` and skills.
+- **Tasks**: from the analysis the care dialog offers tasks, each with its level: **nur vorschlagen**
+  (a hint, the app does nothing), **mit Freigabe** (proposal, then your approval) or **automatisch**
+  (only reading or reversible work, e.g. proofs in a throwaway worktree).
+
+| Task | Level | When |
+|---|---|---|
+| Review and merge pull requests | mit Freigabe | preselected when pull requests are open |
+| Review with proofs | automatisch | preselected with a local clone and detected tests |
+| Tag a release | mit Freigabe | blocked with the reason when neither CI configuration nor checks are found |
+| Update version files and CHANGELOG | mit Freigabe | preselected when CHANGELOG.md or version files exist |
+| Propose a Dependabot configuration | mit Freigabe | GitHub, dependencies detected, neither Dependabot nor Renovate: the app writes `.github/dependabot.yml` (weekly, per manifest folder) in its work folder, shows the diff and opens a pull request after approval; you merge it |
+| Set up CI | nur vorschlagen | no CI detected |
 
 ## Repository care rules
 
@@ -420,6 +451,10 @@ banner once saying that the website now lives in OpenSitePilot, with a button to
 
 ## Changed from earlier versions
 
+- New: analysis of the local clone, a memory per repository and tasks from them in the care dialog (see
+  [Analysis, memory and tasks](#analysis-memory-and-tasks)). Without CI, **Release** is blocked in the
+  dialog already, not only at the tag. Removing a repository from the managed list also deletes its
+  analysis and memory.
 - From 0.5.0: the website moved into an app of its own, **OpenSitePilot**, published in the same release
   (see [OpenSitePilot](#opensitepilot-website)). OpenReleasePilot only looks after repositories and content
   targets (README, documentation, wiki): no Website area, no website step in jobs, no SFTP settings, no
