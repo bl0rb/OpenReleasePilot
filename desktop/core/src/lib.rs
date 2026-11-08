@@ -4,6 +4,7 @@
 //! - `config`: the apps' own settings (`Config`: managed repositories, targets; `SiteConfig`: website project, SFTP), each in its app's data folder
 //! - `site`: the project's `.openreleasepilot/site.json` (build, output, URL, watched products)
 //! - `shell`, `git`, `github`, `gitlab`, `claude`: external tools
+//! - `net`: the HTTP client settings shared by every request
 //! - `forge`: whether a repository lives on GitHub or on a GitLab instance
 //! - `sftp`, `manifest`, `verify`, `secrets`: upload, change tracking, live check, password storage
 //! - `tokens`: tokens the user entered for GitHub and GitLab, in the keychain, ahead of the CLIs' tokens
@@ -32,6 +33,7 @@ pub mod jobs;
 pub mod localrepo;
 pub mod manifest;
 pub mod memory;
+pub mod net;
 pub mod paths;
 pub mod profile;
 pub mod proof;

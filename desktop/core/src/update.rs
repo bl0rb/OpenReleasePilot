@@ -200,10 +200,11 @@ pub fn install(_package: &std::path::Path, _version: &str) -> Result<Installed> 
 }
 
 fn download(url: &str, limit: u64) -> Result<Vec<u8>> {
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(300)).build();
-    let response = agent.get(url).set("User-Agent", "OpenReleasePilot").call()?;
+    let agent = crate::net::agent(Duration::from_secs(300), true);
+    let response = agent.get(url).header("User-Agent", "OpenReleasePilot").call()?;
     let mut data = Vec::new();
-    response.into_reader().take(limit).read_to_end(&mut data)?;
+    // Not `read_to_vec`: its 10 MB limit would cut off the package; `limit` is the cap instead.
+    response.into_body().into_reader().take(limit).read_to_end(&mut data)?;
     Ok(data)
 }
 

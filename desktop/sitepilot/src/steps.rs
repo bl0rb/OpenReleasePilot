@@ -500,10 +500,10 @@ fn precheck(ctx: &Ctx) -> Result<(Status, String)> {
     publish(&checks);
     ctx.runner.check()?;
 
-    let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).build();
-    match agent.get(&site.url).call() {
-        Ok(response) => push(&mut checks, "Live-Seite", Status::Ok, format!("{} antwortet mit HTTP {}", site.url, response.status())),
-        Err(ureq::Error::Status(code, _)) => push(&mut checks, "Live-Seite", Status::Warning, format!("{} antwortet mit HTTP {code}", site.url)),
+    let agent = openreleasepilot_core::net::agent(Duration::from_secs(15), true);
+    match agent.get(&openreleasepilot_core::net::url(&site.url)).call() {
+        Ok(response) => push(&mut checks, "Live-Seite", Status::Ok, format!("{} antwortet mit HTTP {}", site.url, response.status().as_u16())),
+        Err(ureq::Error::StatusCode(code)) => push(&mut checks, "Live-Seite", Status::Warning, format!("{} antwortet mit HTTP {code}", site.url)),
         Err(e) => push(&mut checks, "Live-Seite", Status::Warning, format!("{} nicht erreichbar: {e}", site.url)),
     }
     match manifest::load_last(&config.sftp) {
