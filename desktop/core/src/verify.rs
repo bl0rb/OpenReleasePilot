@@ -56,6 +56,7 @@ pub fn compare(base: &str, manifest: &Manifest, on_progress: impl Fn(usize, usiz
         .map(|(path, entry)| (path, &entry.sha256))
         .collect();
     let agent = crate::net::agent(Duration::from_secs(30), true);
+    let base = &crate::net::url(base);
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let problems = Mutex::new(Vec::new());

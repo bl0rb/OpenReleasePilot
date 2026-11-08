@@ -2510,6 +2510,8 @@ dependencies = [
  "sha2 0.11.1",
  "ssh2",
  "ureq",
+ "ureq-proto",
+ "url",
  "walkdir",
 ]
 

@@ -501,7 +501,7 @@ fn precheck(ctx: &Ctx) -> Result<(Status, String)> {
     ctx.runner.check()?;
 
     let agent = openreleasepilot_core::net::agent(Duration::from_secs(15), true);
-    match agent.get(&site.url).call() {
+    match agent.get(&openreleasepilot_core::net::url(&site.url)).call() {
         Ok(response) => push(&mut checks, "Live-Seite", Status::Ok, format!("{} antwortet mit HTTP {}", site.url, response.status().as_u16())),
         Err(ureq::Error::StatusCode(code)) => push(&mut checks, "Live-Seite", Status::Warning, format!("{} antwortet mit HTTP {code}", site.url)),
         Err(e) => push(&mut checks, "Live-Seite", Status::Warning, format!("{} nicht erreichbar: {e}", site.url)),

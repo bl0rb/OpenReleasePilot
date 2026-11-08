@@ -47,11 +47,24 @@ fn request_with(method: &str, path: &str, token: Option<&str>) -> ureq::http::re
 
 /// Sends a request built by `request_with` (or its GitLab twin), with a 15 s timeout. Error statuses
 /// are answers, not errors: the caller reads the status and, where it matters, the body.
+///
+/// Redirects the way ureq 2 handled them: GET and HEAD follow them; a redirect without `Location`
+/// is the answer. Writes do not follow: ureq 3 refuses to resend a body or a DELETE on 307/308
+/// (`RedirectFailed`), where ureq 2 handed back the 3xx – e.g. GitHub's 307 for a renamed
+/// repository – so the caller reports it as a refusal instead of a lost connection.
 pub(crate) fn run(request: ureq::http::request::Builder, body: Option<String>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
     let agent = crate::net::agent(Duration::from_secs(15), false);
-    match body {
-        Some(body) => agent.run(request.body(body)?),
-        None => agent.run(request.body(())?),
+    if let Some(body) = body {
+        return agent.run(agent.configure_request(request.body(body)?).max_redirects(0).build());
+    }
+    let request = request.body(())?;
+    let unfollowed = |request| agent.configure_request(request).max_redirects(0).build();
+    if !matches!(*request.method(), ureq::http::Method::GET | ureq::http::Method::HEAD) {
+        return agent.run(unfollowed(request));
+    }
+    match agent.run(request.clone()) {
+        Err(ureq::Error::Protocol(ureq_proto::Error::NoLocationHeader)) => agent.run(unfollowed(request)),
+        result => result,
     }
 }
 
