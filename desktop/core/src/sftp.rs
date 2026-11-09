@@ -5,7 +5,7 @@ use crate::config::{AuthKind, SftpConfig};
 use crate::paths::expand_home;
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use ssh2::{OpenFlags, OpenType, RenameFlags, Session, Sftp};
+use ssh2::{MethodType, OpenFlags, OpenType, RenameFlags, Session, Sftp};
 use std::fmt;
 use std::fs;
 use std::io::Write;
@@ -52,6 +52,43 @@ fn fingerprint(key: &[u8]) -> String {
     format!("SHA256:{}", base64::engine::general_purpose::STANDARD_NO_PAD.encode(Sha256::digest(key)))
 }
 
+/// Host key algorithms in the order the libssh2 bundled with libssh2-sys 0.3.3 used by default.
+/// Newer libssh2 prefers Ed25519 over ECDSA, so a server holding both would present a
+/// different key and every stored `host_key` fingerprint would read as "changed".
+/// Pinning the old order keeps existing fingerprints valid. SHA-1 `ssh-rsa` and `ssh-dss`
+/// are left out: the bundled libssh2 no longer supports them.
+const HOSTKEY_PREF: &str = "ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
+ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,\
+ecdsa-sha2-nistp521-cert-v01@openssh.com,\
+ssh-ed25519,ssh-ed25519-cert-v01@openssh.com,\
+rsa-sha2-512,rsa-sha2-256,\
+rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com";
+
+fn new_session() -> Result<Session, ConnectError> {
+    let session = Session::new().map_err(|e| other("SSH", e))?;
+    session
+        .method_pref(MethodType::HostKey, HOSTKEY_PREF)
+        .map_err(|e| other("SSH-Host-Key-Algorithmen", e))?;
+    Ok(session)
+}
+
+/// `LIBSSH2_ERROR_KEX_FAILURE`: client and server share no key exchange, cipher or host key method.
+const KEX_FAILURE: ssh2::ErrorCode = ssh2::ErrorCode::Session(-5);
+
+/// A failed key exchange most often means a very old server that only offers SHA-1 `ssh-rsa`
+/// or `ssh-dss` host keys, which the bundled libssh2 no longer supports. Say so instead of
+/// only passing on libssh2's generic message.
+fn handshake_error(e: ssh2::Error) -> ConnectError {
+    if e.code() == KEX_FAILURE {
+        ConnectError::Other(format!(
+            "SSH-Handshake: {e}. Server und App haben keine gemeinsamen Verfahren für den Schlüsselaustausch. \
+Sehr alte Server, die nur veraltete Host-Keys (SHA-1 ssh-rsa oder ssh-dss) anbieten, werden nicht mehr unterstützt."
+        ))
+    } else {
+        other("SSH-Handshake", e)
+    }
+}
+
 pub fn connect(cfg: &SftpConfig, secret: Option<&str>) -> Result<Connection, ConnectError> {
     let host = cfg.host.trim();
     let addr = (host, cfg.port)
@@ -60,10 +97,10 @@ pub fn connect(cfg: &SftpConfig, secret: Option<&str>) -> Result<Connection, Con
         .next()
         .ok_or_else(|| ConnectError::Other(format!("{host} nicht gefunden")))?;
     let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(15)).map_err(|e| other(&format!("Verbindung zu {host}:{}", cfg.port), e))?;
-    let mut session = Session::new().map_err(|e| other("SSH", e))?;
+    let mut session = new_session()?;
     session.set_tcp_stream(tcp);
     session.set_timeout(60_000);
-    session.handshake().map_err(|e| other("SSH-Handshake", e))?;
+    session.handshake().map_err(handshake_error)?;
 
     let (key, _) = session.host_key().ok_or_else(|| ConnectError::Other("Server liefert keinen Host-Key".into()))?;
     let presented = fingerprint(key);
@@ -171,10 +208,81 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::fingerprint;
+    use super::{fingerprint, handshake_error, new_session, ConnectError, HOSTKEY_PREF, KEX_FAILURE};
+    use ssh2::MethodType;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::thread;
 
     #[test]
     fn fingerprint_matches_openssh_format() {
         assert_eq!(fingerprint(b"abc"), "SHA256:ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0");
+    }
+
+    #[test]
+    fn hostkey_pref_is_accepted_and_fully_supported() {
+        // libssh2 silently drops unknown names from a preference list, so check each one.
+        let session = new_session().expect("method_pref rejects HOSTKEY_PREF");
+        let supported = session.supported_algs(MethodType::HostKey).unwrap();
+        for name in HOSTKEY_PREF.split(',') {
+            assert!(supported.contains(&name), "{name} is not supported by libssh2 (supported: {supported:?})");
+        }
+    }
+
+    #[test]
+    fn kex_failure_explains_outdated_host_keys() {
+        let kex = handshake_error(ssh2::Error::new(KEX_FAILURE, "Unable to exchange encryption keys"));
+        assert!(matches!(kex, ConnectError::Other(_)));
+        let message = kex.to_string();
+        assert!(message.starts_with("SSH-Handshake: "), "{message}");
+        assert!(message.contains("SHA-1 ssh-rsa"), "{message}");
+
+        let other = handshake_error(ssh2::Error::new(ssh2::ErrorCode::Session(-13), "Socket disconnected"));
+        assert!(!other.to_string().contains("SHA-1"), "{other}");
+    }
+
+    fn read_u32(buf: &[u8], pos: &mut usize) -> usize {
+        let value = u32::from_be_bytes(buf[*pos..*pos + 4].try_into().unwrap()) as usize;
+        *pos += 4;
+        value
+    }
+
+    /// Captures the host key algorithm list the client sends in its KEXINIT, over loopback
+    /// against a fake server that stops after the client's first packet (no sshd needed).
+    #[test]
+    fn handshake_offers_hostkey_algorithms_in_old_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.write_all(b"SSH-2.0-OpenSSH_test\r\n").unwrap();
+            // Client identification line.
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while !line.ends_with(b"\r\n") {
+                stream.read_exact(&mut byte).unwrap();
+                line.push(byte[0]);
+            }
+            assert!(line.starts_with(b"SSH-2.0-"));
+            // First binary packet (unencrypted): length, padding length, payload, padding.
+            let mut len = [0u8; 4];
+            stream.read_exact(&mut len).unwrap();
+            let mut packet = vec![0u8; u32::from_be_bytes(len) as usize];
+            stream.read_exact(&mut packet).unwrap();
+            let payload = &packet[1..packet.len() - packet[0] as usize];
+            assert_eq!(payload[0], 20, "expected SSH_MSG_KEXINIT");
+            let mut pos = 1 + 16; // message type + cookie
+            let kex_len = read_u32(payload, &mut pos);
+            pos += kex_len;
+            let hostkey_len = read_u32(payload, &mut pos);
+            String::from_utf8(payload[pos..pos + hostkey_len].to_vec()).unwrap()
+        });
+
+        let mut session = new_session().unwrap();
+        session.set_tcp_stream(TcpStream::connect(addr).unwrap());
+        session.set_timeout(10_000);
+        // The fake server hangs up after the KEXINIT, so the handshake itself fails.
+        assert!(session.handshake().is_err());
+        assert_eq!(server.join().unwrap(), HOSTKEY_PREF);
     }
 }

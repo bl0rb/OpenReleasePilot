@@ -708,6 +708,10 @@ Hochgeladen wird von OpenSitePilot.
   `ssh-keyscan -p 22 host | ssh-keygen -lf -`); ändert er sich später, bricht jede Verbindung ab.
   „Verbindung testen“ in den Einstellungen prüft die Eingaben des Dialogs, ohne sie zu speichern; einen
   dort bestätigten Schlüssel übernimmt erst „Sichern“.
+- Sehr alte Server, die nur Host-Keys mit SHA-1 `ssh-rsa` oder `ssh-dss` anbieten (etwa OpenSSH vor
+  7.2, manche NAS- oder Embedded-Geräte), werden nicht mehr unterstützt; die Verbindung scheitert dann
+  beim SSH-Handshake mit einem Hinweis darauf. Unterstützt werden Ed25519-, ECDSA- und RSA-Host-Keys mit
+  `rsa-sha2-256`/`rsa-sha2-512`.
 - Die App merkt sich je Ziel ein Manifest des letzten Uploads (Pfad, Größe, SHA-256) in ihrem
   Datenordner. Hochgeladen werden nur neue oder geänderte Dateien, Assets vor Seiten, jeweils unter
   einem temporären Namen und dann umbenannt, damit Besucher nie halbe Dateien bekommen. Gelöscht
