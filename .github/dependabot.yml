@@ -11,6 +11,9 @@ updates:
     groups:
       tauri:
         patterns: ["tauri", "tauri-*"]
+      # core/Cargo.toml pins ureq-proto to the version ureq uses, so they move together.
+      ureq:
+        patterns: ["ureq", "ureq-proto"]
 
   - package-ecosystem: npm
     directory: /desktop
