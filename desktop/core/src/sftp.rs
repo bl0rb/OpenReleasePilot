@@ -72,6 +72,23 @@ fn new_session() -> Result<Session, ConnectError> {
     Ok(session)
 }
 
+/// `LIBSSH2_ERROR_KEX_FAILURE`: client and server share no key exchange, cipher or host key method.
+const KEX_FAILURE: ssh2::ErrorCode = ssh2::ErrorCode::Session(-5);
+
+/// A failed key exchange most often means a very old server that only offers SHA-1 `ssh-rsa`
+/// or `ssh-dss` host keys, which the bundled libssh2 no longer supports. Say so instead of
+/// only passing on libssh2's generic message.
+fn handshake_error(e: ssh2::Error) -> ConnectError {
+    if e.code() == KEX_FAILURE {
+        ConnectError::Other(format!(
+            "SSH-Handshake: {e}. Server und App haben keine gemeinsamen Verfahren für den Schlüsselaustausch. \
+Sehr alte Server, die nur veraltete Host-Keys (SHA-1 ssh-rsa oder ssh-dss) anbieten, werden nicht mehr unterstützt."
+        ))
+    } else {
+        other("SSH-Handshake", e)
+    }
+}
+
 pub fn connect(cfg: &SftpConfig, secret: Option<&str>) -> Result<Connection, ConnectError> {
     let host = cfg.host.trim();
     let addr = (host, cfg.port)
@@ -83,7 +100,7 @@ pub fn connect(cfg: &SftpConfig, secret: Option<&str>) -> Result<Connection, Con
     let mut session = new_session()?;
     session.set_tcp_stream(tcp);
     session.set_timeout(60_000);
-    session.handshake().map_err(|e| other("SSH-Handshake", e))?;
+    session.handshake().map_err(handshake_error)?;
 
     let (key, _) = session.host_key().ok_or_else(|| ConnectError::Other("Server liefert keinen Host-Key".into()))?;
     let presented = fingerprint(key);
@@ -191,7 +208,7 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, new_session, HOSTKEY_PREF};
+    use super::{fingerprint, handshake_error, new_session, ConnectError, HOSTKEY_PREF, KEX_FAILURE};
     use ssh2::MethodType;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -210,6 +227,18 @@ mod tests {
         for name in HOSTKEY_PREF.split(',') {
             assert!(supported.contains(&name), "{name} is not supported by libssh2 (supported: {supported:?})");
         }
+    }
+
+    #[test]
+    fn kex_failure_explains_outdated_host_keys() {
+        let kex = handshake_error(ssh2::Error::new(KEX_FAILURE, "Unable to exchange encryption keys"));
+        assert!(matches!(kex, ConnectError::Other(_)));
+        let message = kex.to_string();
+        assert!(message.starts_with("SSH-Handshake: "), "{message}");
+        assert!(message.contains("SHA-1 ssh-rsa"), "{message}");
+
+        let other = handshake_error(ssh2::Error::new(ssh2::ErrorCode::Session(-13), "Socket disconnected"));
+        assert!(!other.to_string().contains("SHA-1"), "{other}");
     }
 
     fn read_u32(buf: &[u8], pos: &mut usize) -> usize {

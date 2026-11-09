@@ -677,6 +677,9 @@ Uploading is done by OpenSitePilot.
 - The server's host key is confirmed once (`SHA256:…`, compare with `ssh-keyscan -p 22 host | ssh-keygen -lf -`);
   if it changes later, every connection stops. "Verbindung testen" in the settings tests the dialog's
   entries without saving them; a key confirmed there is only stored with "Sichern".
+- Very old servers that only offer SHA-1 `ssh-rsa` or `ssh-dss` host keys (such as OpenSSH before 7.2,
+  some NAS or embedded boxes) are no longer supported; the connection then fails at the SSH handshake
+  with a hint saying so. Ed25519, ECDSA and RSA host keys with `rsa-sha2-256`/`rsa-sha2-512` work.
 - The app keeps a manifest of the last upload (path, size, SHA-256) per target in its data folder.
   It uploads only new or changed files, assets before pages, each to a temporary name and then
   renamed, so visitors never get half-written files. It deletes only files that it uploaded itself
